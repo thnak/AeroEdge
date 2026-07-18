@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+        sanitizer: ["", "address,undefined", "thread"]
+        include:
+          - sanitizer: ""
+            build_type: Release
+          - sanitizer: "address,undefined"
+            build_type: Debug
+          - sanitizer: "thread"
+            build_type: Debug
+    name: ${{ matrix.compiler }} ${{ matrix.sanitizer == '' && 'release' || matrix.sanitizer }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: AeroEdge
+      # AeroEdge expects QuarkCpp as a sibling checkout (../QuarkCpp), or set -DQUARK_DIR.
+      - name: Checkout QuarkCpp
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/QuarkCpp
+          path: QuarkCpp
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang g++
+      - name: Configure
+        working-directory: AeroEdge
+        run: >
+          CXX=${{ matrix.compiler }} cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DAEROEDGE_SANITIZER="${{ matrix.sanitizer }}"
+          -DQUARK_DIR=${{ github.workspace }}/QuarkCpp
+      - name: Build
+        working-directory: AeroEdge
+        run: cmake --build build -j
+      - name: Test
+        working-directory: AeroEdge
+        run: ctest --test-dir build --output-on-failure
