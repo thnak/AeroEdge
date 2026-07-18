@@ -158,3 +158,27 @@ add_executable(transport_gate transport_gate.cpp)
 target_link_libraries(transport_gate PRIVATE aero::transport)
 add_test(NAME transport_gate COMMAND transport_gate)
 set_tests_properties(transport_gate PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- Phase-8: distribution & horizontal scale (010) ------------------------------------------------
+# Phase-8 gate (010 §2): the device-affinity placement POLICY over Quark's Weighted-HRW — a device
+# actor is placed on an ELIGIBLE node (affinity respected), a device needing a capability no node has is
+# unplaceable as a clear value, and placements SPREAD across eligible nodes (not all on one).
+add_executable(placement_affinity placement_affinity.cpp)
+target_link_libraries(placement_affinity PRIVATE aero::cluster)
+add_test(NAME placement_affinity COMMAND placement_affinity)
+set_tests_properties(placement_affinity PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-8 LOAD-BEARING gate (010 §3): FENCED MIGRATION — the no-dual-drive guarantee. An actor migrates
+# A→B; B recovers A's state + a FRESH Quark 012 fence (f2>f1), A's stale write with f1 is REJECTED by the
+# store, B's write with f2 is accepted, and the driver is re-opened on re-activation. TSan-clean.
+add_executable(fenced_migration fenced_migration.cpp)
+target_link_libraries(fenced_migration PRIVATE aero::cluster aero::drivers)
+add_test(NAME fenced_migration COMMAND fenced_migration)
+set_tests_properties(fenced_migration PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-8 gate (010 §2.2): 90 device actors in 3 capability classes across 6 nodes — affinity respected
+# per class, no eligible node starved, load shared within each eligible pair (not pinned to one node).
+add_executable(cluster_place cluster_place.cpp)
+target_link_libraries(cluster_place PRIVATE aero::cluster)
+add_test(NAME cluster_place COMMAND cluster_place)
+set_tests_properties(cluster_place PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

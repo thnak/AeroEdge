@@ -91,6 +91,14 @@ target_include_directories(aero-transport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(aero-transport INTERFACE quark::quark)
 add_library(aero::transport ALIAS aero-transport)
 
+# aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration
+# helper (010). Adds ONLY policy on top of Quark's placement (025)/membership (021)/fence (012): NO hash
+# ring, NO gossip, NO membership protocol. Depends on aero-core (DurableState) + aero-sdk (IDriver) + Quark.
+add_library(aero-cluster INTERFACE)
+target_include_directories(aero-cluster INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-cluster INTERFACE aero-core aero-sdk quark::quark)
+add_library(aero::cluster ALIAS aero-cluster)
+
 # aero-schema — the language-neutral Application/DTO contract (009 §2, 013 T3). JSON only, no runtime.
 add_library(aero-schema INTERFACE)
 target_include_directories(aero-schema INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
