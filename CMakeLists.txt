@@ -50,6 +50,12 @@ target_include_directories(aero-nodes INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/inc
 target_link_libraries(aero-nodes INTERFACE aero-sdk)
 add_library(aero::nodes ALIAS aero-nodes)
 
+# aero-drivers — built-in driver library: the ingestion producer path over the Quark 024 stream (006).
+add_library(aero-drivers INTERFACE)
+target_include_directories(aero-drivers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-drivers INTERFACE aero-sdk)
+add_library(aero::drivers ALIAS aero-drivers)
+
 # ---- Tests -----------------------------------------------------------------
 option(AEROEDGE_BUILD_TESTS "Build AeroEdge tests" ON)
 if(AEROEDGE_BUILD_TESTS)
