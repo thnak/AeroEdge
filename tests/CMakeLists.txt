@@ -135,3 +135,26 @@ add_executable(wasm_seam wasm_seam.cpp)
 target_link_libraries(wasm_seam PRIVATE aero::ext)
 add_test(NAME wasm_seam COMMAND wasm_seam)
 set_tests_properties(wasm_seam PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- Phase-7: transport plugins (014) --------------------------------------------------------------
+# Phase-7 LOAD-BEARING gate (014 §3 C1 / §5, X2): the FIFO/dedup resequencing shim. A ChaosChannel
+# reorders + duplicates a seq-stamped stream; the CONTROL asserts the raw stream is NOT FIFO (shim is
+# non-vacuous), then the Resequencer restores strict FIFO, exactly-once, 0 loss/dup/inversion/overflow.
+add_executable(resequencer resequencer.cpp)
+target_link_libraries(resequencer PRIVATE aero::transport)
+add_test(NAME resequencer COMMAND resequencer)
+set_tests_properties(resequencer PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-7 cross-node gate (014 §2 X1): two actors on distinct NodeIds exchange a message over Quark's
+# REAL LoopbackTransport + DistributedRouter (fully-wired in-process path) — delivery + per-sender FIFO.
+add_executable(cross_node_message cross_node_message.cpp)
+target_link_libraries(cross_node_message PRIVATE quark::quark)
+add_test(NAME cross_node_message COMMAND cross_node_message)
+set_tests_properties(cross_node_message PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-7 gate (014 §5/§6 R5, §8): NullMqtt/NullGrpc return the documented offline gate error and the
+# per-link TransportSelector picks the correct transport among available ones (relay when none shared).
+add_executable(transport_gate transport_gate.cpp)
+target_link_libraries(transport_gate PRIVATE aero::transport)
+add_test(NAME transport_gate COMMAND transport_gate)
+set_tests_properties(transport_gate PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

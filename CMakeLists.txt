@@ -82,6 +82,15 @@ target_include_directories(aero-drivers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/i
 target_link_libraries(aero-drivers INTERFACE aero-sdk)
 add_library(aero::drivers ALIAS aero-drivers)
 
+# aero-transport — inter-actor transport ADAPTERS behind Quark's `Transport` seam (014, X1). The FIFO/
+# dedup resequencing shim (C1), the ITransport adapter base + per-link selector, and the MQTT/gRPC
+# adapter shapes (offline-gated). Plugs into quark::DistributedRouter; deliberately NOT linked by
+# aero-core/aero-runtime — a transport adapter is an optional backend behind the seam, off the hot path.
+add_library(aero-transport INTERFACE)
+target_include_directories(aero-transport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-transport INTERFACE quark::quark)
+add_library(aero::transport ALIAS aero-transport)
+
 # aero-schema — the language-neutral Application/DTO contract (009 §2, 013 T3). JSON only, no runtime.
 add_library(aero-schema INTERFACE)
 target_include_directories(aero-schema INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
