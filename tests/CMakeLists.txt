@@ -96,3 +96,42 @@ add_executable(api_reload api_reload.cpp)
 target_link_libraries(api_reload PRIVATE aero::api)
 add_test(NAME api_reload COMMAND api_reload)
 set_tests_properties(api_reload PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- Phase-6: extension model (008) ----------------------------------------------------------------
+# Sample NATIVE extensions built as CMake MODULE libraries (`.so`). Being normal targets in this tree
+# they inherit add_compile_options / add_link_options — so under a sanitizer build they are compiled
+# AND linked with the SAME -fsanitize flags as the host, keeping dlopen clean under ASan/TSan. They
+# compile against aero-sdk-native ONLY (the C ABI) — no aero-core, no STL type crosses the boundary (E2).
+add_library(aero_ext_gain MODULE "${CMAKE_CURRENT_SOURCE_DIR}/../examples/ext_native/gain_node.cpp")
+target_link_libraries(aero_ext_gain PRIVATE aero::sdk-native)
+set_target_properties(aero_ext_gain PROPERTIES PREFIX "" OUTPUT_NAME "aero_ext_gain")
+
+add_library(aero_ext_badabi MODULE "${CMAKE_CURRENT_SOURCE_DIR}/../examples/ext_native/gain_node_badabi.cpp")
+target_link_libraries(aero_ext_badabi PRIVATE aero::sdk-native)
+set_target_properties(aero_ext_badabi PROPERTIES PREFIX "" OUTPUT_NAME "aero_ext_badabi")
+
+# Phase-6 LOAD-BEARING gate (008 §2, E1/E2/E6): dlopen the sample `.so`, ABI-check it, register its
+# aero.ext.gain node, deploy a flow that uses it, drive frames, and assert the NATIVE node transformed
+# the data; also assert a wrong-ABI `.so` is rejected cleanly. The `.so` paths are injected here.
+add_executable(native_extension native_extension.cpp)
+target_link_libraries(native_extension PRIVATE aero::runtime aero::ext)
+target_compile_definitions(native_extension PRIVATE
+  AERO_EXT_GAIN_SO="$<TARGET_FILE:aero_ext_gain>"
+  AERO_EXT_BADABI_SO="$<TARGET_FILE:aero_ext_badabi>")
+add_dependencies(native_extension aero_ext_gain aero_ext_badabi)
+add_test(NAME native_extension COMMAND native_extension)
+set_tests_properties(native_extension PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-6 DSL gate (008 §6): the ExprRule grammar evaluates + routes correctly, malformed exprs are
+# rejected at configure (no crash), hot eval is 0-alloc (parse-once), and deploy accepts/rejects rules.
+add_executable(expr_rule expr_rule.cpp)
+target_link_libraries(expr_rule PRIVATE aero::runtime aero::nodes)
+add_test(NAME expr_rule COMMAND expr_rule)
+set_tests_properties(expr_rule PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-6 WASM-seam gate (008 §3, E1/E3/E4): the IWasmRuntime interface + capability/fuel types compile
+# and NullWasmRuntime returns the documented gate error — the honest seam with no faked execution (R5).
+add_executable(wasm_seam wasm_seam.cpp)
+target_link_libraries(wasm_seam PRIVATE aero::ext)
+add_test(NAME wasm_seam COMMAND wasm_seam)
+set_tests_properties(wasm_seam PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

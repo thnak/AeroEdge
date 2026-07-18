@@ -35,7 +35,9 @@
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
+#include "aero/ext/native_loader.hpp"
 #include "aero/nodes/builtin_nodes.hpp"
+#include "aero/nodes/expr_rule_node.hpp"
 #include "aero/runtime/flow_actor.hpp"
 #include "aero/runtime/flow_compiler.hpp"
 #include "aero/schema/application.hpp"
@@ -67,6 +69,14 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     node_reg.register_type("aero.output.sum", [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::SumOutputNode>();
     });
+    // Low-code Rule DSL (008 §6): parse the expression ONCE here (deploy), 0-alloc eval per Command.
+    // A malformed 'expr' is rejected earlier by the flow compiler (validate_node_config); this factory
+    // parses again and, defensively, a bad program yields a node whose process() returns Error.
+    node_reg.register_type("aero.rule.expr", [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+        auto prog = aero::nodes::ExprRuleNode::compile(c.value("expr", std::string{}));
+        return std::make_unique<aero::nodes::ExprRuleNode>(
+            std::move(prog), c.value("alarm", std::string{"AlarmRaised"}));
+    });
 
     driver_reg.register_type("aero.driver.generator", [](const nlohmann::json&) {
         return std::make_unique<aero::drivers::GeneratorDriver>();
@@ -80,6 +90,21 @@ public:
 
     Runtime(const Runtime&) = delete;
     Runtime& operator=(const Runtime&) = delete;
+
+    // Load a NATIVE extension bundle (008 §2): dlopen the `.so`, ABI-check it (E6), and register a
+    // factory per provided node into this Runtime's NodeRegistry — after which its type_ids resolve in
+    // deploy() exactly like a built-in (E1). Must be called BEFORE deploy() references those type_ids.
+    // The loaded library stays resident (ref-counted by the registered factories) until the Runtime is
+    // destroyed; a version change is BuildOnly (drain + redeploy, 009 §4). Errors come back as values.
+    std::expected<void, std::string> load_native_extension(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (dep_) {
+            return std::unexpected("load extensions before deploy (undeploy '" + dep_->name + "' first)");
+        }
+        auto ext = aero::ext::register_native_extension(nodes_, path);
+        if (!ext) return std::unexpected(ext.error());
+        return {};
+    }
 
     // Deploy a parsed Application: compile the flow from the registry (009 §3), bring up the engine +
     // FlowActor, and start the driver ingestion path if one is configured. One Application per Runtime.

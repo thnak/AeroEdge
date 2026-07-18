@@ -28,6 +28,7 @@
 
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
+#include "aero/nodes/expr_rule_node.hpp"
 #include "aero/schema/application.hpp"
 #include "aero/sdk/node.hpp"
 #include "nlohmann/json.hpp"
@@ -74,6 +75,16 @@ inline std::expected<void, std::string> validate_node_config(const std::string& 
         if (cfg["window"].get<long long>() < 1) {
             return std::unexpected("node 'aero.transform.moving_average' 'window' must be >= 1");
         }
+    } else if (type_id == "aero.rule.expr") {
+        // Low-code Rule DSL (008 §6): the expression must be present, a string, and PARSE — a
+        // malformed rule is caught at deploy (parse-once), never producing a broken node at runtime.
+        if (!cfg.contains("expr") || !cfg["expr"].is_string()) {
+            return std::unexpected("node 'aero.rule.expr' requires a string 'expr'");
+        }
+        auto prog = aero::nodes::ExprRuleNode::compile(cfg["expr"].get<std::string>());
+        if (!prog.ok) {
+            return std::unexpected("node 'aero.rule.expr' invalid expression: " + prog.error);
+        }
     }
     return {};
 }
@@ -101,6 +112,9 @@ inline std::expected<CompiledPlan, std::string> compile_flow(const schema::Appli
         auto node = registry.create(ns.type_id, ns.config);
         if (!node) {
             return std::unexpected("flow node: " + node.error());
+        }
+        if (!*node) {  // defensive: an extension factory (native, 008 §2) may return null on failure
+            return std::unexpected("flow node '" + ns.type_id + "' failed to construct");
         }
         switch ((*node)->descriptor().category) {
             case aero::NodeCategory::Source: has_source = true; break;
