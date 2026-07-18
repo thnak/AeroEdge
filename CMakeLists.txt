@@ -63,11 +63,30 @@ add_library(aero-sdk-native INTERFACE)
 target_include_directories(aero-sdk-native INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_library(aero::sdk-native ALIAS aero-sdk-native)
 
-# aero-nodes — built-in node library (005) + the low-code ExprRule DSL (008 §6).
+# aero-nodes — built-in node library (005) + the low-code ExprRule DSL (008 §6) + Phase-10 compute
+# breadth (compute_nodes: mean/minmax/sum/crc, JSON-parse + Modbus-decode Sources) and the MES flow
+# nodes (mes_nodes). JsonParseNode uses nlohmann::json (header-only, allowed broadly — never httplib).
 add_library(aero-nodes INTERFACE)
 target_include_directories(aero-nodes INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-nodes INTERFACE aero-sdk)
+target_link_libraries(aero-nodes INTERFACE aero-sdk aero-thirdparty-json)
 add_library(aero::nodes ALIAS aero-nodes)
+
+# aero-mes — the MES integration hook (012): the canonical DTOs + IMesAdapter seam (mes.hpp), the
+# RestMesAdapter over httplib, and the transactional OUTBOX + MesGateway actor over the Quark 012 store.
+# httplib is fenced to this layer (R1). Depends on aero-core (DurableState) + Quark; sits beside
+# aero-nodes/aero-drivers below aero-runtime — NOT linked by aero-core (a seam-side adapter, off hot path).
+add_library(aero-mes INTERFACE)
+target_include_directories(aero-mes INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-mes INTERFACE aero-core aero-sdk aero-thirdparty-httplib aero-thirdparty-json quark::quark)
+add_library(aero::mes ALIAS aero-mes)
+
+# aero-ota — Firmware OTA (011): the per-device state machine + mock OTA driver (ota.hpp) and the
+# FleetActor staged-rollout policy (fleet.hpp). Durable OTA progress reuses aero-core's DurableState over
+# the Quark 012 seam; the device write goes through the fenced IDriver::write (aero-sdk). No httplib.
+add_library(aero-ota INTERFACE)
+target_include_directories(aero-ota INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-ota INTERFACE aero-core aero-sdk quark::quark)
+add_library(aero::ota ALIAS aero-ota)
 
 # aero-ext — the HOST side of the extension model (008): the Native `.so` loader (dlopen + INode
 # adapter) and the WASM runtime seam (interface + honest gate). Needs dl for dlopen (native_loader).

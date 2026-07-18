@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -31,6 +32,19 @@ struct Event {
     double value = 0.0;
 };
 
+// A report an Output node stages for the MES gateway (012 §4). Kept at the SDK layer — POD + string
+// numbers/views only — so ANY node can stage one WITHOUT an upward include of aero-mes (which would be
+// a cyclic dependency, R1). The MesGateway maps this to the canonical `MesReport` and owns the
+// idempotency-key/timestamp assignment (012 §3). Views point at node-config / static storage so
+// staging one is 0-alloc on the steady path (N1), exactly like SumOutputNode staging into `output`.
+struct StagedMesReport {
+    enum class Kind : std::uint8_t { Production, Alarm, TagSample };
+    Kind kind = Kind::Production;
+    std::string_view line;   // production line / device id (static or config storage)
+    std::string_view label;  // metric name / alarm code
+    double value = 0.0;      // produced count / measurement / severity
+};
+
 using TagCollection = std::vector<Tag>;
 using EventBuffer = std::vector<Event>;
 
@@ -38,10 +52,18 @@ struct ProcessingContext {
     // --- input (borrowed; dies with the flow, I6) ---
     const Frame* frame = nullptr;
 
+    // Raw frame bytes for byte-oriented Source/Transform nodes (JSON parse, CRC, Modbus register
+    // decode — 005/006). The Phase-2 streaming Frame carries only a scalar; a byte payload is the
+    // honest shape for a decode Source that parses a wire frame (003 §Frame). Owned here (cleared, not
+    // freed) so a decode Source's input is a stable span for the flow's duration (I6).
+    std::string payload;
+
     // --- working set + staged outputs (nodes write here; the actor commits/publishes after) ---
     TagCollection tags;       // decoded/normalized signals
     std::vector<double> output;  // Output nodes stage egress here
     EventBuffer events;       // Events to publish after commit (002)
+    std::vector<StagedMesReport> mes_reports;  // MES reports staged by Output nodes (012 §4), drained
+                                               // by the actor into the MesGateway outbox at commit
 
     // --- flow status ---
     bool failed = false;
@@ -50,9 +72,11 @@ struct ProcessingContext {
     // Reset for reuse on the next Command: clear buffers but KEEP capacity (amortized 0-alloc).
     void reset(const Frame* f) noexcept {
         frame = f;
+        payload.clear();
         tags.clear();
         output.clear();
         events.clear();
+        mes_reports.clear();
         failed = false;
         failed_step = 0;
     }

@@ -182,3 +182,30 @@ add_executable(cluster_place cluster_place.cpp)
 target_link_libraries(cluster_place PRIVATE aero::cluster)
 add_test(NAME cluster_place COMMAND cluster_place)
 set_tests_properties(cluster_place PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- Phase-10: MES hook, Firmware OTA, protocol/node breadth (011/012/005) -------------------------
+# Phase-10 LOAD-BEARING gate #1 (012 §3, M3): the transactional outbox. A flow stages a
+# ProductionFinished report through the MesGateway actor; with the mock MES DOWN (503) the report is
+# durably RETAINED in the outbox (proven to survive a simulated gateway restart — reload from the same
+# store); bring the MES UP, drain, and assert it received the report EXACTLY once (a duplicate drain is
+# deduped by the idempotency key). Ephemeral-port local httplib MES, bounded polling, clean shutdown.
+add_executable(mes_outbox mes_outbox.cpp)
+target_link_libraries(mes_outbox PRIVATE aero::mes aero::runtime)
+add_test(NAME mes_outbox COMMAND mes_outbox)
+set_tests_properties(mes_outbox PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-10 LOAD-BEARING gate #2 (011 §3/§4, O1/O2/O5): OTA. A good signed image → canary → COMMIT
+# (device version advances); a forced health-check FAILURE → auto-ROLLBACK (device stays on the old
+# version, rollback target recorded); an unsigned/tampered image is REJECTED before any transfer (O1).
+# Fleet: a failing canary wave AUTO-PAUSES the rollout (O5) and later devices keep their firmware.
+add_executable(ota_rollout ota_rollout.cpp)
+target_link_libraries(ota_rollout PRIVATE aero::ota)
+add_test(NAME ota_rollout COMMAND ota_rollout)
+set_tests_properties(ota_rollout PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-10 breadth gate (005 §2): the new compute nodes each transform correctly and malformed input is
+# handled without a crash (odd Modbus frame → Error; bad JSON → Error; CRC/mean/minmax/sum values).
+add_executable(breadth_nodes breadth_nodes.cpp)
+target_link_libraries(breadth_nodes PRIVATE aero::nodes aero::runtime)
+add_test(NAME breadth_nodes COMMAND breadth_nodes)
+set_tests_properties(breadth_nodes PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

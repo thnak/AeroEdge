@@ -37,7 +37,9 @@
 #include "aero/drivers/generator_driver.hpp"
 #include "aero/ext/native_loader.hpp"
 #include "aero/nodes/builtin_nodes.hpp"
+#include "aero/nodes/compute_nodes.hpp"
 #include "aero/nodes/expr_rule_node.hpp"
+#include "aero/nodes/mes_nodes.hpp"
 #include "aero/runtime/flow_actor.hpp"
 #include "aero/runtime/flow_compiler.hpp"
 #include "aero/schema/application.hpp"
@@ -76,6 +78,40 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
         auto prog = aero::nodes::ExprRuleNode::compile(c.value("expr", std::string{}));
         return std::make_unique<aero::nodes::ExprRuleNode>(
             std::move(prog), c.value("alarm", std::string{"AlarmRaised"}));
+    });
+
+    // Phase-10 compute-node breadth (005 §2): pure, socket-free transforms/sources (compute_nodes.hpp).
+    node_reg.register_type("aero.transform.mean", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::MeanNode>();
+    });
+    node_reg.register_type("aero.transform.minmax", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::MinMaxNode>();
+    });
+    node_reg.register_type("aero.transform.sum", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::SumNode>();
+    });
+    node_reg.register_type("aero.transform.crc", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::CrcNode>();
+    });
+    // Modbus register-map DECODE over already-arrived bytes (no socket; the Modbus-TCP transport is gated).
+    node_reg.register_type("aero.source.modbus", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::ModbusDecodeNode>();
+    });
+    node_reg.register_type("aero.source.json", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::JsonParseNode>();
+    });
+
+    // Phase-10 MES hook (012 §4): the outbound report Output node + the inbound order Source node.
+    node_reg.register_type("aero.output.mes", [](const nlohmann::json& c) {
+        auto kind = aero::StagedMesReport::Kind::Production;
+        const std::string k = c.value("kind", std::string{"production"});
+        if (k == "alarm") kind = aero::StagedMesReport::Kind::Alarm;
+        else if (k == "tag_sample") kind = aero::StagedMesReport::Kind::TagSample;
+        return std::make_unique<aero::nodes::MesReportNode>(
+            c.value("line", std::string{"line-1"}), c.value("label", std::string{"produced"}), kind);
+    });
+    node_reg.register_type("aero.source.mes_order", [](const nlohmann::json& c) {
+        return std::make_unique<aero::nodes::MesOrderSourceNode>(c.value("order_qty", 0.0));
     });
 
     driver_reg.register_type("aero.driver.generator", [](const nlohmann::json&) {
