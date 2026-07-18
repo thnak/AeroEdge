@@ -30,11 +30,14 @@
 #include <thread>
 #include <vector>
 
+#include <optional>
+
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
 #include "aero/nodes/builtin_nodes.hpp"
 #include "aero/runtime/flow_actor.hpp"
+#include "aero/runtime/flow_compiler.hpp"
 #include "aero/schema/application.hpp"
 #include "aero/sdk/driver.hpp"
 #include "aero/sdk/node.hpp"
@@ -86,26 +89,25 @@ public:
             return std::unexpected("a runtime hosts one Application; undeploy '" + dep_->name + "' first");
         }
 
+        // --- Validate + compile the flow BEFORE any engine is brought up (009 §3 P1). A bad
+        // Application is rejected here as a value — never a crash, never a half-deploy. ------------
+        auto compiled = compile_flow(app, nodes_);
+        if (!compiled) {
+            return std::unexpected(compiled.error());
+        }
+
         auto d = std::make_unique<Deployment>();
+        d->app = app;
         d->name = app.name;
         d->version = app.version;
         d->key = app.actor.key;
-
-        // --- Compile the flow: resolve + construct each node from the registry (009 §3, I3). --------
-        for (const auto& ns : app.flow) {
-            auto node = nodes_.create(ns.type_id, ns.config);
-            if (!node) {
-                return std::unexpected("flow node: " + node.error());
-            }
-            d->nodes.push_back(std::move(*node));
-        }
-        for (auto& n : d->nodes) {
-            d->flow.add(*n);
-        }
+        // Heap-hold the plan so `plan->flow`'s address is stable while the actor holds a
+        // `const CompiledFlow*` (ADR-008 Hot-Leaf); a hot-reload swaps this pointer wholesale (§4).
+        d->plan = std::make_unique<CompiledPlan>(std::move(*compiled));
 
         // --- Bring up the engine hosting one FlowActor (verified sample-01 shape, R4). --------------
         d->actor = std::make_unique<FlowActor>();
-        d->actor->bind_flow(d->flow);  // wire before start(), so the flow is live on the first Command
+        d->actor->bind_flow(d->plan->flow);  // wire before start(), so the flow is live on Command #1
         d->pool = std::make_unique<quark::detail::MessagePool>(1024);
         d->activation = std::make_unique<quark::Activation>(d->actor.get(), FlowActor::dispatch_table(),
                                                             d->pool->sink());
@@ -186,6 +188,77 @@ public:
         return deploy(*app);
     }
 
+    // Hot-reload the running Application to a NEW one (009 §4/§6). The change is classified Live vs
+    // BuildOnly (009 §4, P3): a BuildOnly change (actor kind/key or persistence model/mode) cannot be
+    // a live pointer-swap and is REJECTED with a clear error (never half-applied); a Live change (flow
+    // graph / node config) is validated + compiled off to the side while the old flow keeps running,
+    // then swapped in via a mailbox-ordered ReloadFlow Command (P2 — 0 dropped/duplicated Commands).
+    std::expected<void, std::string> reload(const schema::Application& app) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!dep_) {
+            return std::unexpected("nothing deployed; deploy an Application before reload");
+        }
+        if (auto reason = classify_buildonly(dep_->app, app)) {
+            return std::unexpected("BuildOnly change requires redeploy (undeploy first): " + *reason);
+        }
+        // Validate + compile the new flow off to the side (009 §4 step 1). If it fails the OLD flow is
+        // untouched and keeps running — an invalid reload never reaches the actor (P1).
+        auto compiled = compile_flow(app, nodes_);
+        if (!compiled) {
+            return std::unexpected(compiled.error());
+        }
+        auto next = std::make_unique<CompiledPlan>(std::move(*compiled));
+
+        // Publish the swap (009 §4 step 3): tell a ReloadFlow carrying the new flow pointer. Mailbox
+        // FIFO on a Sequential actor puts it AFTER all in-flight frames (they finish on the old flow)
+        // and BEFORE all later frames (they run the new flow) — the Hot-Leaf pointer publish (ADR-008).
+        auto ref = dep_->router->get<FlowActor>(dep_->key);
+        ref.tell(ReloadFlow{&next->flow});
+
+        // Retire the old plan (009 §4 step 4) only after NO execution can reference it. A status ask is
+        // FIFO after the ReloadFlow on the Sequential actor, so when it returns the swap is applied and
+        // every old-flow frame has completed — the old plan is then unreferenced and safe to destroy.
+        (void)quark::block_on(ref.ask<FlowStatus>(GetStatus{}));
+
+        previous_app_ = dep_->app;       // keep the prior version for rollback (009 §6)
+        dep_->app = app;
+        dep_->name = app.name;
+        dep_->version = app.version;
+        dep_->plan = std::move(next);    // old plan destroyed here — provably unreferenced (above)
+        return {};
+    }
+
+    // Parse JSON then reload (the API/daemon entry). Bad JSON → a clean error, never a throw.
+    std::expected<void, std::string> reload_json(const std::string& json_text) {
+        auto app = schema::load_application(json_text);
+        if (!app) {
+            return std::unexpected(app.error());
+        }
+        return reload(*app);
+    }
+
+    // Rollback to the previously-deployed Application version (009 §6): a hot-reload back to the prior
+    // flow. Requires a prior version (i.e. at least one successful reload). Same Live/BuildOnly rules.
+    std::expected<void, std::string> rollback() {
+        std::optional<schema::Application> prev;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!dep_) return std::unexpected("nothing deployed");
+            if (!previous_app_) return std::unexpected("no previous version to roll back to");
+            prev = *previous_app_;
+        }
+        return reload(*prev);  // re-locks; classify + validate + swap the prior flow back in
+    }
+
+    // Test helper: tell one frame Command directly to the deployed actor (no driver). Lets a test drive
+    // an exact, deterministic send/reload interleave to prove the hot-reload ordering (009 §4).
+    std::expected<void, std::string> tell_frame(std::int64_t raw) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!dep_) return std::unexpected("nothing deployed");
+        dep_->router->get<FlowActor>(dep_->key).tell(ReceiveFrame{raw});
+        return {};
+    }
+
     // Status snapshot (009 §6 observability): the deployed app + the actor's live counters, read via a
     // single ask (FIFO after all prior frame tells on a Sequential actor).
     nlohmann::json status() {
@@ -207,6 +280,8 @@ public:
         j["frames_processed"] = s.frames;
         j["events_published"] = s.events;
         j["last_output"] = s.last;
+        j["output_sum"] = s.output_sum;
+        j["reloads"] = s.reloads;
         j["failed"] = s.failed;
         return j;
     }
@@ -258,13 +333,13 @@ private:
     // All lifetimes of one deployment. Held as unique_ptrs so deploy() can build them imperatively
     // (register_actor must run between construction steps) and teardown() can order the shutdown.
     struct Deployment {
+        schema::Application app;  // the running Application (name+version+shape) — the reload/rollback base
         std::string name;
         std::string version;
         std::uint64_t key = 0;
 
-        std::vector<std::unique_ptr<aero::INode>> nodes;  // owns the flow's node instances
+        std::unique_ptr<CompiledPlan> plan;  // owns the nodes + the bound flow (stable heap address)
         std::unique_ptr<aero::IDriver> driver;
-        aero::CompiledFlow flow;  // holds INode* into `nodes` — destroyed before `nodes`
 
         std::unique_ptr<FlowActor> actor;
         std::unique_ptr<quark::detail::MessagePool> pool;
@@ -283,6 +358,35 @@ private:
         std::thread bridge;
     };
 
+    // Classify a reload as Live or BuildOnly (009 §4 table, P3). Returns nullopt for a Live change
+    // (flow graph / node config — hot-swappable), or a reason string for a BuildOnly change that
+    // cannot be a live pointer-swap: a different actor kind or key (a different actor identity /
+    // placement), or a persistence model/mode change (rebinds the durable-state path, 007). A name
+    // change is treated as BuildOnly too — reload targets the SAME Application, not a replacement.
+    static std::optional<std::string> classify_buildonly(const schema::Application& cur,
+                                                         const schema::Application& next) {
+        if (cur.name != next.name) {
+            return "app name changed ('" + cur.name + "' -> '" + next.name + "')";
+        }
+        if (cur.actor.kind != next.actor.kind) {
+            return "actor kind changed ('" + cur.actor.kind + "' -> '" + next.actor.kind + "')";
+        }
+        if (cur.actor.key != next.actor.key) {
+            return "actor key changed";
+        }
+        const bool cur_p = cur.persistence.has_value();
+        const bool next_p = next.persistence.has_value();
+        if (cur_p != next_p) {
+            return "persistence presence changed";
+        }
+        if (cur_p && next_p &&
+            (cur.persistence->model != next.persistence->model ||
+             cur.persistence->mode != next.persistence->mode)) {
+            return "persistence model/mode changed";
+        }
+        return std::nullopt;  // Live: flow graph and/or node config only
+    }
+
     static void teardown(Deployment& d) noexcept {
         d.stop_flag.store(true, std::memory_order_release);  // graceful stop (006 §8): finish in-flight
         if (d.producer.joinable()) d.producer.join();
@@ -294,6 +398,7 @@ private:
     NodeRegistry nodes_;
     DriverRegistry drivers_;
     std::unique_ptr<Deployment> dep_;
+    std::optional<schema::Application> previous_app_;  // the prior version, for rollback (009 §6)
     std::mutex mtx_;
 };
 

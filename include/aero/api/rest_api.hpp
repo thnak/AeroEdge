@@ -53,6 +53,32 @@ public:
             res.set_content(rt_.list().dump(), "application/json");
         });
 
+        // Hot-reload the running Application (009 §4): body = new Application JSON. A Live change
+        // hot-swaps in place; a BuildOnly change is a clean 400 ("requires redeploy"), never applied.
+        // The {name} path segment must match the running app (enforced by reload's classifier).
+        svr.Put(R"(/apps/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
+            auto r = rt_.reload_json(req.body);
+            if (!r) {
+                res.status = 400;
+                res.set_content(error_json(r.error()), "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(rt_.status().dump(), "application/json");
+        });
+
+        // Rollback to the previous Application version (009 §6): a hot-reload back to the prior flow.
+        svr.Post(R"(/apps/([^/]+)/rollback)", [this](const httplib::Request&, httplib::Response& res) {
+            auto r = rt_.rollback();
+            if (!r) {
+                res.status = 400;
+                res.set_content(error_json(r.error()), "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(rt_.status().dump(), "application/json");
+        });
+
         svr.Delete(R"(/apps/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
             const std::string name = req.matches[1];
             auto r = rt_.undeploy(name);

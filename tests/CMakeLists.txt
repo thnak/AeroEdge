@@ -59,3 +59,40 @@ add_executable(api_integration api_integration.cpp)
 target_link_libraries(api_integration PRIVATE aero::api)
 add_test(NAME api_integration COMMAND api_integration)
 set_tests_properties(api_integration PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-5 validation gate (009 §3 P1, 004 §2.1): the Flow Compiler validates at deploy — invalid
+# Applications (unknown type_id, empty flow, no source/output, bad config) are rejected as values
+# (no crash, no half-deploy); a valid one is accepted.
+add_executable(flow_validation flow_validation.cpp)
+target_link_libraries(flow_validation PRIVATE aero::runtime)
+add_test(NAME flow_validation COMMAND flow_validation)
+set_tests_properties(flow_validation PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-5 LOAD-BEARING gate (009 §4 P2): hot-reload a live actor's flow while Commands flow — 0
+# dropped, 0 duplicated (exactly-once), the pre-reload frames run the old flow and post-reload the
+# new one, proven by an exact frame count + output-sum split. Mailbox-ordered swap on a Sequential
+# actor (Quark 001/ADR-002 FIFO). Must be TSan-clean.
+add_executable(hot_reload hot_reload.cpp)
+target_link_libraries(hot_reload PRIVATE aero::runtime)
+add_test(NAME hot_reload COMMAND hot_reload)
+set_tests_properties(hot_reload PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-5 classification gate (009 §4 P3): a Live change (node config) hot-reloads; a BuildOnly change
+# (actor key, persistence mode) is rejected with a clear error and never half-applied.
+add_executable(reload_buildonly reload_buildonly.cpp)
+target_link_libraries(reload_buildonly PRIVATE aero::runtime)
+add_test(NAME reload_buildonly COMMAND reload_buildonly)
+set_tests_properties(reload_buildonly PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-5 versioning gate (009 §6): reload A->B then rollback returns behavior to A.
+add_executable(rollback rollback.cpp)
+target_link_libraries(rollback PRIVATE aero::runtime)
+add_test(NAME rollback COMMAND rollback)
+set_tests_properties(rollback PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-5 API gate (009 §4/§6, 013 §5): PUT /apps/{name} (reload) + POST /apps/{name}/rollback over a
+# real socket; a BuildOnly reload is a clean 400. Ephemeral port, health-poll, clean shutdown.
+add_executable(api_reload api_reload.cpp)
+target_link_libraries(api_reload PRIVATE aero::api)
+add_test(NAME api_reload COMMAND api_reload)
+set_tests_properties(api_reload PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
