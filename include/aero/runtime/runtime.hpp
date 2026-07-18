@@ -1,0 +1,300 @@
+// AeroEdge runtime — the RuntimeController (spec 009, 013 §2 aero-runtime).
+//
+// The Runtime is the edge daemon's core, testable IN-PROCESS with no socket: it takes a declarative
+// Application (009 §2), COMPILES it at deploy (009 §3) by resolving each node/driver from the registry
+// (005 §5), brings up a Quark engine hosting one FlowActor bound to the CompiledFlow, and — if a driver
+// is configured — runs the Phase-2 ingestion path (GeneratorDriver → Quark 024 StreamChannel → a
+// bridge that `tell`s each frame into the actor). It owns every lifetime and tears them down on
+// undeploy/stop. All control logic lives HERE; aero-api is a thin HTTP shell over this (013 T2).
+//
+// THIN-OVER-QUARK (R0): the Runtime writes no scheduler/mailbox/stream — bring-up is the verified
+// sample-01 shape (MessagePool → Activation → Engine → register_actor → LocalRouter), and ingestion
+// reuses the proven 024 StreamChannel. The one thing AeroEdge adds is the compile+wire+bridge glue.
+//
+// INGESTION BRIDGE (why a bridge thread, not direct drive): the driver produces frames on its own I/O
+// lane (D6). Feeding them to the actor by `tell` — rather than calling the actor directly from the
+// drain thread — keeps the actor SINGLE-EXECUTOR (I2): only the engine worker ever touches actor
+// state, so status `ask`s and frame Commands serialize through the mailbox with no data race (the
+// mailbox is Quark's Vyukov MPSC — many producers may enqueue). The StreamChannel still carries the
+// lossless credit backpressure between the driver and the bridge (006 §3). This is the honest Phase-4
+// path until Quark routes a stream descriptor through the worker loop itself (024 seam, see 006).
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <expected>
+#include <memory>
+#include <memory_resource>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "aero/core/compiled_flow.hpp"
+#include "aero/core/registry.hpp"
+#include "aero/drivers/generator_driver.hpp"
+#include "aero/nodes/builtin_nodes.hpp"
+#include "aero/runtime/flow_actor.hpp"
+#include "aero/schema/application.hpp"
+#include "aero/sdk/driver.hpp"
+#include "aero/sdk/node.hpp"
+#include "nlohmann/json.hpp"
+#include "quark/core/actor_ref.hpp"
+#include "quark/core/activation.hpp"
+#include "quark/core/engine.hpp"
+#include "quark/core/engine_config.hpp"
+#include "quark/core/spawn.hpp"
+#include "quark/core/stream_activation.hpp"
+
+namespace aero::runtime {
+
+// Populate the registries with the Phase-4 built-in node/driver factories (005 §5). Lives here (not in
+// aero-core/registry.hpp) because it #includes aero-nodes/aero-drivers — the one-way layering (R1)
+// forbids aero-core depending upward on them.
+inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg) {
+    node_reg.register_type("aero.source.decode", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::DecodeSourceNode>();
+    });
+    node_reg.register_type("aero.transform.scale", [](const nlohmann::json& c) {
+        return std::make_unique<aero::nodes::ScaleNode>(c.value("factor", 1.0));
+    });
+    node_reg.register_type("aero.transform.moving_average", [](const nlohmann::json& c) {
+        return std::make_unique<aero::nodes::RuntimeMovingAverageNode>(c.value("window", std::size_t{1}));
+    });
+    node_reg.register_type("aero.output.sum", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::SumOutputNode>();
+    });
+
+    driver_reg.register_type("aero.driver.generator", [](const nlohmann::json&) {
+        return std::make_unique<aero::drivers::GeneratorDriver>();
+    });
+}
+
+class Runtime {
+public:
+    Runtime() { register_builtins(nodes_, drivers_); }
+    ~Runtime() { (void)undeploy(); }
+
+    Runtime(const Runtime&) = delete;
+    Runtime& operator=(const Runtime&) = delete;
+
+    // Deploy a parsed Application: compile the flow from the registry (009 §3), bring up the engine +
+    // FlowActor, and start the driver ingestion path if one is configured. One Application per Runtime.
+    std::expected<void, std::string> deploy(const schema::Application& app) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (dep_) {
+            return std::unexpected("a runtime hosts one Application; undeploy '" + dep_->name + "' first");
+        }
+
+        auto d = std::make_unique<Deployment>();
+        d->name = app.name;
+        d->version = app.version;
+        d->key = app.actor.key;
+
+        // --- Compile the flow: resolve + construct each node from the registry (009 §3, I3). --------
+        for (const auto& ns : app.flow) {
+            auto node = nodes_.create(ns.type_id, ns.config);
+            if (!node) {
+                return std::unexpected("flow node: " + node.error());
+            }
+            d->nodes.push_back(std::move(*node));
+        }
+        for (auto& n : d->nodes) {
+            d->flow.add(*n);
+        }
+
+        // --- Bring up the engine hosting one FlowActor (verified sample-01 shape, R4). --------------
+        d->actor = std::make_unique<FlowActor>();
+        d->actor->bind_flow(d->flow);  // wire before start(), so the flow is live on the first Command
+        d->pool = std::make_unique<quark::detail::MessagePool>(1024);
+        d->activation = std::make_unique<quark::Activation>(d->actor.get(), FlowActor::dispatch_table(),
+                                                            d->pool->sink());
+        d->engine = std::make_unique<quark::Engine<>>(quark::EngineConfig{/*workers*/ 1, /*shards*/ 1,
+                                                                          /*budget*/ 64, 64});
+        quark::register_actor<FlowActor>(*d->engine, d->key, *d->activation);
+        d->router = std::make_unique<quark::LocalRouter>(d->engine->post_courier(), *d->pool);
+        d->engine->start();
+
+        // --- Driver ingestion path (optional): GeneratorDriver → 024 StreamChannel → bridge (006). --
+        if (app.driver) {
+            auto drv = drivers_.create(app.driver->type_id, app.driver->config);
+            if (!drv) {
+                d->engine->stop();
+                return std::unexpected("driver: " + drv.error());
+            }
+            d->driver = std::move(*drv);
+
+            aero::DriverConfig dcfg;
+            dcfg.endpoint = "generator://seq";  // string literal — static storage, view-safe
+            dcfg.frame_count = app.driver->config.value("frame_count", std::uint32_t{0});
+            if (d->driver->open(dcfg) != aero::DriverStatus::Ok) {
+                d->engine->stop();
+                return std::unexpected("driver.open failed for '" + app.driver->type_id + "'");
+            }
+
+            quark::StreamActivation<aero::Frame>::Config scfg;
+            scfg.capacity = 256;  // ring == max credit == max in-flight frames (006 §3)
+            d->mr = std::make_unique<std::pmr::monotonic_buffer_resource>();
+            d->stream = std::make_unique<quark::StreamActivation<aero::Frame>>(scfg, d->mr.get());
+            auto tok = quark::open_stream(*d->stream);  // single-writer token (024, D1)
+            if (!tok) {
+                d->engine->stop();
+                return std::unexpected("open_stream failed");
+            }
+            aero::StreamSink<aero::Frame> sink(std::move(tok.value()));
+            d->has_driver = true;
+
+            // Producer lane: the driver's run loop pushes frames honoring backpressure (D6).
+            d->producer = std::thread(
+                [drv = d->driver.get(), sink = std::move(sink), flag = &d->stop_flag,
+                 done = &d->producer_done]() mutable {
+                    drv->run(std::move(sink), aero::StopToken{flag});
+                    done->store(true, std::memory_order_release);
+                });
+
+            // Bridge lane: drain the stream and `tell` each frame into the actor (single-executor, I2).
+            Deployment* dp = d.get();
+            d->bridge = std::thread([dp]() {
+                auto& ch = dp->stream->channel();
+                auto ref = dp->router->get<FlowActor>(dp->key);
+                for (;;) {
+                    const bool producer_done = dp->producer_done.load(std::memory_order_acquire);
+                    while (ch.occupancy() > 0) {
+                        quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 64);
+                        while (const aero::Frame* f = batch.next()) {
+                            ref.tell(ReceiveFrame{f->raw});  // copy scalar out of the pinned slot
+                            batch.retire();                  // return credit after the tell is enqueued
+                        }
+                    }
+                    if (dp->stop_flag.load(std::memory_order_acquire)) break;
+                    if (producer_done && ch.occupancy() == 0) break;  // bounded driver finished + drained
+                    std::this_thread::yield();  // no sleep; progress bounded by frame_count / stop
+                }
+            });
+        }
+
+        dep_ = std::move(d);
+        return {};
+    }
+
+    // Parse JSON text then deploy (the API/daemon entry). Bad JSON → a clean error, never a throw.
+    std::expected<void, std::string> deploy_json(const std::string& json_text) {
+        auto app = schema::load_application(json_text);
+        if (!app) {
+            return std::unexpected(app.error());
+        }
+        return deploy(*app);
+    }
+
+    // Status snapshot (009 §6 observability): the deployed app + the actor's live counters, read via a
+    // single ask (FIFO after all prior frame tells on a Sequential actor).
+    nlohmann::json status() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json j;
+        if (!dep_) {
+            j["deployed"] = false;
+            return j;
+        }
+        auto ref = dep_->router->get<FlowActor>(dep_->key);
+        auto r = quark::block_on(ref.ask<FlowStatus>(GetStatus{}));
+        const FlowStatus s = r.has_value() ? r.value() : FlowStatus{};
+        j["deployed"] = true;
+        j["name"] = dep_->name;
+        j["version"] = dep_->version;
+        j["actor_key"] = static_cast<std::uint64_t>(dep_->key);
+        j["actor_kind"] = "edge";
+        j["has_driver"] = dep_->has_driver;
+        j["frames_processed"] = s.frames;
+        j["events_published"] = s.events;
+        j["last_output"] = s.last;
+        j["failed"] = s.failed;
+        return j;
+    }
+
+    // The deployed Applications (0 or 1 in Phase-4) — name + version each.
+    nlohmann::json list() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json arr = nlohmann::json::array();
+        if (dep_) {
+            nlohmann::json a;
+            a["name"] = dep_->name;
+            a["version"] = dep_->version;
+            arr.push_back(std::move(a));
+        }
+        return arr;
+    }
+
+    // Undeploy (by name; empty name == the current deployment). Stops the driver + engine and joins all
+    // threads before destroying anything (ordered teardown).
+    std::expected<void, std::string> undeploy(const std::string& name = "") {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!dep_) {
+            return name.empty() ? std::expected<void, std::string>{} : std::unexpected("nothing deployed");
+        }
+        if (!name.empty() && name != dep_->name) {
+            return std::unexpected("no such app: '" + name + "'");
+        }
+        teardown(*dep_);
+        dep_.reset();
+        return {};
+    }
+
+    [[nodiscard]] bool deployed() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return dep_ != nullptr;
+    }
+
+    // Test helper: block until a BOUNDED driver has produced all its frames and the bridge has `tell`ed
+    // every one into the mailbox. After this returns, a status ask observes the full frame count
+    // (mailbox FIFO on a Sequential actor). No-op when there is no driver. NOT for unbounded drivers.
+    void await_driver_drain() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!dep_) return;
+        if (dep_->producer.joinable()) dep_->producer.join();
+        if (dep_->bridge.joinable()) dep_->bridge.join();
+    }
+
+private:
+    // All lifetimes of one deployment. Held as unique_ptrs so deploy() can build them imperatively
+    // (register_actor must run between construction steps) and teardown() can order the shutdown.
+    struct Deployment {
+        std::string name;
+        std::string version;
+        std::uint64_t key = 0;
+
+        std::vector<std::unique_ptr<aero::INode>> nodes;  // owns the flow's node instances
+        std::unique_ptr<aero::IDriver> driver;
+        aero::CompiledFlow flow;  // holds INode* into `nodes` — destroyed before `nodes`
+
+        std::unique_ptr<FlowActor> actor;
+        std::unique_ptr<quark::detail::MessagePool> pool;
+        std::unique_ptr<quark::Activation> activation;
+        std::unique_ptr<quark::Engine<>> engine;
+        std::unique_ptr<quark::LocalRouter> router;
+
+        std::unique_ptr<std::pmr::monotonic_buffer_resource> mr;
+        std::unique_ptr<quark::StreamActivation<aero::Frame>> stream;
+
+        std::atomic<bool> stop_flag{false};
+        std::atomic<bool> producer_done{false};
+        bool has_driver = false;
+
+        std::thread producer;  // declared last → joined in teardown, dtor sees non-joinable
+        std::thread bridge;
+    };
+
+    static void teardown(Deployment& d) noexcept {
+        d.stop_flag.store(true, std::memory_order_release);  // graceful stop (006 §8): finish in-flight
+        if (d.producer.joinable()) d.producer.join();
+        if (d.bridge.joinable()) d.bridge.join();
+        if (d.engine) d.engine->stop();
+        if (d.driver) d.driver->close();
+    }
+
+    NodeRegistry nodes_;
+    DriverRegistry drivers_;
+    std::unique_ptr<Deployment> dep_;
+    std::mutex mtx_;
+};
+
+}  // namespace aero::runtime

@@ -1,0 +1,11 @@
+{
+  "name": "hello_flow",
+  "version": "0.1.0",
+  "actor": { "kind": "edge", "key": 7 },
+  "flow": [
+    { "type_id": "aero.source.decode" },
+    { "type_id": "aero.transform.scale", "config": { "factor": 2 } },
+    { "type_id": "aero.output.sum" }
+  ],
+  "driver": { "type_id": "aero.driver.generator", "config": { "frame_count": 100 } }
+}

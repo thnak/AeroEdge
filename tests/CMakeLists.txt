@@ -38,3 +38,24 @@ add_executable(stateful_node stateful_node.cpp)
 target_link_libraries(stateful_node PRIVATE aero::core aero::nodes)
 add_test(NAME stateful_node COMMAND stateful_node)
 set_tests_properties(stateful_node PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-4 schema gate (009 §2, 013 T3): parse a well-formed Application → assert fields; malformed /
+# incomplete JSON → a clean error value (no throw), so the API can 4xx instead of aborting.
+add_executable(schema_load schema_load.cpp)
+target_link_libraries(schema_load PRIVATE aero::schema)
+add_test(NAME schema_load COMMAND schema_load)
+set_tests_properties(schema_load PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-4 LOAD-BEARING gate (009): in-process, NO socket — deploy a declarative Application into a
+# Runtime and assert the compiled flow runs every ingested frame (declarative deploy → running flow).
+add_executable(runtime_deploy runtime_deploy.cpp)
+target_link_libraries(runtime_deploy PRIVATE aero::runtime)
+add_test(NAME runtime_deploy COMMAND runtime_deploy)
+set_tests_properties(runtime_deploy PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-4 API gate (013 §5/§9): start the REST server on an ephemeral port, POST an Application + GET
+# /status over a real socket, assert it is reported, then shut down cleanly. Wait-for-ready by polling.
+add_executable(api_integration api_integration.cpp)
+target_link_libraries(api_integration PRIVATE aero::api)
+add_test(NAME api_integration COMMAND api_integration)
+set_tests_properties(api_integration PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

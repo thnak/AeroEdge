@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <vector>
 
 #include "aero/sdk/node.hpp"
 
@@ -88,6 +89,48 @@ public:
 
 private:
     std::array<double, K> ring_{};  // TRANSIENT per-instance state (007 §6) — lost + rebuilt on restart
+    std::size_t head_ = 0;
+    std::size_t count_ = 0;
+};
+
+// Runtime-window moving average (005 §5 registry): the same stateful transform as MovingAverageNode<K>
+// but with the window K chosen AT DEPLOY from `{"window": K}` config rather than a template parameter,
+// so the registry can build one instance per Application. The ring is sized ONCE in the ctor (N3
+// config-time allocation — allowed, off the hot path); process() is 0-alloc (it writes only the reused
+// context buffers, the ring is a pre-sized vector never grown). Transient per-instance state, lost and
+// rebuilt COLD on restart, identical to MovingAverageNode<K> (007 §6).
+class RuntimeMovingAverageNode final : public INode {
+public:
+    explicit RuntimeMovingAverageNode(std::size_t window) : ring_(window == 0 ? 1 : window, 0.0) {}
+
+    NodeResult process(ProcessingContext& ctx) noexcept override {
+        double sample = 0.0;  // fold the current working-set tags into one sample
+        for (const auto& tag : ctx.tags) {
+            sample += tag.value;
+        }
+        ring_[head_] = sample;
+        head_ = (head_ + 1) % ring_.size();
+        if (count_ < ring_.size()) {
+            ++count_;  // window still filling after a cold (re)start
+        }
+        double sum = 0.0;
+        for (std::size_t i = 0; i < count_; ++i) {
+            sum += ring_[i];
+        }
+        const double avg = sum / static_cast<double>(count_);
+        ctx.output.push_back(avg);
+        ctx.events.push_back(Event{"MovingAverage", avg});
+        return NodeResult::Continue;
+    }
+    const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
+
+    [[nodiscard]] std::size_t warm_samples() const noexcept { return count_; }
+    [[nodiscard]] std::size_t window() const noexcept { return ring_.size(); }
+
+    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.moving_average"};
+
+private:
+    std::vector<double> ring_;  // TRANSIENT per-instance state (007 §6) — sized once, never grown (N1)
     std::size_t head_ = 0;
     std::size_t count_ = 0;
 };
