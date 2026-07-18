@@ -1,0 +1,11 @@
+# Build outputs
+/build*/
+/out/
+compile_commands.json
+
+# Editor / OS
+.cache/
+.vscode/
+.idea/
+*.swp
+.DS_Store
