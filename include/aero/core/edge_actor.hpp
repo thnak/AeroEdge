@@ -43,14 +43,23 @@ protected:
         ++frames_processed_;
     }
 
+    // Durable-state promotion hook (007 §2, S1) — the customization point of the single write point.
+    // Default: no durable state (Phase-1 actors). A persistent Derived overrides this to promote
+    // committed facts (ctx staged output/events) into durable member fields and checkpoint them via
+    // the Quark 012 `Store` seam (see aero/core/persistent_actor.hpp). Resolved statically through the
+    // CRTP `Derived` — off the flow-execute hot path (runs at commit, never inside execute()).
+    void on_commit(const ProcessingContext&) noexcept {}
+
 private:
-    // Commit: apply staged output to committed actor state (I5). Phase-3 routes this through
-    // Quark 012 Persistent<>.
+    // Commit: apply staged output to committed actor state (I5), then invoke the durable-state
+    // promotion hook (007 §2). Persistence work happens HERE — at the commit point, off the 0-alloc
+    // execute path (Quark 012 "not on the hot path").
     void commit() noexcept {
         last_failed_ = ctx_.failed;
         if (!ctx_.output.empty()) {
             last_output_ = ctx_.output.back();
         }
+        static_cast<Derived*>(this)->on_commit(ctx_);
     }
 
     // Publish: emit Events post-commit (002 §3). Phase-1 counts them; Phase-2/4 `tell` subscribers.

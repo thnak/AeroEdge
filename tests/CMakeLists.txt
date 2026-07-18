@@ -23,3 +23,18 @@ add_executable(stream_backpressure stream_backpressure.cpp)
 target_link_libraries(stream_backpressure PRIVATE aero::core aero::nodes aero::drivers quark::quark)
 add_test(NAME stream_backpressure COMMAND stream_backpressure)
 set_tests_properties(stream_backpressure PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-3 load-bearing gate (007 §2/§6/§7): durable actor state survives a simulated restart — a
+# fresh actor recovers its snapshot from the SAME Store (InMemoryStore + crash-durable FileStore),
+# while a stateful node's transient window rebuilds cold ("nodes compute, actors remember").
+add_executable(persistence_recovery persistence_recovery.cpp)
+target_link_libraries(persistence_recovery PRIVATE aero::core aero::nodes quark::quark)
+add_test(NAME persistence_recovery COMMAND persistence_recovery)
+set_tests_properties(persistence_recovery PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-3 stateful-node gate (007 §6): engine-free proof that transient node state is lost + rebuilt
+# cold on restart while promoted (durable) actor state survives (S6).
+add_executable(stateful_node stateful_node.cpp)
+target_link_libraries(stateful_node PRIVATE aero::core aero::nodes)
+add_test(NAME stateful_node COMMAND stateful_node)
+set_tests_properties(stateful_node PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
