@@ -41,6 +41,17 @@ npm test -- --run   # vitest; the load-bearing test round-trips ../examples/hell
 npm run build       # tsc typecheck + vite build
 ```
 
+## End-to-end (Studio ↔ daemon)
+
+`scripts/e2e.sh` boots the `aero-runtime` daemon + the Vite dev server and drives the exact
+requests the Studio's `api.ts` makes THROUGH the `/api` proxy (deploy → status → list → undeploy),
+proving the full browser → Studio → proxy → daemon loop with no CORS. Requires the daemon built
+(`cmake --build build`):
+
+```bash
+bash studio/scripts/e2e.sh   # prints "E2E OK" on success
+```
+
 ## Gated
 
 Live device discovery and a live-daemon end-to-end require a running runtime + device; those are
