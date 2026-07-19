@@ -6,19 +6,19 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    # 24.04 ships the C++23 toolchains AeroEdge + QuarkCpp need (std::expected, deducing-this):
+    # g++-14 and clang-18 from the default repos. ubuntu-latest's defaults are too old.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        compiler: [g++, clang++]
-        sanitizer: ["", "address,undefined", "thread"]
         include:
-          - sanitizer: ""
-            build_type: Release
-          - sanitizer: "address,undefined"
-            build_type: Debug
-          - sanitizer: "thread"
-            build_type: Debug
+          - { compiler: g++-14,     build_type: Release, sanitizer: "" }
+          - { compiler: g++-14,     build_type: Debug,   sanitizer: "address,undefined" }
+          - { compiler: g++-14,     build_type: Debug,   sanitizer: "thread" }
+          - { compiler: clang++-18, build_type: Release, sanitizer: "" }
+          - { compiler: clang++-18, build_type: Debug,   sanitizer: "address,undefined" }
+          - { compiler: clang++-18, build_type: Debug,   sanitizer: "thread" }
     name: ${{ matrix.compiler }} ${{ matrix.sanitizer == '' && 'release' || matrix.sanitizer }}
     steps:
       - uses: actions/checkout@v4
@@ -31,11 +31,13 @@ jobs:
           repository: ${{ github.repository_owner }}/QuarkCpp
           path: QuarkCpp
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang g++
+        # g++-14 provides libstdc++-14 (which clang-18 uses for <expected>); ninja for the -G Ninja build.
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++-14 clang-18
       - name: Configure
         working-directory: AeroEdge
         run: >
-          CXX=${{ matrix.compiler }} cmake -S . -B build -G Ninja
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DAEROEDGE_SANITIZER="${{ matrix.sanitizer }}"
           -DQUARK_DIR=${{ github.workspace }}/QuarkCpp
