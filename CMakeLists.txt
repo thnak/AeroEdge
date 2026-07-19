@@ -107,7 +107,8 @@ add_library(aero::drivers ALIAS aero-drivers)
 # aero-core/aero-runtime — a transport adapter is an optional backend behind the seam, off the hot path.
 add_library(aero-transport INTERFACE)
 target_include_directories(aero-transport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-transport INTERFACE quark::quark)
+# Threads: the REAL socket backends (tcp/mqtt/grpc adapters) run accept/reader loops on std::thread.
+target_link_libraries(aero-transport INTERFACE quark::quark Threads::Threads)
 add_library(aero::transport ALIAS aero-transport)
 
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration

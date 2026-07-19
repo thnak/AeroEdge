@@ -42,6 +42,10 @@ jobs:
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 20
+      # uv hosts the real MQTT (amqtt) + gRPC (grpcio) backends the transport gates exercise. Installed
+      # BEFORE Configure so find_program(uv) locates it; without it those two tests skip cleanly instead.
+      - name: Install uv (real MQTT/gRPC transport backends)
+        uses: astral-sh/setup-uv@v5
       - name: Configure
         working-directory: AeroEdge
         run: >

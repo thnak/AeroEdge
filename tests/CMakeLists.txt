@@ -169,6 +169,48 @@ target_link_libraries(transport_gate PRIVATE aero::transport)
 add_test(NAME transport_gate COMMAND transport_gate)
 set_tests_properties(transport_gate PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# Phase-7 REAL-TCP gate (014 §4, X1): two nodes exchange genuine MessageFrames over an ACTUAL loopback
+# TCP socket (POSIX, no external backend) — round-trip delivery both directions, header fidelity (C4),
+# and per-(from → target) FIFO (C1) with no resequencer (TCP is the order-preserving substrate). The
+# frame codec (frame_codec.hpp) is exercised end-to-end here. Concurrent accept/reader threads → TSan gate.
+add_executable(tcp_transport tcp_transport.cpp)
+target_link_libraries(tcp_transport PRIVATE aero::transport)
+add_test(NAME tcp_transport COMMAND tcp_transport)
+set_tests_properties(tcp_transport PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# uv drives the Python-hosted backends (amqtt broker / grpcio server) the REAL MQTT & gRPC gates need.
+# Absent uv, those tests SKIP (exit 0 with a SKIP line) rather than fail — the backend is external infra.
+find_program(AERO_UV_BIN uv)
+if(NOT AERO_UV_BIN)
+  set(AERO_UV_BIN "uv")  # fall back to PATH lookup at runtime; the test skips cleanly if it is missing
+  message(STATUS "uv not found at configure time; MQTT/gRPC transport tests will skip if it is unavailable")
+endif()
+
+# Phase-7 REAL-MQTT gate (014 §5, X2/X3): two nodes exchange genuine MessageFrames through a REAL amqtt
+# broker (spawned via uv) using the hand-written MqttClientTransport — CONNECT/SUBSCRIBE/PUBLISH-QoS1/
+# PUBACK, topic-per-node, and the C1 resequencing shim passing a real stream exactly-once + FIFO. Spawns
+# a broker subprocess + reader threads → also a TSan gate. Longer timeout (may fetch amqtt on first run).
+add_executable(mqtt_transport mqtt_transport.cpp)
+target_link_libraries(mqtt_transport PRIVATE aero::transport)
+target_compile_definitions(mqtt_transport PRIVATE
+  AERO_UV_BIN="${AERO_UV_BIN}"
+  AERO_MQTT_BROKER_PY="${CMAKE_CURRENT_SOURCE_DIR}/py/mqtt_broker.py")
+add_test(NAME mqtt_transport COMMAND mqtt_transport)
+set_tests_properties(mqtt_transport PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL" TIMEOUT 120)
+
+# Phase-7 REAL-gRPC gate (014 §6, X2): the hand-written GrpcClientTransport (its OWN HTTP/2 + gRPC framing,
+# no gRPC library linked) exchanges genuine MessageFrames with a REAL grpcio bidi server (spawned via uv)
+# over an actual HTTP/2 stream — the server decodes each frame with AeroEdge's codec + echoes swapped,
+# proving a full round-trip with single-stream FIFO (no resequencer). Reader thread → TSan gate. Longer
+# timeout (may fetch grpcio on first run).
+add_executable(grpc_transport grpc_transport.cpp)
+target_link_libraries(grpc_transport PRIVATE aero::transport)
+target_compile_definitions(grpc_transport PRIVATE
+  AERO_UV_BIN="${AERO_UV_BIN}"
+  AERO_GRPC_SERVER_PY="${CMAKE_CURRENT_SOURCE_DIR}/py/grpc_echo_server.py")
+add_test(NAME grpc_transport COMMAND grpc_transport)
+set_tests_properties(grpc_transport PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL" TIMEOUT 120)
+
 # ---- Phase-8: distribution & horizontal scale (010) ------------------------------------------------
 # Phase-8 gate (010 §2): the device-affinity placement POLICY over Quark's Weighted-HRW — a device
 # actor is placed on an ELIGIBLE node (affinity respected), a device needing a capability no node has is

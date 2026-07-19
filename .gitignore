@@ -3,6 +3,10 @@
 /out/
 compile_commands.json
 
+# Python (test backends under tests/py/ run via uv)
+__pycache__/
+*.pyc
+
 # Editor / OS
 .cache/
 .vscode/
