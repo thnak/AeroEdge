@@ -130,10 +130,14 @@ set_tests_properties(native_extension PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
 # Phase-6 DSL gate (008 §6): the ExprRule grammar evaluates + routes correctly, malformed exprs are
 # rejected at configure (no crash), hot eval is 0-alloc (parse-once), and deploy accepts/rejects rules.
-add_executable(expr_rule expr_rule.cpp)
-target_link_libraries(expr_rule PRIVATE aero::runtime aero::nodes)
-add_test(NAME expr_rule COMMAND expr_rule)
-set_tests_properties(expr_rule PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+# Overrides global operator new for the 0-alloc check, which collides with clang's TSan C++ runtime
+# (see flow_zero_alloc above) — its logic is single-threaded, so skip it under -fsanitize=thread.
+if(NOT AEROEDGE_SANITIZER MATCHES "thread")
+  add_executable(expr_rule expr_rule.cpp)
+  target_link_libraries(expr_rule PRIVATE aero::runtime aero::nodes)
+  add_test(NAME expr_rule COMMAND expr_rule)
+  set_tests_properties(expr_rule PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+endif()
 
 # Phase-6 WASM-seam gate (008 §3, E1/E3/E4): the IWasmRuntime interface + capability/fuel types compile
 # and NullWasmRuntime returns the documented gate error — the honest seam with no faked execution (R5).
