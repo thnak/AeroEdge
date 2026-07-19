@@ -1,5 +1,7 @@
 # AeroEdge — Industrial Edge Platform (RFC)
 
+[![CI](https://github.com/thnak/AeroEdge/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/AeroEdge/actions/workflows/ci.yml)
+
 AeroEdge is a **C++ industrial edge platform** for managing edge devices, ingesting
 their data, and processing it through a rule/driver/event-driven pipeline. This
 repository is the **design RFC first** — a set of specification documents — with an
