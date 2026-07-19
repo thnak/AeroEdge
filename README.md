@@ -19,6 +19,14 @@ CI runs the C++ runtime across **GCC 14 + Clang 20 × Release / ASan+UBSan / TSa
 vitest + build on every push — see [Build & run](#build--run). The actor runtime underneath is
 **not** ours to build — it is [QuarkCpp](../QuarkCpp) (see below).
 
+## Docs
+
+- **[Setup Guide](docs/setup-guide.md)** — build from source, run the daemon, run the Studio.
+- **[User Guide](docs/user-guide.md)** — deploy & manage flows, the built-in node/driver catalog, the
+  rule expression language, the REST API, monitoring.
+
+The rest of this README covers the same build steps for a quick start, plus the architecture.
+
 ## Studio
 
 A React + Vite web app ([`studio/`](studio/)) to configure, build, deploy, and monitor flows,
@@ -42,7 +50,7 @@ talking only to `aero-api`:
 # from the repo root, with QuarkCpp at ../QuarkCpp
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure          # 26 deterministic tests
+ctest --test-dir build --output-on-failure          # 29 deterministic tests
 ```
 
 Sanitizer builds (the CI matrix — must stay green):
