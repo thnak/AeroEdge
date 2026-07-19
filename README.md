@@ -5,9 +5,13 @@ their data, and processing it through a rule/driver/event-driven pipeline. This
 repository is the **design RFC first** — a set of specification documents — with an
 implementation that follows the design, not the other way around.
 
-> **Status:** Draft v0.1. The core novelty (Flow Runtime, Node SDK, Processing
-> Context, Command/Event model) is specified here. The actor runtime underneath is
-> **not** ours to build — see below.
+> **Status:** Draft v0.1 — **specified _and_ implemented.** The RFC (specs 001–015) is complete,
+> and Phases 0–10 of the [implementation plan](IMPLEMENTATION-PLAN.md) are built and verified on
+> Linux/x86-64: the Flow Runtime, Node/Driver SDK, state/persistence, runtime daemon + REST/SSE API
+> + CLI, hot-reload, native/WASM-seam extensions, transport pluggability, distribution, MES hook,
+> firmware OTA, and the React Studio. Every C++ phase is green under **GCC + Clang + ASan/UBSan +
+> TSan**; see [Build & run](#build--run). The actor runtime underneath is **not** ours to build —
+> see below.
 
 ## Studio
 
@@ -15,6 +19,76 @@ A React + Vite web app ([`studio/`](studio/)) to configure, build, deploy, and m
 talking only to `aero-api`:
 
 ![AeroEdge Studio](studio/docs/screenshot.png)
+
+## Build & run
+
+### Prerequisites
+
+- A **C++23** compiler — GCC 13+ or Clang 17+ (verified on GCC 14.2 / Clang 20).
+- **CMake ≥ 3.24**.
+- **[QuarkCpp](../QuarkCpp)** checked out as a sibling directory (`../QuarkCpp`), or point at it with
+  `-DQUARK_DIR=/path/to/QuarkCpp`. AeroEdge links it as `quark::quark` — it is never forked or vendored.
+- **Node 18+ / npm** — only for the Studio.
+
+### Build & test the C++ core
+
+```bash
+# from the repo root, with QuarkCpp at ../QuarkCpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure          # 26 deterministic tests
+```
+
+Sanitizer builds (the CI matrix — must stay green):
+
+```bash
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DAEROEDGE_SANITIZER=address,undefined
+cmake --build build-asan -j && ctest --test-dir build-asan
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DAEROEDGE_SANITIZER=thread
+cmake --build build-tsan -j && ctest --test-dir build-tsan
+# swap the compiler with a leading `CXX=clang++` on the configure line
+```
+
+### Run the daemon + CLI
+
+```bash
+./build/aero-runtime --port 8080 &                  # the edge runtime daemon (aero-api on :8080)
+
+./build/aero deploy examples/hello_flow.json        # deploy a declarative Application
+./build/aero status                                 # -> frames_processed:100, last_output:198, ...
+./build/aero reload examples/hello_flow.json        # hot-reload (0 dropped Commands)
+./build/aero rollback hello_flow                    # roll back to the previous version
+./build/aero undeploy hello_flow
+```
+
+The management API is REST + JSON (`POST /apps`, `GET /status`, `PUT /apps/{name}`,
+`POST /apps/{name}/rollback`, `DELETE /apps/{name}`) with live metrics over SSE (`GET /metrics/stream`).
+
+### Run the Studio (web UI)
+
+```bash
+cd studio
+npm install
+npm run dev                                          # http://localhost:5173, proxies /api -> :8080
+npm test -- --run                                    # 14 vitest tests
+npm run build                                        # tsc typecheck + vite build
+```
+
+Point the Studio at a daemon elsewhere with `VITE_API_URL=http://<host>:<port> npm run dev`. To verify
+the whole loop (daemon + Studio + proxy) in one shot: `bash studio/scripts/e2e.sh` → prints `E2E OK`.
+
+### Project layout
+
+| Target | What | Plane |
+|---|---|---|
+| `aero-sdk` | `INode`/`IDriver`/`ProcessingContext` — the stable extension contract | runtime |
+| `aero-core` | Flow Runtime + compiler, `EdgeActorBase`, registries | runtime |
+| `aero-nodes` · `aero-drivers` | built-in nodes & drivers | runtime |
+| `aero-mes` · `aero-ota` · `aero-cluster` · `aero-transport` | MES hook, firmware OTA, placement, transports | runtime |
+| `aero-runtime` (daemon) · `aero-api` · `aero` (CLI) | the deployable edge daemon + REST/SSE + CLI | runtime |
+| `studio/` | React + Vite web app (talks only to `aero-api`) | tooling |
+
+See [013-Solution-Topology-and-Studio.md](013-Solution-Topology-and-Studio.md) for the full module map.
 
 ## The single most important design decision
 
