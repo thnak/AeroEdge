@@ -25,7 +25,10 @@ export interface ApiResult {
 export type Fetcher = typeof fetch;
 
 export class AeroApi {
-  constructor(private base = "/api", private fetcher: Fetcher = fetch) {}
+  // Default to a wrapper arrow, NOT the bare `fetch`: native fetch must be invoked with `this` ===
+  // the global (window). Storing it as a member and calling `this.fetcher(...)` would rebind `this`
+  // to the AeroApi instance → "Illegal invocation". Tests inject a plain mock (no `this` need).
+  constructor(private base = "/api", private fetcher: Fetcher = (input, init) => fetch(input, init)) {}
 
   private async req(method: string, path: string, body?: unknown): Promise<ApiResult> {
     const res = await this.fetcher(`${this.base}${path}`, {

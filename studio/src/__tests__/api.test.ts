@@ -49,6 +49,28 @@ describe("AeroApi request building", () => {
     expect(r.body).toEqual({ error: "invalid expression" });
   });
 
+  it("default fetcher invokes native fetch with the correct receiver (no Illegal invocation)", async () => {
+    // Regression: storing `fetch` as a member and calling this.fetcher(...) rebinds `this` and native
+    // fetch throws "Illegal invocation". Stub a global fetch that ENFORCES the window receiver.
+    const calls: string[] = [];
+    const realThisFetch = function (this: unknown, url: string) {
+      if (this !== globalThis && this !== undefined) throw new TypeError("Illegal invocation");
+      calls.push(url);
+      return Promise.resolve(new Response(JSON.stringify({ deployed: false }), { status: 200 }));
+    };
+    const g = globalThis as unknown as { fetch: unknown };
+    const saved = g.fetch;
+    g.fetch = realThisFetch;
+    try {
+      const api = new AeroApi("/api"); // uses the DEFAULT fetcher (the bug's blast radius)
+      const r = await api.status();
+      expect(r.ok).toBe(true);
+      expect(calls).toEqual(["/api/status"]);
+    } finally {
+      g.fetch = saved;
+    }
+  });
+
   it("gates runtime-assisted discovery (browser never dials a device)", async () => {
     const r = await new AeroApi("/api", mockFetch() as unknown as typeof fetch).discover("aero.driver.generator");
     expect(r.available).toBe(false);
