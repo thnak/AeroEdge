@@ -1,19 +1,23 @@
 # AeroEdge — Industrial Edge Platform (RFC)
 
-[![CI](https://github.com/thnak/AeroEdge/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/AeroEdge/actions/workflows/ci.yml)
-
 AeroEdge is a **C++ industrial edge platform** for managing edge devices, ingesting
 their data, and processing it through a rule/driver/event-driven pipeline. This
 repository is the **design RFC first** — a set of specification documents — with an
 implementation that follows the design, not the other way around.
 
-> **Status:** Draft v0.1 — **specified _and_ implemented.** The RFC (specs 001–015) is complete,
-> and Phases 0–10 of the [implementation plan](IMPLEMENTATION-PLAN.md) are built and verified on
-> Linux/x86-64: the Flow Runtime, Node/Driver SDK, state/persistence, runtime daemon + REST/SSE API
-> + CLI, hot-reload, native/WASM-seam extensions, transport pluggability, distribution, MES hook,
-> firmware OTA, and the React Studio. Every C++ phase is green under **GCC + Clang + ASan/UBSan +
-> TSan**; see [Build & run](#build--run). The actor runtime underneath is **not** ours to build —
-> see below.
+## Status
+
+[![CI](https://github.com/thnak/AeroEdge/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/AeroEdge/actions/workflows/ci.yml)
+
+**Draft v0.1 — specified _and_ implemented.** The RFC (specs 001–015) is complete, and Phases 0–10
+of the [implementation plan](IMPLEMENTATION-PLAN.md) are built and verified on Linux/x86-64: the
+Flow Runtime, Node/Driver SDK, state/persistence, runtime daemon + REST/SSE API + CLI, hot-reload,
+native/WASM-seam extensions, transport pluggability, distribution, MES hook, firmware OTA, and the
+React Studio.
+
+CI runs the C++ runtime across **GCC 14 + Clang 20 × Release / ASan+UBSan / TSan** and the Studio's
+vitest + build on every push — see [Build & run](#build--run). The actor runtime underneath is
+**not** ours to build — it is [QuarkCpp](../QuarkCpp) (see below).
 
 ## Studio
 
