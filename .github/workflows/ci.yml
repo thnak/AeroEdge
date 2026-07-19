@@ -12,13 +12,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # clang-18 must be pointed at gcc-14's libstdc++ (which has <expected>); g++-14 uses its own.
         include:
-          - { compiler: g++-14,     build_type: Release, sanitizer: "" }
-          - { compiler: g++-14,     build_type: Debug,   sanitizer: "address,undefined" }
-          - { compiler: g++-14,     build_type: Debug,   sanitizer: "thread" }
-          - { compiler: clang++-18, build_type: Release, sanitizer: "" }
-          - { compiler: clang++-18, build_type: Debug,   sanitizer: "address,undefined" }
-          - { compiler: clang++-18, build_type: Debug,   sanitizer: "thread" }
+          - { compiler: g++-14,     build_type: Release, sanitizer: "",                 stdlib: "" }
+          - { compiler: g++-14,     build_type: Debug,   sanitizer: "address,undefined", stdlib: "" }
+          - { compiler: g++-14,     build_type: Debug,   sanitizer: "thread",            stdlib: "" }
+          - { compiler: clang++-18, build_type: Release, sanitizer: "",                 stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
+          - { compiler: clang++-18, build_type: Debug,   sanitizer: "address,undefined", stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
+          - { compiler: clang++-18, build_type: Debug,   sanitizer: "thread",            stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
     name: ${{ matrix.compiler }} ${{ matrix.sanitizer == '' && 'release' || matrix.sanitizer }}
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +39,8 @@ jobs:
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_CXX_FLAGS="${{ matrix.stdlib }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.stdlib }}"
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DAEROEDGE_SANITIZER="${{ matrix.sanitizer }}"
           -DQUARK_DIR=${{ github.workspace }}/QuarkCpp
