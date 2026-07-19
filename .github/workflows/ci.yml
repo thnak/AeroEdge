@@ -58,3 +58,23 @@ jobs:
       - name: Test
         working-directory: AeroEdge
         run: ctest --test-dir build --output-on-failure
+
+  studio:
+    name: studio (web)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+      - name: Install
+        working-directory: studio
+        run: npm ci
+      - name: Test (vitest)
+        working-directory: studio
+        run: npm test -- --run
+      - name: Build (tsc + vite)
+        working-directory: studio
+        run: npm run build
