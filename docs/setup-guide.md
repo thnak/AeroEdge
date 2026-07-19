@@ -102,6 +102,15 @@ If your daemon isn't on `127.0.0.1:8080`, point the Studio at it:
 VITE_API_URL=http://<host>:<port> npm run dev
 ```
 
+Open `http://localhost:5173` — you should see the Flow Designer with the `hello_flow` example
+pre-loaded, and (once you deploy it, either from here or via the CLI as in §5) live metrics
+streaming in under **Deploy & Monitor**:
+
+![AeroEdge Studio — Flow Designer + live Deploy & Monitor](../studio/docs/screenshot.png)
+
+*`deployed: true · frames: 100 · events: 100 · last output: 198` confirms the daemon, the Studio,
+and the proxy between them are all wired up correctly.*
+
 See [studio/README.md](../studio/README.md) for what each panel does.
 
 ## Troubleshooting
