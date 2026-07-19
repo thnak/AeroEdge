@@ -296,6 +296,12 @@ the same REST API:
   table above, rendered as UI).
 - **Deploy & Monitor** — deploy, watch live metrics over SSE, reload, rollback — all from the browser.
 
+![AeroEdge Studio — Flow Designer + live Deploy & Monitor](../studio/docs/screenshot.png)
+
+*The `hello_flow` pipeline from [Your first flow](#your-first-flow) (Decode → Scale → Sum) in the
+Flow Designer, its generated Application JSON alongside, and Deploy & Monitor streaming metrics
+live over SSE — the same `frames`/`events`/`last output` fields from [Monitoring](#monitoring).*
+
 Start it per the [Setup Guide](setup-guide.md#6-optional-run-the-studio-web-ui) and point it at your
 running daemon.
 
