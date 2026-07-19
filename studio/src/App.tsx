@@ -1,6 +1,6 @@
 // The Studio shell (013 §5): compose the Flow Designer with a deploy/monitor panel driven by the
 // aero-api client. Starts from the hello_flow example so it's usable immediately.
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { FlowDesigner } from "./FlowDesigner";
 import { Panel, Button } from "./components";
 import { AeroApi, type StatusSnapshot } from "./api";
@@ -24,11 +24,20 @@ export function App() {
   const [model, setModel] = useState<FlowModel>(() => fromApplication(HELLO));
   const [log, setLog] = useState<string[]>([]);
   const [status, setStatus] = useState<StatusSnapshot | null>(null);
+  const [live, setLive] = useState(false);
 
   const app = toApplication(model);
   const errors = validateApplication(app, sourceIds(), outputIds());
 
   const say = (m: string) => setLog((l) => [m, ...l].slice(0, 20));
+
+  // Live monitoring: subscribe to the aero-api SSE metrics stream (013 §5). Each snapshot updates the
+  // panel in place. The subscription is torn down when Live turns off or the component unmounts.
+  useEffect(() => {
+    if (!live) return;
+    const unsubscribe = api.subscribeMetrics((s) => setStatus(s));
+    return unsubscribe;
+  }, [live, api]);
 
   const deploy = async () => {
     if (errors.length) { say(`✗ invalid: ${errors.join("; ")}`); return; }
@@ -52,7 +61,10 @@ export function App() {
 
       <Panel title="Deploy & Monitor"
         actions={<><Button variant="primary" onClick={deploy} disabled={errors.length > 0}>Deploy</Button>
-                   <Button onClick={refresh}>Refresh status</Button></>}>
+                   <Button onClick={refresh}>Refresh status</Button>
+                   <Button variant={live ? "danger" : "default"} onClick={() => setLive((v) => !v)}>
+                     {live ? "■ Stop live" : "● Go live"}</Button></>}>
+        {live && <p className="live-badge">● live — streaming metrics over SSE</p>}
         {errors.length > 0 && <p className="field-error">{errors.join("; ")}</p>}
         {status && (
           <dl className="status">

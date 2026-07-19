@@ -76,4 +76,49 @@ describe("AeroApi request building", () => {
     expect(r.available).toBe(false);
     expect(r.notice).toMatch(/runtime \+ device/i);
   });
+
+  it("subscribeMetrics opens the SSE stream and unsubscribes cleanly", () => {
+    let opened = "";
+    let closed = false;
+    class MockES {
+      onmessage: ((e: { data: string }) => void) | null = null;
+      constructor(url: string) { opened = url; }
+      close() { closed = true; }
+    }
+    const g = globalThis as unknown as { EventSource: unknown };
+    const saved = g.EventSource;
+    g.EventSource = MockES as unknown;
+    try {
+      const unsub = new AeroApi("/api").subscribeMetrics(() => {});
+      expect(opened).toBe("/api/metrics/stream");
+      unsub();
+      expect(closed).toBe(true);
+    } finally {
+      g.EventSource = saved;
+    }
+  });
+
+  it("subscribeMetrics parses each SSE frame into a snapshot", () => {
+    // A MockES that exposes the created instance so we can fire messages at it.
+    let inst: { onmessage: ((e: { data: string }) => void) | null; close: () => void } | null = null;
+    class MockES {
+      onmessage: ((e: { data: string }) => void) | null = null;
+      constructor(public url: string) { inst = this; }
+      close() {}
+    }
+    const g = globalThis as unknown as { EventSource: unknown };
+    const saved = g.EventSource;
+    g.EventSource = MockES as unknown;
+    try {
+      const api = new AeroApi("/api");
+      const seen: Array<number | undefined> = [];
+      api.subscribeMetrics((s) => seen.push(s.frames_processed));
+      inst!.onmessage!({ data: JSON.stringify({ deployed: true, frames_processed: 50 }) });
+      inst!.onmessage!({ data: JSON.stringify({ deployed: true, frames_processed: 100 }) });
+      inst!.onmessage!({ data: "not-json" }); // malformed frame ignored, no throw
+      expect(seen).toEqual([50, 100]);
+    } finally {
+      g.EventSource = saved;
+    }
+  });
 });

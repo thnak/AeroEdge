@@ -30,19 +30,26 @@ try {
 
   const clickByText = (text) =>
     page.evaluate((t) => {
-      const b = [...document.querySelectorAll("button")].find((x) => x.textContent?.trim() === t);
+      const b = [...document.querySelectorAll("button")].find((x) => x.textContent?.trim().includes(t));
       if (b) { b.click(); return true; }
       return false;
     }, text);
 
+  // Enable LIVE (SSE) monitoring, then Deploy — the panel must update from the STREAM, no Refresh.
+  console.log("[click Go live]", await clickByText("Go live"));
+  await new Promise((r) => setTimeout(r, 300));
   console.log("[click Deploy]", await clickByText("Deploy"));
-  await new Promise((r) => setTimeout(r, 800));
-  console.log("[click Refresh status]", await clickByText("Refresh status"));
 
-  const gotStatus = await page.waitForSelector("dl.status", { timeout: 8000 }).then(() => true).catch(() => false);
-  console.log("[dl.status rendered]", gotStatus);
-  await new Promise((r) => setTimeout(r, 400));
+  // Poll the panel until the SSE stream reports frames=100 — proving the stream (not a manual fetch)
+  // drives the monitor. Fails loudly if the stream never delivers through the proxy.
+  const framesLive = await page.waitForFunction(() => {
+    const dds = [...document.querySelectorAll("dl.status dt")];
+    const frames = dds.find((dt) => dt.textContent === "frames")?.nextElementSibling?.textContent;
+    return frames === "100" ? frames : false;
+  }, { timeout: 12000 }).then((h) => h.jsonValue()).catch(() => null);
+  console.log("[live frames via SSE]", framesLive);
 
+  await new Promise((r) => setTimeout(r, 300));
   await page.screenshot({ path: out });
   console.log("wrote", out);
 } finally {

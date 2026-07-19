@@ -9,7 +9,8 @@ it never touches a device directly.
 
 *The Studio running against a live `aero-runtime` daemon: the `hello_flow` pipeline
 (Decode → Scale → Sum) in the Flow Designer, the generated Application JSON, and the Deploy &
-Monitor panel reading back `deployed: true · frames: 100 · events: 100 · last output: 198`.*
+Monitor panel **streaming metrics live over SSE** (`● live`) — `deployed: true · frames: 100 ·
+events: 100 · last output: 198`.*
 
 ## Run
 
