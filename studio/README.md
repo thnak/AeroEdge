@@ -5,6 +5,12 @@ plane of spec [013](../013-Solution-Topology-and-Studio.md) and the plugin-UI co
 [015](../015-Configuration-Model-and-Studio-Plugin-UI.md). It talks **only** to `aero-api` (013 T2);
 it never touches a device directly.
 
+![AeroEdge Studio — Flow Designer + live Deploy & Monitor](docs/screenshot.png)
+
+*The Studio running against a live `aero-runtime` daemon: the `hello_flow` pipeline
+(Decode → Scale → Sum) in the Flow Designer, the generated Application JSON, and the Deploy &
+Monitor panel reading back `deployed: true · frames: 100 · events: 100 · last output: 198`.*
+
 ## Run
 
 ```bash

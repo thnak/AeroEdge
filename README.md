@@ -9,6 +9,13 @@ implementation that follows the design, not the other way around.
 > Context, Command/Event model) is specified here. The actor runtime underneath is
 > **not** ours to build — see below.
 
+## Studio
+
+A React + Vite web app ([`studio/`](studio/)) to configure, build, deploy, and monitor flows,
+talking only to `aero-api`:
+
+![AeroEdge Studio](studio/docs/screenshot.png)
+
 ## The single most important design decision
 
 **AeroEdge does not implement an actor runtime. It builds on [QuarkCpp](../QuarkCpp).**
