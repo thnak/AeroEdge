@@ -12,14 +12,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # clang-18 must be pointed at gcc-14's libstdc++ (which has <expected>); g++-14 uses its own.
+        # Toolchains match the verified local set: g++-14 and clang-20 (from apt.llvm.org). clang is
+        # pointed at gcc-14's libstdc++ (which provides <expected>) via --gcc-install-dir; older clang
+        # + gcc-14 headers do not compile, and Quark is only verified on clang-20.
         include:
           - { compiler: g++-14,     build_type: Release, sanitizer: "",                 stdlib: "" }
           - { compiler: g++-14,     build_type: Debug,   sanitizer: "address,undefined", stdlib: "" }
           - { compiler: g++-14,     build_type: Debug,   sanitizer: "thread",            stdlib: "" }
-          - { compiler: clang++-18, build_type: Release, sanitizer: "",                 stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
-          - { compiler: clang++-18, build_type: Debug,   sanitizer: "address,undefined", stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
-          - { compiler: clang++-18, build_type: Debug,   sanitizer: "thread",            stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
+          - { compiler: clang++-20, build_type: Release, sanitizer: "",                 stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
+          - { compiler: clang++-20, build_type: Debug,   sanitizer: "address,undefined", stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
+          - { compiler: clang++-20, build_type: Debug,   sanitizer: "thread",            stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
     name: ${{ matrix.compiler }} ${{ matrix.sanitizer == '' && 'release' || matrix.sanitizer }}
     steps:
       - uses: actions/checkout@v4
@@ -32,8 +34,14 @@ jobs:
           repository: ${{ github.repository_owner }}/QuarkCpp
           path: QuarkCpp
       - name: Install toolchain
-        # g++-14 provides libstdc++-14 (which clang-18 uses for <expected>); ninja for the -G Ninja build.
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++-14 clang-18
+        # g++-14 provides libstdc++-14 (which clang uses for <expected>); clang-20 from apt.llvm.org
+        # (matches the verified local toolchain); ninja for the -G Ninja build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++-14 lsb-release wget software-properties-common gnupg
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
       - name: Configure
         working-directory: AeroEdge
         run: >
