@@ -130,8 +130,8 @@ add_library(aero::schema ALIAS aero-schema)
 add_library(aero-runtime INTERFACE)
 target_include_directories(aero-runtime INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-runtime INTERFACE
-  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-schema quark::quark aero-thirdparty-json
-  Threads::Threads)
+  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-ota aero-cluster aero-schema quark::quark
+  aero-thirdparty-json Threads::Threads)
 add_library(aero::runtime ALIAS aero-runtime)
 
 # aero-api — the thin REST/SSE management shell over aero-runtime (013 §5/§9). httplib lives here only.

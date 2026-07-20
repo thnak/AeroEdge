@@ -263,6 +263,14 @@ target_link_libraries(ota_rollout PRIVATE aero::ota)
 add_test(NAME ota_rollout COMMAND ota_rollout)
 set_tests_properties(ota_rollout PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# Phase-11.2 gate (016 §2.1/§2.2): Cluster+Fleet(OTA) wired into Runtime + reachable over the real REST
+# API — GET /fleet and GET /ota/rollouts are {"configured": false} until configure_fleet(), then
+# reflect real placement (010) and a real wave-by-wave rollout (011) against the registered devices.
+add_executable(runtime_fleet_wiring runtime_fleet_wiring.cpp)
+target_link_libraries(runtime_fleet_wiring PRIVATE aero::api)
+add_test(NAME runtime_fleet_wiring COMMAND runtime_fleet_wiring)
+set_tests_properties(runtime_fleet_wiring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-10 breadth gate (005 §2): the new compute nodes each transform correctly and malformed input is
 # handled without a crash (odd Modbus frame → Error; bad JSON → Error; CRC/mean/minmax/sum values).
 add_executable(breadth_nodes breadth_nodes.cpp)

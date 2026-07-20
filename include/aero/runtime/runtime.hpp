@@ -32,6 +32,7 @@
 
 #include <optional>
 
+#include "aero/cluster/cluster.hpp"
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
@@ -39,6 +40,8 @@
 #include "aero/mes/mes.hpp"
 #include "aero/mes/outbox.hpp"
 #include "aero/mes/rest_mes_adapter.hpp"
+#include "aero/ota/fleet.hpp"
+#include "aero/ota/ota.hpp"
 #include "aero/nodes/builtin_nodes.hpp"
 #include "aero/nodes/compute_nodes.hpp"
 #include "aero/nodes/expr_rule_node.hpp"
@@ -461,7 +464,152 @@ public:
         return j;
     }
 
+    // ---- Cluster + Fleet(OTA) observability (010/011, 016 §2.1/§2.2) --------------------------------
+    // The device registry source (016 §6 open question) is resolved here as the minimal honest answer:
+    // a config-driven list, one call at daemon start (mirrors configure_mes()). Builds a ClusterView
+    // scoped to what ONE daemon can honestly see (016 §2.1 — real multi-node membership stays gated on
+    // Quark 019/021) and a FleetActor over per-device MockOtaDriver instances (016 §2.2 — real
+    // orchestration policy, but no real firmware-push driver/crypto exists yet, R5).
+    struct FleetDeviceConfig {
+        std::string id;
+        std::string initial_version;
+        std::vector<std::string> required_flags;
+        std::vector<std::string> preferred_flags;
+    };
+    struct FleetConfig {
+        std::vector<std::string> node_flags;
+        std::vector<FleetDeviceConfig> devices;
+        double ota_threshold = 1.0;
+        std::size_t ota_canary = 1;
+        std::size_t ota_staged = 1;
+        std::size_t ota_rate_limit = 1;
+        // A keyed-hash trust root (011 §3, GATED stand-in for real asymmetric signing — see ota.hpp
+        // sign_image()'s own comment). Never a real secret; a production adapter uses Quark 020.
+        std::uint64_t ota_trust_key = 0xA1B2C3D4ULL;
+    };
+
+    std::expected<void, std::string> configure_fleet(const FleetConfig& cfg) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (cluster_) {
+            return std::unexpected("fleet already configured");
+        }
+
+        node_flags_ = cfg.node_flags;
+        quark::NodeCapabilities node_caps;
+        for (const auto& f : cfg.node_flags) node_caps.add(quark::Flag{f});
+        cluster_ = std::make_unique<aero::cluster::ClusterView>(
+            std::vector<aero::cluster::NodeSpec>{aero::cluster::NodeSpec{quark::NodeId{1}, node_caps}});
+
+        ota_trust_key_ = cfg.ota_trust_key;
+        ota_ = std::make_unique<aero::ota::FleetActor>(cfg.ota_threshold, cfg.ota_canary, cfg.ota_staged,
+                                                       cfg.ota_rate_limit);
+
+        std::vector<aero::cluster::DeviceActor> devs;
+        std::uint64_t key = 1;
+        for (const auto& d : cfg.devices) {
+            aero::cluster::PlacementRequirement req;
+            for (const auto& f : d.required_flags) {
+                req.required.push_back(aero::cluster::CapabilityConstraint::flag(f));
+            }
+            for (const auto& f : d.preferred_flags) {
+                req.preferred.push_back(aero::cluster::CapabilityConstraint::flag(f));
+            }
+            devs.push_back(aero::cluster::DeviceActor{quark::ActorId{quark::TypeKey{0x0DE7}, key++}, req, d.id});
+
+            // Owned here (unique_ptr so the vector can grow without invalidating the pointee address);
+            // FleetActor only holds a non-owning pointer (ota/fleet.hpp FleetDevice).
+            auto driver = std::make_unique<aero::ota::MockOtaDriver>(d.initial_version);
+            ota_->add_device(d.id, *driver);
+            ota_drivers_.push_back(std::move(driver));
+        }
+        placement_ = aero::cluster::place_actors(devs, *cluster_);
+        device_actors_ = std::move(devs);
+        return {};
+    }
+
+    // Fleet/placement observability (016 §2.1): {"configured": false} until configure_fleet().
+    nlohmann::json fleet_status() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json j;
+        if (!cluster_) {
+            j["configured"] = false;
+            return j;
+        }
+        j["configured"] = true;
+        nlohmann::json node;
+        node["id"] = 1;
+        node["flags"] = node_flags_;
+        j["nodes"] = nlohmann::json::array({std::move(node)});
+
+        nlohmann::json devices = nlohmann::json::array();
+        for (const auto& d : device_actors_) {
+            nlohmann::json dj;
+            dj["id"] = d.name;
+            const auto it = placement_.assignments.find(d.id);
+            dj["eligible"] = it != placement_.assignments.end();
+            if (it != placement_.assignments.end()) {
+                dj["node"] = it->second.value;
+            }
+            devices.push_back(std::move(dj));
+        }
+        j["devices"] = std::move(devices);
+        return j;
+    }
+
+    // OTA rollout observability (016 §2.2): {"configured": false} until configure_fleet().
+    nlohmann::json ota_status() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json j;
+        if (!ota_) {
+            j["configured"] = false;
+            return j;
+        }
+        j["configured"] = true;
+        j["state"] = rollout_state_name(ota_->state());
+        j["devices_updated"] = ota_->devices_updated();
+        j["devices_rolled_back"] = ota_->devices_rolled_back();
+        nlohmann::json waves = nlohmann::json::array();
+        for (const auto& w : last_waves_) {
+            nlohmann::json wj;
+            wj["name"] = w.name;
+            wj["attempted"] = w.attempted;
+            wj["succeeded"] = w.succeeded;
+            wj["success_rate"] = w.success_rate;
+            wj["passed"] = w.passed;
+            waves.push_back(std::move(wj));
+        }
+        j["waves"] = std::move(waves);
+        return j;
+    }
+
+    // Start a wave-by-wave rollout (011 §4) against the registered (mock) drivers. `image_bytes` is the
+    // firmware payload; the signature is derived from the daemon's own configured trust key (never sent
+    // over the wire — 012 M5 posture). Synchronous: FleetActor::run() is a deterministic, in-memory,
+    // sub-millisecond loop over MockOtaDriver — no socket, so no need for a separate actor/engine (unlike
+    // the MES gateway, which fronts a real blocking HTTP client).
+    std::expected<void, std::string> start_rollout(const std::string& image_version,
+                                                    const std::string& image_bytes) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!ota_) {
+            return std::unexpected("fleet not configured");
+        }
+        aero::ota::OtaImage image{image_version, image_bytes, ""};
+        image.signature = aero::ota::sign_image(image, ota_trust_key_);
+        last_waves_ = ota_->run(image, ota_trust_key_);
+        return {};
+    }
+
 private:
+    static const char* rollout_state_name(aero::ota::RolloutState s) noexcept {
+        switch (s) {
+            case aero::ota::RolloutState::Idle:      return "Idle";
+            case aero::ota::RolloutState::Running:   return "Running";
+            case aero::ota::RolloutState::Paused:    return "Paused";
+            case aero::ota::RolloutState::Completed: return "Completed";
+        }
+        return "Idle";
+    }
+
     // All lifetimes of one deployment. Held as unique_ptrs so deploy() can build them imperatively
     // (register_actor must run between construction steps) and teardown() can order the shutdown.
     struct Deployment {
@@ -541,6 +689,16 @@ private:
     std::unique_ptr<quark::Activation> mes_activation_;
     std::unique_ptr<quark::Engine<>> mes_engine_;
     std::unique_ptr<quark::LocalRouter> mes_router_;
+
+    // Fleet/OTA/placement lifetime (daemon-scoped, set by configure_fleet() above).
+    std::vector<std::string> node_flags_;
+    std::unique_ptr<aero::cluster::ClusterView> cluster_;
+    std::vector<aero::cluster::DeviceActor> device_actors_;
+    aero::cluster::PlacementPlan placement_;
+    std::vector<std::unique_ptr<aero::ota::MockOtaDriver>> ota_drivers_;
+    std::unique_ptr<aero::ota::FleetActor> ota_;
+    std::uint64_t ota_trust_key_ = 0;
+    std::vector<aero::ota::WaveResult> last_waves_;
 };
 
 }  // namespace aero::runtime

@@ -11,6 +11,9 @@
 //   GET    /metrics/stream   → SSE stream of status snapshots (live metrics)
 //   GET    /mes/outbox       → Runtime.mes_outbox_stats() (016 §2.3 — real, ungated)
 //   POST   /mes/outbox/drain → nudge a stuck outbox drain (M3)
+//   GET    /fleet            → Runtime.fleet_status() (016 §2.1 — real, single-daemon scope)
+//   GET    /ota/rollouts     → Runtime.ota_status() (016 §2.2 — real orchestration, mock drivers)
+//   POST   /ota/rollouts     → body = {"version","bytes"} → Runtime.start_rollout()
 //
 // httplib (cpp-httplib) is confined to aero-api/aero-cli (R1): it never enters aero-core/aero-sdk.
 #pragma once
@@ -127,6 +130,35 @@ public:
             }
             res.status = 200;
             res.set_content(rt_.mes_outbox_stats().dump(), "application/json");
+        });
+
+        // Fleet/placement observability (016 §2.1): {"configured": false} until configure_fleet().
+        svr.Get("/fleet", [this](const httplib::Request&, httplib::Response& res) {
+            res.set_content(rt_.fleet_status().dump(), "application/json");
+        });
+
+        // OTA rollout observability + control (016 §2.2). GET is idempotent status; POST starts a new
+        // wave-by-wave rollout (011 §4) against the registered drivers — body carries ONLY the image
+        // (version + payload bytes), never a trust key (012 M5 posture, 016 §2.2).
+        svr.Get("/ota/rollouts", [this](const httplib::Request&, httplib::Response& res) {
+            res.set_content(rt_.ota_status().dump(), "application/json");
+        });
+
+        svr.Post("/ota/rollouts", [this](const httplib::Request& req, httplib::Response& res) {
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.contains("version")) {
+                res.status = 400;
+                res.set_content(error_json("body must be JSON with a 'version' field"), "application/json");
+                return;
+            }
+            auto r = rt_.start_rollout(body.value("version", std::string{}), body.value("bytes", std::string{}));
+            if (!r) {
+                res.status = 400;
+                res.set_content(error_json(r.error()), "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(rt_.ota_status().dump(), "application/json");
         });
     }
 
