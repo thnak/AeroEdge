@@ -1,5 +1,8 @@
-// The Flows page (016 §1): the Flow Designer + Deploy/Monitor panel, unchanged from the pre-016
-// single-page Studio other than losing its own <header> (the AppShell now owns page chrome).
+// The Flows page (016 §1): the Flow Designer + Deploy/Monitor/History panel. `Runtime` hosts exactly
+// one Application at a time (016 §1 correction) — POST /apps only works the FIRST time; once
+// something is deployed, changing the flow and clicking Deploy again must PUT /apps/{name} (hot-
+// reload, 009 §4) instead, or the runtime rejects it ("a runtime hosts one Application"). Rollback
+// (009 §6) reverts to the one prior version Runtime keeps.
 import { useEffect, useMemo, useState } from "react";
 import { FlowDesigner } from "../FlowDesigner";
 import { Panel, Button } from "../components";
@@ -25,11 +28,24 @@ export function FlowsPage() {
   const [log, setLog] = useState<string[]>([]);
   const [status, setStatus] = useState<StatusSnapshot | null>(null);
   const [live, setLive] = useState(false);
+  const [deployed, setDeployed] = useState(false);
 
   const app = toApplication(model);
   const errors = validateApplication(app, sourceIds(), outputIds());
 
   const say = (m: string) => setLog((l) => [m, ...l].slice(0, 20));
+
+  // On mount: pick up whatever the daemon already has running (e.g. a page reload) so Deploy targets
+  // reload/PUT instead of a doomed second POST.
+  useEffect(() => {
+    void api.status().then((r) => {
+      if (r.ok) {
+        const s = r.body as StatusSnapshot;
+        setStatus(s);
+        setDeployed(Boolean(s.deployed));
+      }
+    });
+  }, [api]);
 
   // Live monitoring: subscribe to the aero-api SSE metrics stream (013 §5). Each snapshot updates the
   // panel in place. The subscription is torn down when Live turns off or the component unmounts.
@@ -41,13 +57,33 @@ export function FlowsPage() {
 
   const deploy = async () => {
     if (errors.length) { say(`✗ invalid: ${errors.join("; ")}`); return; }
-    const r = await api.deploy(app);
-    say(r.ok ? `✓ deployed ${app.name}@${app.version}` : `✗ deploy ${r.status}: ${JSON.stringify(r.body)}`);
+    const r = deployed ? await api.reload(app.name, app) : await api.deploy(app);
+    if (r.ok) {
+      setDeployed(true);
+      say(`✓ ${deployed ? "reloaded" : "deployed"} ${app.name}@${app.version}`);
+    } else {
+      say(`✗ ${deployed ? "reload" : "deploy"} ${r.status}: ${JSON.stringify(r.body)}`);
+    }
   };
   const refresh = async () => {
     const r = await api.status();
     if (r.ok) setStatus(r.body as StatusSnapshot);
     say(r.ok ? "✓ status" : `✗ status ${r.status}`);
+  };
+  const rollback = async () => {
+    const r = await api.rollback(app.name);
+    say(r.ok ? `✓ rolled back ${app.name}` : `✗ rollback ${r.status}: ${JSON.stringify(r.body)}`);
+    if (r.ok) await refresh();
+  };
+  const undeploy = async () => {
+    const r = await api.undeploy(app.name);
+    if (r.ok) {
+      setDeployed(false);
+      setStatus(null);
+      say(`✓ undeployed ${app.name}`);
+    } else {
+      say(`✗ undeploy ${r.status}: ${JSON.stringify(r.body)}`);
+    }
   };
 
   return (
@@ -55,10 +91,16 @@ export function FlowsPage() {
       <FlowDesigner model={model} onChange={setModel} />
 
       <Panel title="Deploy & Monitor"
-        actions={<><Button variant="primary" onClick={deploy} disabled={errors.length > 0}>Deploy</Button>
-                   <Button onClick={refresh}>Refresh status</Button>
-                   <Button variant={live ? "danger" : "default"} onClick={() => setLive((v) => !v)}>
-                     {live ? "■ Stop live" : "● Go live"}</Button></>}>
+        actions={<>
+          <Button variant="primary" onClick={deploy} disabled={errors.length > 0}>
+            {deployed ? "Redeploy (hot-reload)" : "Deploy"}
+          </Button>
+          <Button onClick={refresh}>Refresh status</Button>
+          <Button onClick={rollback} disabled={!deployed}>Rollback</Button>
+          <Button variant="danger" onClick={undeploy} disabled={!deployed}>Undeploy</Button>
+          <Button variant={live ? "danger" : "default"} onClick={() => setLive((v) => !v)}>
+            {live ? "■ Stop live" : "● Go live"}</Button>
+        </>}>
         {live && <p className="live-badge">● live — streaming metrics over SSE</p>}
         {errors.length > 0 && <p className="field-error">{errors.join("; ")}</p>}
         {status && (
