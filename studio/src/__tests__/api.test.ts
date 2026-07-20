@@ -98,6 +98,26 @@ describe("AeroApi request building", () => {
     }
   });
 
+  it("uses the right verbs + urls for fleet/ota/mes (016 §2)", async () => {
+    const f = mockFetch();
+    const api = new AeroApi("/api", f as unknown as typeof fetch);
+    await api.fleetStatus();
+    await api.otaStatus();
+    await api.startRollout("2.0", "payload");
+    await api.mesOutboxStats();
+    await api.drainMesOutbox();
+    const calls = f.mock.calls.map((c) => [c[1]?.method, c[0]]);
+    expect(calls).toEqual([
+      ["GET", "/api/fleet"],
+      ["GET", "/api/ota/rollouts"],
+      ["POST", "/api/ota/rollouts"],
+      ["GET", "/api/mes/outbox"],
+      ["POST", "/api/mes/outbox/drain"],
+    ]);
+    const rolloutBody = JSON.parse(f.mock.calls[2][1]!.body as string);
+    expect(rolloutBody).toEqual({ version: "2.0", bytes: "payload" });
+  });
+
   it("subscribeMetrics parses each SSE frame into a snapshot", () => {
     // A MockES that exposes the created instance so we can fire messages at it.
     let inst: { onmessage: ((e: { data: string }) => void) | null; close: () => void } | null = null;

@@ -16,6 +16,37 @@ export interface StatusSnapshot {
   [k: string]: unknown;
 }
 
+// 016 §2.1 — {"configured": false} until the daemon has a --fleet-device/--fleet-node-flag registry.
+export interface FleetStatus {
+  configured: boolean;
+  nodes?: { id: number; flags: string[] }[];
+  devices?: { id: string; eligible: boolean; node?: number }[];
+}
+
+// 016 §2.2 — {"configured": false} until the daemon has a fleet; "waves" only after a rollout has run.
+export interface WaveResult {
+  name: string;
+  attempted: number;
+  succeeded: number;
+  success_rate: number;
+  passed: boolean;
+}
+export interface OtaStatus {
+  configured: boolean;
+  state?: "Idle" | "Running" | "Paused" | "Completed";
+  devices_updated?: number;
+  devices_rolled_back?: number;
+  waves?: WaveResult[];
+}
+
+// 016 §2.3 — {"configured": false} until the daemon has --mes-host/--mes-port.
+export interface MesOutboxStats {
+  configured: boolean;
+  staged?: number;
+  pending?: number;
+  delivered?: number;
+}
+
 export interface ApiResult {
   ok: boolean;
   status: number;
@@ -67,6 +98,20 @@ export class AeroApi {
     };
     return () => es.close();
   }
+
+  // Fleet/placement observability (016 §2.1).
+  fleetStatus(): Promise<ApiResult> { return this.req("GET", "/fleet"); }
+
+  // OTA rollout observability + control (016 §2.2). start() posts ONLY the image — never a trust key
+  // (012 M5 posture): the daemon signs against its own configured trust root.
+  otaStatus(): Promise<ApiResult> { return this.req("GET", "/ota/rollouts"); }
+  startRollout(version: string, bytes: string): Promise<ApiResult> {
+    return this.req("POST", "/ota/rollouts", { version, bytes });
+  }
+
+  // MES outbox observability + control (016 §2.3).
+  mesOutboxStats(): Promise<ApiResult> { return this.req("GET", "/mes/outbox"); }
+  drainMesOutbox(): Promise<ApiResult> { return this.req("POST", "/mes/outbox/drain"); }
 
   // Runtime-assisted discovery (015 §5): browsing an OPC UA address space / testing an MQTT
   // connection needs the runtime + a live device — which only the edge node can reach. The browser
