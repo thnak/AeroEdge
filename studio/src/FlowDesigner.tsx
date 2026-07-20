@@ -1,12 +1,20 @@
-// The Flow Designer (013 §5): add/remove/reorder nodes into a linear flow, pick types from the
-// catalog, edit config via the Tier-1 form, set actor + driver — and emit a schema-aligned
-// Application (application.ts). The emitted JSON is what deploys, so alignment is the whole point.
-import { useState } from "react";
+// The Flow Designer (013 §5, 016 §5.2): add/remove/reorder nodes into a linear flow on a node-graph
+// canvas, pick types from the catalog, edit config via the Tier-1 form, set actor + driver — and emit
+// a schema-aligned Application (application.ts). The emitted JSON is what deploys, so alignment is
+// the whole point. The canvas (Phase 11.8) is a presentation upgrade over the same `nodes: FlowNode[]`
+// array — order still IS the DAG (v0.1 flows are linear, spec 004); toApplication/fromApplication are
+// untouched, and examples/hello_flow.json's round-trip test proves it (application.test.ts).
+import { useMemo, useState } from "react";
+import { ReactFlow, type Node, type Edge } from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import { NODE_CATALOG, DRIVER_CATALOG, catalogEntry } from "./catalog";
 import type { FlowModel, FlowNode } from "./application";
 import { toApplication } from "./application";
-import { Panel, Button } from "./components";
+import { Panel } from "./components";
 import { ConfigForm } from "./ConfigForm";
+import { FlowCanvasNode, type FlowCanvasNodeData } from "./FlowCanvasNode";
+
+const nodeTypes = { flowNode: FlowCanvasNode };
 
 export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: (m: FlowModel) => void }) {
   const [selected, setSelected] = useState<number | null>(model.nodes.length ? 0 : null);
@@ -37,6 +45,39 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
 
   const app = toApplication(model);
 
+  const rfNodes: Node<FlowCanvasNodeData>[] = useMemo(
+    () =>
+      model.nodes.map((n, i) => ({
+        id: String(i),
+        type: "flowNode",
+        position: { x: 0, y: i * 110 },
+        draggable: false,
+        connectable: false,
+        data: {
+          index: i,
+          typeId: n.type_id,
+          entry: catalogEntry(n.type_id),
+          isSelected: selected === i,
+          first: i === 0,
+          last: i === model.nodes.length - 1,
+          onSelect: setSelected,
+          onMove: move,
+          onRemove: removeNode,
+        },
+      })),
+    [model.nodes, selected],
+  );
+
+  const rfEdges: Edge[] = useMemo(
+    () =>
+      model.nodes.slice(1).map((_, i) => ({
+        id: `e${i}-${i + 1}`,
+        source: String(i),
+        target: String(i + 1),
+      })),
+    [model.nodes],
+  );
+
   return (
     <div className="designer">
       <Panel title="Flow"
@@ -46,24 +87,24 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
             {NODE_CATALOG.map((e) => <option key={e.type_id} value={e.type_id}>{e.category}: {e.label}</option>)}
           </select>
         }>
-        <ol className="flow-list">
-          {model.nodes.map((n, i) => {
-            const e = catalogEntry(n.type_id);
-            return (
-              <li key={i} className={selected === i ? "sel" : ""} onClick={() => setSelected(i)}>
-                <span className="badge">{e?.category ?? "?"}</span>
-                <span className="node-label">{e?.label ?? n.type_id}</span>
-                <span className="node-id">{n.type_id}</span>
-                <span className="row-actions">
-                  <Button onClick={() => move(i, -1)}>↑</Button>
-                  <Button onClick={() => move(i, 1)}>↓</Button>
-                  <Button variant="danger" onClick={() => removeNode(i)}>✕</Button>
-                </span>
-              </li>
-            );
-          })}
-          {model.nodes.length === 0 && <li className="muted">Empty flow. Add a Source node to start.</li>}
-        </ol>
+        {model.nodes.length === 0 ? (
+          <p className="muted">Empty flow. Add a Source node to start.</p>
+        ) : (
+          <div className="flow-canvas">
+            <ReactFlow
+              nodes={rfNodes}
+              edges={rfEdges}
+              nodeTypes={nodeTypes}
+              nodesDraggable={false}
+              nodesConnectable={false}
+              edgesReconnectable={false}
+              panOnScroll
+              fitView
+              fitViewOptions={{ padding: 0.3 }}
+              proOptions={{ hideAttribution: true }}
+            />
+          </div>
+        )}
       </Panel>
 
       <Panel title="Configure">

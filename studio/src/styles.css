@@ -59,12 +59,18 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #04101f; font-weight: 600; }
 .btn-danger { background: transparent; border-color: var(--danger); color: var(--danger); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
-.flow-list { list-style: none; margin: 0; padding: 0; }
-.flow-list li { display: flex; align-items: center; gap: 8px; padding: 6px; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
-.flow-list li.sel { border-color: var(--accent); background: #12233b; }
+/* ---- Flow node-graph canvas (Phase 11.8, 016 §5.2): @xyflow/react over the same linear array ---- */
+.flow-canvas { height: 360px; border: 1px solid var(--line); border-radius: 6px; background: #0d141b; }
+.flow-canvas .react-flow__edge-path { stroke: var(--line); }
+.flow-node-card {
+  width: 190px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel); cursor: pointer;
+}
+.flow-node-card.sel { border-color: var(--accent); background: #12233b; }
 .badge { font-size: 11px; background: #26303c; padding: 1px 6px; border-radius: 4px; color: var(--muted); }
 .node-id { font-size: 11px; color: var(--muted); font-family: monospace; }
-.row-actions { margin-left: auto; }
+.row-actions { display: flex; gap: 4px; margin-top: 6px; }
+.row-actions .btn { margin-left: 0; }
 .field { display: block; margin: 8px 0; }
 .field-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
 .field input, .field select, .config-form input, .config-form select { background: #0d141b; color: var(--fg); border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; width: 100%; }

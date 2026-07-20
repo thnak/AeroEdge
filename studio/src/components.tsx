@@ -17,11 +17,12 @@ export function Panel({ title, children, actions }: { title: string; children: R
   );
 }
 
-export function Button({ onClick, children, variant = "default", disabled }: {
+export function Button({ onClick, children, variant = "default", disabled, ariaLabel }: {
   onClick?: () => void; children: ReactNode; variant?: "default" | "primary" | "danger"; disabled?: boolean;
+  ariaLabel?: string;
 }) {
   return (
-    <button className={`btn btn-${variant}`} onClick={onClick} disabled={disabled}>
+    <button className={`btn btn-${variant}`} onClick={onClick} disabled={disabled} aria-label={ariaLabel}>
       {children}
     </button>
   );
