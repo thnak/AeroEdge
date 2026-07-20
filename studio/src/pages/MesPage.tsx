@@ -37,7 +37,7 @@ export function MesPage() {
     return (
       <Panel title="MES Outbox">
         <p className="muted">
-          No MES gateway configured. Start the daemon with <code>--mes-host H --mes-port P</code>
+          No MES gateway configured. Start the daemon with <code>--mes-host H --mes-port P</code>{" "}
           (optionally <code>--mes-path</code>/<code>--mes-token</code>) to see outbox stats here.
         </p>
       </Panel>

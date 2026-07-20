@@ -61,7 +61,11 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 /* ---- Flow node-graph canvas (Phase 11.8, 016 §5.2): @xyflow/react over the same linear array ---- */
 .flow-canvas { height: 360px; border: 1px solid var(--line); border-radius: 6px; background: #0d141b; }
-.flow-canvas .react-flow__edge-path { stroke: var(--line); }
+.flow-canvas .react-flow__edge-path { stroke: var(--accent); stroke-width: 2; opacity: .6; }
+/* Handles are non-functional here (nodesConnectable=false, 016 S2 — order in the array IS the DAG,
+   not a user-drawn connection) — visible only as two dots nearly touching at this card spacing,
+   easily misread as a stray glyph. Hide them; the edge line alone is the connector. */
+.flow-canvas .react-flow__handle { opacity: 0; pointer-events: none; }
 .flow-node-card {
   width: 190px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
   background: var(--panel); cursor: pointer;
