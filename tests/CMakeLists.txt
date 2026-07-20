@@ -246,6 +246,14 @@ target_link_libraries(mes_outbox PRIVATE aero::mes aero::runtime)
 add_test(NAME mes_outbox COMMAND mes_outbox)
 set_tests_properties(mes_outbox PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# Phase-11.1 gate (016 §2.3): the MES gateway wired into Runtime + reachable over the real REST API —
+# GET /mes/outbox is {"configured": false} until configure_mes(), then reflects a staged/retained
+# report (MES down) and a drained/delivered one (MES up, via POST /mes/outbox/drain).
+add_executable(runtime_mes_wiring runtime_mes_wiring.cpp)
+target_link_libraries(runtime_mes_wiring PRIVATE aero::api)
+add_test(NAME runtime_mes_wiring COMMAND runtime_mes_wiring)
+set_tests_properties(runtime_mes_wiring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-10 LOAD-BEARING gate #2 (011 §3/§4, O1/O2/O5): OTA. A good signed image → canary → COMMIT
 # (device version advances); a forced health-check FAILURE → auto-ROLLBACK (device stays on the old
 # version, rollback target recorded); an unsigned/tampered image is REJECTED before any transfer (O1).

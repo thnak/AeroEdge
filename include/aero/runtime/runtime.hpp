@@ -36,6 +36,9 @@
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
 #include "aero/ext/native_loader.hpp"
+#include "aero/mes/mes.hpp"
+#include "aero/mes/outbox.hpp"
+#include "aero/mes/rest_mes_adapter.hpp"
 #include "aero/nodes/builtin_nodes.hpp"
 #include "aero/nodes/compute_nodes.hpp"
 #include "aero/nodes/expr_rule_node.hpp"
@@ -50,6 +53,8 @@
 #include "quark/core/activation.hpp"
 #include "quark/core/engine.hpp"
 #include "quark/core/engine_config.hpp"
+#include "quark/core/ids.hpp"
+#include "quark/core/persistence.hpp"
 #include "quark/core/spawn.hpp"
 #include "quark/core/stream_activation.hpp"
 
@@ -122,7 +127,10 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
 class Runtime {
 public:
     Runtime() { register_builtins(nodes_, drivers_); }
-    ~Runtime() { (void)undeploy(); }
+    ~Runtime() {
+        (void)undeploy();
+        if (mes_engine_) mes_engine_->stop();
+    }
 
     Runtime(const Runtime&) = delete;
     Runtime& operator=(const Runtime&) = delete;
@@ -390,6 +398,69 @@ public:
         if (dep_->bridge.joinable()) dep_->bridge.join();
     }
 
+    // ---- MES gateway (012 §3, 016 §2.3) ------------------------------------------------------------
+    // The gateway is a daemon-lifetime subsystem, independent of any deployed Application's
+    // deploy/undeploy cycle (an MES outage/outbox must survive a flow redeploy) — its own engine, not
+    // Deployment's. Configure once at daemon start; a second call is rejected rather than silently
+    // replacing the outbox store underneath any in-flight drain.
+    using MesGateway = aero::mes::MesGatewayActor<quark::InMemoryStore>;
+    static constexpr quark::ActorId kMesOutboxId{quark::TypeKey{0x0B08}, 1};
+
+    std::expected<void, std::string> configure_mes(const aero::mes::MesConfig& cfg) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (mes_engine_) {
+            return std::unexpected("MES gateway already configured");
+        }
+        mes_adapter_ = std::make_unique<aero::mes::RestMesAdapter>();
+        mes_adapter_->connect(cfg);
+        mes_store_ = std::make_unique<quark::InMemoryStore>();
+        mes_gateway_ = std::make_unique<MesGateway>(*mes_adapter_, *mes_store_, kMesOutboxId);
+        mes_pool_ = std::make_unique<quark::detail::MessagePool>(1024);
+        mes_activation_ = std::make_unique<quark::Activation>(mes_gateway_.get(), MesGateway::dispatch_table(),
+                                                               mes_pool_->sink());
+        mes_engine_ = std::make_unique<quark::Engine<>>(quark::EngineConfig{/*workers*/ 1, /*shards*/ 1,
+                                                                             /*budget*/ 64, 64});
+        quark::register_actor<MesGateway>(*mes_engine_, /*key*/ 1, *mes_activation_);
+        mes_router_ = std::make_unique<quark::LocalRouter>(mes_engine_->post_courier(), *mes_pool_);
+        mes_engine_->start();
+        return {};
+    }
+
+    // Stage a canonical report through the gateway (M2 hand-off point). Public so a flow-actor
+    // integration or a test can drive it without reaching into the gateway internals.
+    std::expected<void, std::string> mes_stage(const aero::mes::MesReport& r) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!mes_engine_) return std::unexpected("MES gateway not configured");
+        mes_router_->get<MesGateway>(1).tell(aero::mes::StageReport{r});
+        return {};
+    }
+
+    // Re-attempt a stuck drain after the MES recovers (M3).
+    std::expected<void, std::string> mes_drain() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!mes_engine_) return std::unexpected("MES gateway not configured");
+        mes_router_->get<MesGateway>(1).tell(aero::mes::DrainOutbox{});
+        return {};
+    }
+
+    // Outbox observability (016 §2.3): {"configured": false} when configure_mes() was never called.
+    nlohmann::json mes_outbox_stats() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json j;
+        if (!mes_engine_) {
+            j["configured"] = false;
+            return j;
+        }
+        auto ref = mes_router_->get<MesGateway>(1);
+        auto r = quark::block_on(ref.template ask<aero::mes::OutboxStats>(aero::mes::GetOutboxStats{}));
+        const aero::mes::OutboxStats s = r.value_or(aero::mes::OutboxStats{});
+        j["configured"] = true;
+        j["staged"] = s.staged;
+        j["pending"] = s.pending;
+        j["delivered"] = s.delivered;
+        return j;
+    }
+
 private:
     // All lifetimes of one deployment. Held as unique_ptrs so deploy() can build them imperatively
     // (register_actor must run between construction steps) and teardown() can order the shutdown.
@@ -461,6 +532,15 @@ private:
     std::unique_ptr<Deployment> dep_;
     std::optional<schema::Application> previous_app_;  // the prior version, for rollback (009 §6)
     std::mutex mtx_;
+
+    // MES gateway lifetime (daemon-scoped, not deployment-scoped — see configure_mes() above).
+    std::unique_ptr<aero::mes::RestMesAdapter> mes_adapter_;
+    std::unique_ptr<quark::InMemoryStore> mes_store_;
+    std::unique_ptr<MesGateway> mes_gateway_;
+    std::unique_ptr<quark::detail::MessagePool> mes_pool_;
+    std::unique_ptr<quark::Activation> mes_activation_;
+    std::unique_ptr<quark::Engine<>> mes_engine_;
+    std::unique_ptr<quark::LocalRouter> mes_router_;
 };
 
 }  // namespace aero::runtime

@@ -1,10 +1,12 @@
 // AeroEdge runtime daemon (spec 013 §2 aero-runtime).
 //
 // Boots a Runtime + the REST/SSE management API. Optionally deploys an Application from `--app
-// path.json` at startup; otherwise it waits for a `POST /apps`. This is the deployable edge-node
-// binary — one per node. All control logic lives in Runtime/RestApi; main is just wiring + args.
+// path.json` at startup; otherwise it waits for a `POST /apps`. Optionally wires the MES gateway
+// (016 §2.3) from `--mes-host`/`--mes-port` — omit them and `/mes/outbox` just reports
+// `{"configured": false}`. This is the deployable edge-node binary — one per node. All control logic
+// lives in Runtime/RestApi; main is just wiring + args.
 //
-//   aero-runtime [--app path.json] [--host 0.0.0.0] [--port 8080]
+//   aero-runtime [--app path.json] [--host 0.0.0.0] [--port 8080] [--mes-host H --mes-port P]
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 #include <string>
 
 #include "aero/api/rest_api.hpp"
+#include "aero/mes/mes.hpp"
 #include "aero/runtime/runtime.hpp"
 #include "httplib.h"
 
@@ -27,6 +30,10 @@ int main(int argc, char** argv) {
     std::string app_path;
     std::string host = "0.0.0.0";
     int port = 8080;
+    std::string mes_host;
+    int mes_port = 0;
+    std::string mes_path = "/production";
+    std::string mes_token;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -36,13 +43,37 @@ int main(int argc, char** argv) {
             host = argv[++i];
         } else if (a == "--port" && i + 1 < argc) {
             port = std::atoi(argv[++i]);
+        } else if (a == "--mes-host" && i + 1 < argc) {
+            mes_host = argv[++i];
+        } else if (a == "--mes-port" && i + 1 < argc) {
+            mes_port = std::atoi(argv[++i]);
+        } else if (a == "--mes-path" && i + 1 < argc) {
+            mes_path = argv[++i];
+        } else if (a == "--mes-token" && i + 1 < argc) {
+            mes_token = argv[++i];
         } else {
-            std::fprintf(stderr, "usage: aero-runtime [--app path.json] [--host H] [--port P]\n");
+            std::fprintf(stderr,
+                         "usage: aero-runtime [--app path.json] [--host H] [--port P] "
+                         "[--mes-host H --mes-port P [--mes-path PATH] [--mes-token TOKEN]]\n");
             return 2;
         }
     }
 
     aero::runtime::Runtime rt;
+
+    if (!mes_host.empty()) {
+        aero::mes::MesConfig mes_cfg;
+        mes_cfg.endpoint = mes_host;
+        mes_cfg.port = mes_port;
+        mes_cfg.report_path = mes_path;
+        mes_cfg.token = mes_token;
+        auto r = rt.configure_mes(mes_cfg);
+        if (!r) {
+            std::fprintf(stderr, "MES gateway configure failed: %s\n", r.error().c_str());
+            return 3;
+        }
+        std::printf("MES gateway wired to %s:%d%s\n", mes_host.c_str(), mes_port, mes_path.c_str());
+    }
 
     if (!app_path.empty()) {
         std::ifstream f(app_path);

@@ -1,14 +1,16 @@
-// AeroEdge api — the management/control REST surface (spec 013 §2/§5/§9, 009).
+// AeroEdge api — the management/control REST surface (spec 013 §2/§5/§9, 009, 016).
 //
 // A THIN shell over Runtime (013 T2: the Studio and CLI reach the runtime ONLY through this API; all
 // logic lives in Runtime, so it is testable without HTTP). Decided in 013 §9: REST+JSON for
 // request/response, SSE for live streams. Endpoints:
-//   GET    /health          → readiness probe (used by clients to wait-for-ready)
-//   POST   /apps            → body = Application JSON → deploy → 200 status / 4xx error
-//   GET    /status          → Runtime.status()
-//   GET    /apps            → deployed Applications
-//   DELETE /apps/{name}     → undeploy
-//   GET    /metrics/stream  → SSE stream of status snapshots (live metrics)
+//   GET    /health           → readiness probe (used by clients to wait-for-ready)
+//   POST   /apps             → body = Application JSON → deploy → 200 status / 4xx error
+//   GET    /status           → Runtime.status()
+//   GET    /apps             → deployed Applications
+//   DELETE /apps/{name}      → undeploy
+//   GET    /metrics/stream   → SSE stream of status snapshots (live metrics)
+//   GET    /mes/outbox       → Runtime.mes_outbox_stats() (016 §2.3 — real, ungated)
+//   POST   /mes/outbox/drain → nudge a stuck outbox drain (M3)
 //
 // httplib (cpp-httplib) is confined to aero-api/aero-cli (R1): it never enters aero-core/aero-sdk.
 #pragma once
@@ -109,6 +111,22 @@ public:
                     sink.done();
                     return true;
                 });
+        });
+        // MES outbox observability (016 §2.3): {"configured": false} until the daemon has been given
+        // an MES endpoint to gateway to (see aero_runtime_main.cpp --mes-host/--mes-port).
+        svr.Get("/mes/outbox", [this](const httplib::Request&, httplib::Response& res) {
+            res.set_content(rt_.mes_outbox_stats().dump(), "application/json");
+        });
+
+        svr.Post("/mes/outbox/drain", [this](const httplib::Request&, httplib::Response& res) {
+            auto r = rt_.mes_drain();
+            if (!r) {
+                res.status = 400;
+                res.set_content(error_json(r.error()), "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(rt_.mes_outbox_stats().dump(), "application/json");
         });
     }
 
