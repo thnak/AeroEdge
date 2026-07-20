@@ -17,16 +17,21 @@ hardcoded to a single `Application` (`HELLO` in `App.tsx`). Replacing it with a 
 
 ```text
 AppShell (sidebar nav + content area)
-├── /flows          Application catalog (multi-app list) → Flow Designer + Deploy/Monitor for one
+├── /flows          Flow Designer + Deploy/Monitor/History for the one running Application
 ├── /fleet          Nodes, capabilities, device placement          (010, NEW REST)
 ├── /ota            Firmware rollout status, wave progress          (011, NEW REST)
 └── /mes            MES outbox stats, pending/delivered, drain      (012, NEW REST)
 ```
 
-`/flows` subsumes today's whole page: the Application catalog (013 §5 T2, §6 gap — Studio previously
-managed one hardcoded app despite `aero-api` already supporting many) is the entry list; selecting an
-app opens the existing Flow Designer + Deploy/Monitor panel scoped to it. `/fleet`, `/ota`, `/mes` are
-net-new — this spec is what makes them possible.
+**Correction to an earlier draft of this spec**: `/apps` returning a JSON array does *not* mean
+`Runtime` hosts multiple concurrent `Applications` — `Runtime::deploy()` explicitly rejects a second
+deploy ("a runtime hosts one Application; undeploy first"), so `list()` is always 0 or 1 entries. This
+spec does not change that (out of scope — it's a `Runtime` architecture change, not a UI gap). `/flows`
+therefore stays scoped to the single running Application, but grows a **history/rollback** view: today
+`reload`/`rollback` exist in `aero-api` but only `previous_app_` (one prior version) is kept and there
+is no UI for either. `/flows` surfaces the current Application, lets an operator deploy a replacement
+(hot-reload if Live, a clear rejection if BuildOnly per 009 §4), and rollback to the prior version.
+`/fleet`, `/ota`, `/mes` are net-new — this spec is what makes them possible.
 
 This is a **presentation-layer change only**: no `aero-schema` DTO changes, no change to
 `Application`/`FlowNode`/`DriverSpec` (013 T3). `aero-studio-sdk`'s component contract (015 §4) is
