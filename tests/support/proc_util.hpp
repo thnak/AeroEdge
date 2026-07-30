@@ -2,96 +2,64 @@
 // server) for the REAL transport gates. NOT part of the shipped transport library — lives under tests/.
 //
 // Model: the C++ test picks a free TCP port, hands it to `uv run --with <pkg> <script> <port>`, waits
-// until the port accepts a connection, runs the transport, then SIGTERMs the child's process group on
-// teardown. The child runs in its own process group so killing it also kills the python `uv` spawned.
+// until the port accepts a connection, runs the transport, then stops the child's whole process tree on
+// teardown (see pal_process.hpp — POSIX process-group / Windows Job Object, so killing `uv` also kills
+// the python it spawns).
 #pragma once
 
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <spawn.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include "pal/net.hpp"  // quark::pal::* — reused directly rather than re-deriving a socket PAL here
 
-extern char** environ;
+#include "aero/pal/poll.hpp"
+#include "pal_process.hpp"
 
 namespace aero::testutil {
 
 // Bind 127.0.0.1:0, read the assigned port, close — a free ephemeral port (small TOCTOU window; fine on
 // loopback for a test). The backend then binds this exact port.
 inline std::uint16_t free_port() {
-    const int s = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) return 0;
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = 0;
-    if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { ::close(s); return 0; }
-    socklen_t len = sizeof(a);
-    ::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
-    const std::uint16_t port = ntohs(a.sin_port);
-    ::close(s);
+    auto lfd = quark::pal::tcp_listen(quark::pal::ipv4_loopback, 0, 1);
+    if (!lfd) return 0;
+    std::uint16_t port = 0;
+    if (auto p = quark::pal::local_port(*lfd)) port = *p;
+    quark::pal::close_fd(*lfd);
     return port;
 }
 
-// A spawned `uv run` backend. SIGTERMs its whole process group on destruction.
+// A spawned `uv run` backend. Stops its whole process tree on destruction.
 class UvBackend {
 public:
     // uv_bin: absolute path to the uv binary. args: full argv AFTER uv_bin (e.g. {"run","--with","amqtt",
-    // script, port}). Child runs in its own process group; stdout/stderr inherit (surface failures).
+    // script, port}).
     UvBackend(const std::string& uv_bin, const std::vector<std::string>& args) {
-        std::vector<char*> argv;
-        argv.push_back(const_cast<char*>(uv_bin.c_str()));
-        for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-        argv.push_back(nullptr);
-
-        posix_spawnattr_t attr;
-        posix_spawnattr_init(&attr);
-        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);  // new process group ⇒ killpg reaches all
-        posix_spawnattr_setpgroup(&attr, 0);
-        if (posix_spawn(&pid_, uv_bin.c_str(), nullptr, &attr, argv.data(), environ) != 0) pid_ = -1;
-        posix_spawnattr_destroy(&attr);
+        (void)proc_.spawn(uv_bin, args);
     }
 
     ~UvBackend() {
-        if (pid_ > 0) {
-            ::killpg(pid_, SIGTERM);
-            int status = 0;
-            for (int i = 0; i < 50; ++i) {  // up to ~5s for graceful exit
-                if (::waitpid(pid_, &status, WNOHANG) == pid_) { pid_ = -1; return; }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            ::killpg(pid_, SIGKILL);
-            ::waitpid(pid_, &status, 0);
-        }
+        if (!proc_.spawned()) return;
+        proc_.terminate_gracefully();
+        if (!proc_.wait_for_exit(5000)) proc_.kill_hard();  // up to ~5s for graceful exit, then hard-kill
     }
 
     UvBackend(const UvBackend&) = delete;
     UvBackend& operator=(const UvBackend&) = delete;
 
-    [[nodiscard]] bool spawned() const noexcept { return pid_ > 0; }
+    [[nodiscard]] bool spawned() const noexcept { return proc_.spawned(); }
 
     // Poll until 127.0.0.1:port accepts a TCP connection (backend bound + listening), or timeout.
     static bool wait_for_port(std::uint16_t port, int timeout_ms = 60000) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
-            const int s = ::socket(AF_INET, SOCK_STREAM, 0);
-            if (s >= 0) {
-                sockaddr_in a{};
-                a.sin_family = AF_INET;
-                a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                a.sin_port = htons(port);
-                const bool ok = ::connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
-                ::close(s);
+            auto fd = quark::pal::tcp_connect(quark::pal::ipv4_loopback, port);
+            if (fd) {
+                const auto ready = aero::pal::wait_writable(*fd, 200);
+                const bool ok = ready && *ready && static_cast<bool>(quark::pal::connect_result(*fd));
+                quark::pal::close_fd(*fd);
                 if (ok) return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -100,7 +68,7 @@ public:
     }
 
 private:
-    pid_t pid_ = -1;
+    Process proc_;
 };
 
 }  // namespace aero::testutil

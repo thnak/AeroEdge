@@ -31,9 +31,7 @@
 #pragma once
 
 #include <atomic>
-#include <cerrno>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <functional>
 #include <mutex>
@@ -45,14 +43,13 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "pal/net.hpp"  // quark::pal::* — fd_t, tcp_connect/recv_some/send_some/... (see tcp_transport.hpp)
 
+#if !defined(_WIN32)
+#include <netdb.h>  // getaddrinfo/freeaddrinfo (Windows: transitively via pal/net.hpp's ws2tcpip.h)
+#endif
+
+#include "aero/pal/poll.hpp"
 #include "aero/transport/frame_codec.hpp"
 #include "aero/transport/grpc_transport.hpp"  // GrpcTransport base (Config/shape) + (via mqtt) kTransportGate
 #include "aero/transport/transport.hpp"
@@ -77,7 +74,7 @@ public:
         authority_ = host + ":" + std::to_string(port);
 
         fd_ = dial(host, port);
-        if (fd_ < 0) return gate_err("cannot dial grpc server " + authority_);
+        if (fd_ == quark::pal::invalid_fd) return gate_err("cannot dial grpc server " + authority_);
         running_.store(true, std::memory_order_release);
 
         // (1) client connection preface, then (2) an (empty) client SETTINGS frame.
@@ -96,11 +93,11 @@ public:
     // Half-close our send side (empty DATA + END_STREAM), stop the reader, close the socket, join.
     void stop() {
         if (!running_.exchange(false, std::memory_order_acq_rel)) return;
-        if (fd_ >= 0) (void)write_frame(kData, kEndStream, kStreamId, {});  // best-effort half-close
+        if (fd_ != quark::pal::invalid_fd) (void)write_frame(kData, kEndStream, kStreamId, {});  // best-effort half-close
         if (reader_thread_.joinable()) reader_thread_.join();
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
+        if (fd_ != quark::pal::invalid_fd) {
+            quark::pal::close_fd(fd_);
+            fd_ = quark::pal::invalid_fd;
         }
     }
 
@@ -145,7 +142,7 @@ private:
 
     std::unexpected<std::string> gate_err(std::string_view what) {
         running_.store(false, std::memory_order_release);
-        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+        if (fd_ != quark::pal::invalid_fd) { quark::pal::close_fd(fd_); fd_ = quark::pal::invalid_fd; }
         return std::unexpected(std::string(kTransportGate) + " [grpc: " + std::string(what) + "]");
     }
 
@@ -165,23 +162,30 @@ private:
         return port != 0;
     }
 
-    static int dial(const std::string& host, std::uint16_t port) {
+    // Non-blocking connect (Quark's `tcp_connect` contract) bounded by kConnectTimeoutMs per candidate —
+    // see tcp_transport.hpp's dial() banner for the full rationale.
+    static constexpr int kConnectTimeoutMs = 5000;
+
+    static quark::pal::fd_t dial(const std::string& host, std::uint16_t port) {
         addrinfo hints{};
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
         addrinfo* res = nullptr;
-        if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) return -1;
-        int fd = -1;
+        if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)
+            return quark::pal::invalid_fd;
+
+        quark::pal::fd_t fd = quark::pal::invalid_fd;
         for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-            fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-            if (fd < 0) continue;
-            if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
-                int one = 1;
-                ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-                break;
-            }
-            ::close(fd);
-            fd = -1;
+            if (ai->ai_family != AF_INET) continue;
+            const auto* sin = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+            const std::uint64_t addr_u64 = ::ntohl(sin->sin_addr.s_addr);
+            auto attempt = quark::pal::tcp_connect(addr_u64, port);
+            if (!attempt) continue;
+            fd = *attempt;
+            const auto writable = aero::pal::wait_writable(fd, kConnectTimeoutMs);
+            if (writable && *writable && quark::pal::connect_result(fd)) break;  // connected
+            quark::pal::close_fd(fd);
+            fd = quark::pal::invalid_fd;
         }
         ::freeaddrinfo(res);
         return fd;
@@ -190,12 +194,16 @@ private:
     // ===== raw socket I/O ==============================================================================
     bool write_raw(const std::byte* buf, std::size_t n) {
         std::lock_guard<std::mutex> g(io_mu_);
-        if (fd_ < 0) return false;
+        if (fd_ == quark::pal::invalid_fd) return false;
         std::size_t sent = 0;
         while (sent < n) {
-            const ssize_t w = ::send(fd_, buf + sent, n - sent, MSG_NOSIGNAL);
-            if (w < 0) { if (errno == EINTR) continue; return false; }
-            sent += static_cast<std::size_t>(w);
+            auto w = quark::pal::send_some(fd_, buf + sent, n - sent);
+            if (w) {
+                sent += *w;
+                continue;
+            }
+            if (w.error() != quark::pal::would_block()) return false;
+            if (!aero::pal::wait_writable(fd_, 200)) return false;  // poll itself failed
         }
         return true;
     }
@@ -204,14 +212,16 @@ private:
         std::size_t got = 0;
         while (got < n) {
             if (!running_.load(std::memory_order_acquire)) return false;
-            pollfd pfd{fd_, POLLIN, 0};
-            const int pr = ::poll(&pfd, 1, 200);
-            if (pr < 0) { if (errno == EINTR) continue; return false; }
-            if (pr == 0) continue;
-            const ssize_t r = ::recv(fd_, buf + got, n - got, 0);
-            if (r == 0) return false;
-            if (r < 0) { if (errno == EINTR) continue; return false; }
-            got += static_cast<std::size_t>(r);
+            const auto ready = aero::pal::wait_readable(fd_, 200);
+            if (!ready) return false;   // poll failed
+            if (!*ready) continue;      // timeout → re-check running_
+            auto r = quark::pal::recv_some(fd_, buf + got, n - got);
+            if (!r) {
+                if (r.error() == quark::pal::would_block()) continue;  // spurious wake
+                return false;
+            }
+            if (*r == 0) return false;  // peer closed
+            got += *r;
         }
         return true;
     }
@@ -331,7 +341,7 @@ private:
         if (off > 0) recv_buf_.erase(recv_buf_.begin(), recv_buf_.begin() + static_cast<std::ptrdiff_t>(off));
     }
 
-    int fd_ = -1;
+    quark::pal::fd_t fd_ = quark::pal::invalid_fd;
     std::string authority_;
     std::atomic<bool> running_{false};
     std::function<void(MessageFrame)> cb_;  // set once, before start()

@@ -17,8 +17,6 @@
 // seam's job (wasm_runtime.hpp), not this one.
 #pragma once
 
-#include <dlfcn.h>
-
 #include <expected>
 #include <memory>
 #include <string>
@@ -26,6 +24,7 @@
 #include <vector>
 
 #include "aero/core/registry.hpp"
+#include "aero/pal/dl.hpp"
 #include "aero/sdk/ext_abi.h"
 #include "aero/sdk/node.hpp"
 #include "aero/sdk/processing_context.hpp"
@@ -137,23 +136,23 @@ public:
     NativeExtension& operator=(const NativeExtension&) = delete;
 
     ~NativeExtension() {
-        if (handle_) dlclose(handle_);  // safe: every NativeNode holds a shared_ptr to us (above)
+        aero::pal::dl_close(handle_);  // safe: every NativeNode holds a shared_ptr to us (above)
     }
 
     // dlopen the library, resolve + ABI-check the exports (E6). On ANY failure returns an error
     // value with nothing left loaded — a bad/incompatible bundle never half-registers (008 §2).
     [[nodiscard]] static std::expected<std::shared_ptr<NativeExtension>, std::string>
     load(const std::string& path) {
-        void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (!h) {
-            const char* e = dlerror();
-            return std::unexpected("dlopen('" + path + "') failed: " + (e ? e : "unknown"));
+        auto opened = aero::pal::dl_open(path);
+        if (!opened) {
+            return std::unexpected("dlopen('" + path + "') failed: " + opened.error());
         }
+        void* h = *opened;
         auto ext = std::shared_ptr<NativeExtension>(new NativeExtension(h, path));
 
-        ext->abi_fn_ = reinterpret_cast<AeroExtAbiVersionFn>(dlsym(h, "aero_ext_abi_version"));
-        ext->manifest_fn_ = reinterpret_cast<AeroExtManifestFn>(dlsym(h, "aero_ext_manifest"));
-        ext->create_fn_ = reinterpret_cast<AeroExtCreateFn>(dlsym(h, "aero_ext_create"));
+        ext->abi_fn_ = reinterpret_cast<AeroExtAbiVersionFn>(aero::pal::dl_sym(h, "aero_ext_abi_version"));
+        ext->manifest_fn_ = reinterpret_cast<AeroExtManifestFn>(aero::pal::dl_sym(h, "aero_ext_manifest"));
+        ext->create_fn_ = reinterpret_cast<AeroExtCreateFn>(aero::pal::dl_sym(h, "aero_ext_create"));
         if (!ext->abi_fn_ || !ext->manifest_fn_ || !ext->create_fn_) {
             return std::unexpected("'" + path + "' is not an AeroEdge native extension "
                                    "(missing aero_ext_abi_version/manifest/create)");
