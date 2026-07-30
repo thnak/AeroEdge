@@ -178,6 +178,15 @@ target_link_libraries(tcp_transport PRIVATE aero::transport)
 add_test(NAME tcp_transport COMMAND tcp_transport)
 set_tests_properties(tcp_transport PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 Phase-1 gate: NativeBroker (AeroEdge's own embedded MQTT server) over real loopback sockets — a
+# hand-rolled test client (built on the same shared mqtt_codec.hpp) proves CONNECT/SUBSCRIBE/PUBLISH/
+# PUBACK, wildcard topic routing, retained-message replay, and the on_publish() ingestion seam. No
+# external MQTT client/backend needed (single-node broker, unlike the REAL-MQTT gate below).
+add_executable(native_broker broker/native_broker.cpp)
+target_link_libraries(native_broker PRIVATE aero::broker)
+add_test(NAME native_broker COMMAND native_broker)
+set_tests_properties(native_broker PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # uv drives the Python-hosted backends (amqtt broker / grpcio server) the REAL MQTT & gRPC gates need.
 # Absent uv, those tests SKIP (exit 0 with a SKIP line) rather than fail — the backend is external infra.
 find_program(AERO_UV_BIN uv)

@@ -111,6 +111,16 @@ target_include_directories(aero-transport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(aero-transport INTERFACE quark::quark Threads::Threads)
 add_library(aero::transport ALIAS aero-transport)
 
+# aero-broker — AeroEdge's own embedded MQTT server (017, Phase 1): local wire-protocol session state
+# (CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PINGREQ/DISCONNECT), single-node topic routing, retained messages.
+# Shares its wire codec with aero-transport's MqttClientTransport (017 §9 N3). Single-node only in
+# Phase 1 — cross-node routing over Quark's DistributedRouter is deferred (017 follow-on phases).
+# Deliberately NOT linked by aero-core/aero-runtime yet — Phase 1 is a standalone library + test.
+add_library(aero-broker INTERFACE)
+target_include_directories(aero-broker INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-broker INTERFACE aero-transport quark::quark Threads::Threads)
+add_library(aero::broker ALIAS aero-broker)
+
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration
 # helper (010). Adds ONLY policy on top of Quark's placement (025)/membership (021)/fence (012): NO hash
 # ring, NO gossip, NO membership protocol. Depends on aero-core (DurableState) + aero-sdk (IDriver) + Quark.

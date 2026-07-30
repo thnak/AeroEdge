@@ -50,11 +50,17 @@
 
 #include "aero/pal/poll.hpp"
 #include "aero/transport/frame_codec.hpp"
+#include "aero/transport/mqtt_codec.hpp"  // shared MQTT 3.1.1 wire codec (017 §9 N3)
 #include "aero/transport/mqtt_transport.hpp"  // MqttTransport base (Config/shape) + kTransportGate
 #include "aero/transport/resequencer.hpp"
 #include "aero/transport/transport.hpp"
 
 namespace aero::transport {
+
+using mqtt::Packet;
+using mqtt::put_str;
+using mqtt::put_u16_be;
+using mqtt::put_u64_be;
 
 class MqttClientTransport final : public MqttTransport {
 public:
@@ -132,28 +138,6 @@ public:
     [[nodiscard]] std::uint64_t duplicates_dropped() const noexcept { return dupes_.load(std::memory_order_relaxed); }
 
 private:
-    // ===== MQTT byte helpers ===========================================================================
-    static void put_u16_be(std::vector<std::byte>& out, std::uint16_t v) {
-        out.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
-        out.push_back(static_cast<std::byte>(v & 0xFF));
-    }
-    static void put_u64_be(std::vector<std::byte>& out, std::uint64_t v) {
-        for (int i = 7; i >= 0; --i) out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
-    }
-    static void put_str(std::vector<std::byte>& out, std::string_view s) {
-        put_u16_be(out, static_cast<std::uint16_t>(s.size()));
-        for (char c : s) out.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(c)));
-    }
-    // MQTT "remaining length": 1–4 bytes, 7 bits each, high bit = continuation.
-    static void put_remaining_length(std::vector<std::byte>& out, std::uint32_t len) {
-        do {
-            std::uint8_t enc = len % 128;
-            len /= 128;
-            if (len > 0) enc |= 0x80;
-            out.push_back(static_cast<std::byte>(enc));
-        } while (len > 0);
-    }
-
     std::unexpected<std::string> gate_err(std::string_view what) {
         running_.store(false, std::memory_order_release);
         if (fd_ != quark::pal::invalid_fd) { quark::pal::close_fd(fd_); fd_ = quark::pal::invalid_fd; }
@@ -238,70 +222,15 @@ private:
         return {};
     }
 
-    // ===== raw packet I/O ==============================================================================
-    struct Packet {
-        std::uint8_t type_flags = 0;
-        std::vector<std::byte> body;  // everything after the fixed header (var header + payload)
-    };
+    // ===== raw packet I/O (framing lives in mqtt_codec.hpp, shared with NativeBroker — 017 §9 N3) ======
+    std::optional<Packet> read_packet() { return mqtt::read_packet(fd_, running_); }
 
-    // Read exactly n bytes off fd_, polling so the loop notices stop() (running_ → false) promptly.
-    bool read_n(std::byte* buf, std::size_t n) {
-        std::size_t got = 0;
-        while (got < n) {
-            if (!running_.load(std::memory_order_acquire)) return false;
-            const auto ready = aero::pal::wait_readable(fd_, 200);
-            if (!ready) return false;   // poll failed
-            if (!*ready) continue;      // timeout → re-check running_
-            auto r = quark::pal::recv_some(fd_, buf + got, n - got);
-            if (!r) {
-                if (r.error() == quark::pal::would_block()) continue;  // spurious wake
-                return false;
-            }
-            if (*r == 0) return false;  // peer closed
-            got += *r;
-        }
-        return true;
-    }
-
-    std::optional<Packet> read_packet() {
-        std::byte b0;
-        if (!read_n(&b0, 1)) return std::nullopt;
-        std::uint32_t mult = 1, len = 0;
-        for (int i = 0; i < 4; ++i) {
-            std::byte enc;
-            if (!read_n(&enc, 1)) return std::nullopt;
-            const std::uint8_t e = std::to_integer<std::uint8_t>(enc);
-            len += (e & 0x7F) * mult;
-            if ((e & 0x80) == 0) break;
-            mult *= 128;
-        }
-        Packet p;
-        p.type_flags = std::to_integer<std::uint8_t>(b0);
-        p.body.resize(len);
-        if (len > 0 && !read_n(p.body.data(), len)) return std::nullopt;
-        return p;
-    }
-
-    // Serialize [fixed-header-byte | remaining-length | body] and write it atomically (io_mu_ serializes
-    // writers: send()'s PUBLISH, the reader's PUBACK, and the handshake — no interleaved packets).
+    // io_mu_ serializes writers: send()'s PUBLISH, the reader's PUBACK, and the handshake — no
+    // interleaved packets on the wire.
     bool write_packet(std::byte type_flags, const std::vector<std::byte>& body) {
-        std::vector<std::byte> pkt;
-        pkt.push_back(type_flags);
-        put_remaining_length(pkt, static_cast<std::uint32_t>(body.size()));
-        pkt.insert(pkt.end(), body.begin(), body.end());
         std::lock_guard<std::mutex> g(io_mu_);
         if (fd_ == quark::pal::invalid_fd) return false;
-        std::size_t sent = 0;
-        while (sent < pkt.size()) {
-            auto w = quark::pal::send_some(fd_, pkt.data() + sent, pkt.size() - sent);
-            if (w) {
-                sent += *w;
-                continue;
-            }
-            if (w.error() != quark::pal::would_block()) return false;
-            if (!aero::pal::wait_writable(fd_, 200)) return false;  // poll itself failed
-        }
-        return true;
+        return mqtt::write_packet(fd_, type_flags, body);
     }
 
     // ===== inbound loop ================================================================================
