@@ -319,3 +319,18 @@ target_compile_definitions(tls_channel PRIVATE
   AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
 add_test(NAME tls_channel COMMAND tls_channel)
 set_tests_properties(tls_channel PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# M5 TLS+ACL milestone INTEGRATION gate: NativeBroker itself wired to TLS (aero/pal/tls.hpp) + the ACL
+# seam (aero/broker/acl.hpp) — as opposed to tls_channel (TLS PAL in isolation) and acl (ACL policy logic
+# in isolation), this proves the WIRING: a real NativeBroker with cfg.tls/cfg.authenticate/cfg.authorizer
+# set, driven by real MQTT clients over real sockets (one TLS-capable, hand-rolled over mbedTLS's
+# client-role APIs, mirroring tls_channel.cpp's own TestTlsClient; one plaintext, mirroring
+# native_broker.cpp's TestClient). Reuses tests/pal/certs/ directly (same AERO_TLS_TEST_CERTS_DIR
+# compile definition as tls_channel, rather than duplicating cert files) and links aero-thirdparty-tls
+# for the same reason tls_channel does (real mbedTLS client-role calls in the test's own TLS client code).
+add_executable(native_broker_security broker/native_broker_security.cpp)
+target_link_libraries(native_broker_security PRIVATE aero::broker aero-thirdparty-tls)
+target_compile_definitions(native_broker_security PRIVATE
+  AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
+add_test(NAME native_broker_security COMMAND native_broker_security)
+set_tests_properties(native_broker_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

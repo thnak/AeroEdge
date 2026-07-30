@@ -14,12 +14,6 @@
 // mirrors this paragraph.)
 //
 // WHAT THIS FILE DELIBERATELY IS NOT:
-//   - Not wired into NativeBroker yet. NativeBroker's CONNECT/SUBSCRIBE/PUBLISH handlers still act
-//     unconditionally (`include/aero/broker/native_broker.hpp`, read-only from here) — a separate
-//     integration pass wires a `TopicAclAuthorizer` (or any `Authorizer`) into `Config`, calling
-//     `allow()` at the CONNECT/SUBSCRIBE/PUBLISH boundary BEFORE any topic state (retained store,
-//     session subscription list, route_publish fan-out) is touched, so a denied request has zero side
-//     effects. This file only defines the policy engine that boundary will call.
 //   - Not an authentication system. `Authenticator` (bottom of this file) is a bare function-object
 //     TYPE so both NativeBroker's `Config` and whatever concrete authenticator a deployment supplies
 //     agree on a shape without a circular include; this file supplies no implementation of it.
@@ -30,14 +24,15 @@
 //     it is its own narrow (principal, topic-filter, action) → allow/deny table, not a reuse of the
 //     expression engine (an ACL rule is a 3-tuple match, not an expression to evaluate).
 //
-// DUPLICATED CODE, TEMPORARY: `topic_matches()` below is copied verbatim from `native_broker.hpp`
-// (same namespace, same signature) so this file can `#include` nothing from native_broker.hpp (this
-// task must not touch or depend on that file's edit surface — a parallel integration pass and a
-// sibling TLS-layer agent are both touching it). A later integration pass extracts this function into
-// a new shared header both files `#include`; at that point this copy is deleted in favor of the
-// include, and no call site here needs to change because the function signature/namespace already
-// match (017 N3 precedent — the wire codec was shared the same way). Until then this is intentional,
-// temporary duplication, not a policy violation.
+// WIRED INTO NativeBroker (M5 integration pass): `native_broker.hpp`'s CONNECT/SUBSCRIBE/PUBLISH
+// handlers call `Authorizer::allow()` at the CONNECT/SUBSCRIBE/PUBLISH boundary BEFORE any topic state
+// (retained store, session subscription list, route_publish fan-out) is touched, so a denied request has
+// zero side effects — see `Config::authorizer`/`Config::authenticate` there.
+//
+// `topic_matches()` now lives in `topic_match.hpp` (extracted from native_broker.hpp's original inline
+// copy so both this file and native_broker.hpp share one definition, 017 N3 precedent — the wire codec
+// was shared the same way). This file used to carry its own temporary duplicate pending that extraction;
+// the extraction has happened, so it now just includes the shared header.
 #pragma once
 
 #include <cstdint>
@@ -47,39 +42,9 @@
 #include <string_view>
 #include <vector>
 
-namespace aero::broker {
+#include "aero/broker/topic_match.hpp"
 
-// Duplicated from native_broker.hpp pending extraction to a shared header by the integration pass
-// (017 N3 precedent). MQTT 3.1.1 §4.7: `+` matches exactly one level, `#` matches the rest of the
-// topic (including zero further levels) and must be the filter's last level to have any effect beyond
-// literal comparison. Pure function, independently testable. Copied verbatim — do not let this drift
-// from native_broker.hpp's copy before the extraction happens.
-[[nodiscard]] inline bool topic_matches(std::string_view filter, std::string_view topic) noexcept {
-    auto split = [](std::string_view s) {
-        std::vector<std::string_view> parts;
-        std::size_t start = 0;
-        for (;;) {
-            const auto pos = s.find('/', start);
-            if (pos == std::string_view::npos) {
-                parts.push_back(s.substr(start));
-                break;
-            }
-            parts.push_back(s.substr(start, pos - start));
-            start = pos + 1;
-        }
-        return parts;
-    };
-    const auto f = split(filter);
-    const auto t = split(topic);
-    std::size_t i = 0;
-    for (; i < f.size(); ++i) {
-        if (f[i] == "#") return true;         // matches everything remaining, including zero levels
-        if (i >= t.size()) return false;      // filter has more levels than topic, and it's not '#'
-        if (f[i] == "+") continue;            // matches exactly this one level
-        if (f[i] != t[i]) return false;
-    }
-    return i == t.size();  // no '#' consumed the tail => topic must end exactly where the filter does
-}
+namespace aero::broker {
 
 // What a topic-scoped ACL rule is deciding about — MQTT's two message-carrying client operations.
 // (CONNECT has no topic and is out of scope for this seam; it's an authentication decision, see

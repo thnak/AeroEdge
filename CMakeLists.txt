@@ -166,10 +166,14 @@ add_library(aero::transport ALIAS aero-transport)
 # bridge.hpp (017 §6, revised scope) adds bridging (MQTT + HTTP webhook sinks) and a rule engine over
 # `on_publish()`, reusing aero-nodes' ExprRuleNode (008 §6) for the rule/expression side and httplib
 # (RestMesAdapter's own pattern, mes/rest_mes_adapter.hpp) for the HTTP sink — hence the added deps.
+# M5 (TLS+ACL milestone) adds aero-thirdparty-tls: native_broker.hpp's TLS listener (aero/pal/tls.hpp)
+# needs the real mbedTLS-backed implementation (AERO_TLS_ENABLED + the mbedtls libs), not the "not
+# compiled in" stub, whenever this library is actually linked into a binary.
 add_library(aero-broker INTERFACE)
 target_include_directories(aero-broker INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-broker INTERFACE
-  aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json quark::quark Threads::Threads)
+  aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json aero-thirdparty-tls
+  quark::quark Threads::Threads)
 add_library(aero::broker ALIAS aero-broker)
 
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration

@@ -7,12 +7,18 @@
 // repeated `--fleet-device ID[:VERSION]` flags — omit them and `/fleet`/`/ota/rollouts` report
 // `{"configured": false}`. Optionally wires the native MQTT broker / southbound termination (017)
 // from `--broker-port`/`--broker-bind` — omit them and `/broker/status` reports `{"configured": false}`.
+// Optionally wires the broker's TLS listener (M5) from `--broker-tls-cert`/`--broker-tls-key` (both
+// required together; `--broker-tls-ca` is optional, enables mTLS) — omit them and the broker stays
+// plaintext-only, exactly as before M5. NOTE (intentional v1 gap): Config::authenticate/authorizer
+// (aero/broker/acl.hpp) have no CLI/config-file story yet — C++ API only for now.
 // This is the deployable edge-node binary — one per node. All control logic lives in Runtime/RestApi;
 // main is just wiring + args.
 //
 //   aero-runtime [--app path.json] [--host 0.0.0.0] [--port 8080] [--mes-host H --mes-port P]
 //                [--fleet-device ID[:VERSION] ...] [--fleet-node-flag FLAG ...]
 //                [--broker-port P] [--broker-bind H]
+//                [--broker-tls-cert PATH --broker-tls-key PATH [--broker-tls-ca PATH]]
+//                [--broker-tls-port P]
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +29,7 @@
 #include "aero/api/rest_api.hpp"
 #include "aero/broker/native_broker.hpp"
 #include "aero/mes/mes.hpp"
+#include "aero/pal/tls.hpp"
 #include "aero/runtime/runtime.hpp"
 #include "httplib.h"
 
@@ -56,6 +63,8 @@ int main(int argc, char** argv) {
     aero::runtime::Runtime::FleetConfig fleet_cfg;
     aero::broker::Config broker_cfg;
     bool broker_enabled = false;  // only true if a --broker-* flag was actually given (017)
+    std::string broker_tls_cert, broker_tls_key, broker_tls_ca;      // M5
+    std::uint16_t broker_tls_port = 8883;                            // M5
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -83,14 +92,44 @@ int main(int argc, char** argv) {
         } else if (a == "--broker-bind" && i + 1 < argc) {
             broker_cfg.bind_host = argv[++i];
             broker_enabled = true;
+        } else if (a == "--broker-tls-cert" && i + 1 < argc) {
+            broker_tls_cert = argv[++i];
+        } else if (a == "--broker-tls-key" && i + 1 < argc) {
+            broker_tls_key = argv[++i];
+        } else if (a == "--broker-tls-ca" && i + 1 < argc) {
+            broker_tls_ca = argv[++i];
+        } else if (a == "--broker-tls-port" && i + 1 < argc) {
+            broker_tls_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
         } else {
             std::fprintf(stderr,
                          "usage: aero-runtime [--app path.json] [--host H] [--port P] "
                          "[--mes-host H --mes-port P [--mes-path PATH] [--mes-token TOKEN]] "
                          "[--fleet-device ID[:VERSION] ...] [--fleet-node-flag FLAG ...] "
-                         "[--broker-port P] [--broker-bind H]\n");
+                         "[--broker-port P] [--broker-bind H] "
+                         "[--broker-tls-cert PATH --broker-tls-key PATH [--broker-tls-ca PATH]] "
+                         "[--broker-tls-port P]\n");
             return 2;
         }
+    }
+
+    // --broker-tls-cert/--broker-tls-key are required TOGETHER to enable TLS (matches the existing
+    // flag-validation posture above: a clear stderr message + non-zero exit, not a silent half-config).
+    // --broker-tls-ca is optional (mTLS). Config::authenticate/authorizer have no CLI story yet (v1 gap,
+    // noted in this file's banner) — only the TLS material is wireable from the command line today.
+    if (broker_tls_cert.empty() != broker_tls_key.empty()) {
+        std::fprintf(stderr,
+                     "usage: --broker-tls-cert and --broker-tls-key must both be given together "
+                     "(only one was provided)\n");
+        return 2;
+    }
+    if (!broker_tls_cert.empty()) {
+        aero::pal::tls::ServerConfig tls_cfg;
+        tls_cfg.cert_file = broker_tls_cert;
+        tls_cfg.key_file = broker_tls_key;
+        tls_cfg.ca_file = broker_tls_ca;
+        broker_cfg.tls = std::move(tls_cfg);
+        broker_cfg.tls_port = broker_tls_port;
+        broker_enabled = true;
     }
 
     aero::runtime::Runtime rt;
