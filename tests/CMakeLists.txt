@@ -196,6 +196,16 @@ target_link_libraries(bridge PRIVATE aero::broker aero::nodes aero-thirdparty-ht
 add_test(NAME bridge COMMAND bridge)
 set_tests_properties(bridge PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 M6 gate: broker_cluster.hpp — cross-node PUBLISH broadcast over REAL loopback TCP. Two
+# NativeBroker+BrokerCluster pairs (aero::transport::TcpTransport under a Quark DistributedRouter,
+# StaticBrokerMembership) prove the cross-node hop (a node-2 PUBLISH reaches a node-1 subscriber) and
+# loop prevention (node 2's own subscriber sees its local PUBLISH exactly once, never a relayed-back
+# duplicate). Same aero::broker library as native_broker/bridge above — no new link target needed.
+add_executable(broker_cluster broker/broker_cluster.cpp)
+target_link_libraries(broker_cluster PRIVATE aero::broker)
+add_test(NAME broker_cluster COMMAND broker_cluster)
+set_tests_properties(broker_cluster PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # uv drives the Python-hosted backends (amqtt broker / grpcio server) the REAL MQTT & gRPC gates need.
 # Absent uv, those tests SKIP (exit 0 with a SKIP line) rather than fail — the backend is external infra.
 find_program(AERO_UV_BIN uv)

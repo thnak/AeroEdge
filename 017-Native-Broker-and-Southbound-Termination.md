@@ -17,9 +17,9 @@
 | M1 | QoS 2, Last Will & Testament, keep-alive enforcement, persistent/clean sessions + takeover | **Shipped** |
 | M2 | `Runtime::configure_broker()`, `GET /broker/status`, CLI flags — `aero-broker` now linked into `aero-runtime` | **Shipped** |
 | M3 | Bridge seam (`IBridgeSink`: MQTT-to-MQTT, HTTP webhook) + rule engine reusing `ExprRuleNode` (008 §6) | **Shipped** |
-| M4 | Studio dashboard page for the broker | Backlog, blocked on M2 (done) — not yet built |
+| M4 | Studio dashboard page for the broker | **Shipped** |
 | M5 | TLS + Quark 020 per-topic authorization/ACL | Backlog |
-| M6 | Cross-node topic routing via `DistributedRouter` | Backlog |
+| M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | Backlog |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | Backlog |
 | M9 | Multi-protocol southbound (OPC-UA/Modbus) — likely its own spec (018?) | Backlog |
@@ -120,6 +120,22 @@ rebuild:
   PUBACK on QoS 1) is new; the byte-level framing is not — factor the codec into a shared
   header both the client and broker link, rather than a second copy.
 
+**Correction from M6 (this section's original framing was wrong on one point).** The paragraph
+above assumed `DistributedRouter::tell` could be pointed at whichever node HRW-owns a given
+topic, the same way any other actor `tell` works. It cannot: `tell()` is placement-routed — it
+computes the HRW owner itself and sends there — there is no way to address an explicit,
+caller-chosen peer through `tell()`/`DistRef`. That rules out "ask Quark who owns this topic and
+forward to just that node" as a mechanism, at least without a lower-level primitive this codebase
+doesn't have today. M6 ships v1 with the simpler, coordinator-free alternative discussed as a
+fallback in §4's fanout note: **every local PUBLISH is broadcast to every peer node** (a
+hand-built `MessageFrame`, `TcpTransport::send()`'d directly to each peer — see
+`broker_cluster.hpp`), and each peer does its own local wildcard match. `DistributedRouter` is
+still used, but only for the *receive* side (peers `tell` a well-known `BrokerRelayActor`, which
+is itself HRW-placed like any actor — the sender just also happens to be every node, since a
+broadcast reaches all of them). Selective, ownership-aware forwarding (M6.1, Open Questions)
+would need either a real per-topic subscription registry or a lower-level "send to this specific
+`NodeId`" primitive in Quark; neither exists yet.
+
 ## 5. Where it attaches (seam, not a fork of anything)
 
 ```text
@@ -174,10 +190,10 @@ principled exclusions the way v0.1 framed the whole breadth:
 | Persistent/clean sessions + takeover | **shipped**, in-memory, single-node | M1; cluster-wide session sync is M6 |
 | Bridging (MQTT-to-MQTT, HTTP webhook) | **shipped** | M3, `IBridgeSink`/`MqttBridgeSink`/`HttpWebhookBridgeSink` |
 | Rule engine (topic filter + expression gate → sink) | **shipped**, reuses `ExprRuleNode` | M3, not a new DSL |
-| Dashboard | backlog | M4, blocked on M2 (done) |
+| Dashboard | **shipped** | M4, `studio/src/pages/BrokerPage.tsx` |
 | TLS | backlog | M5 — C5 (014) still applies; v1-and-beyond is plaintext/trusted-network until this lands |
 | Per-topic ACL / authorization | backlog | M5, via Quark 020 principal, not a bespoke ACL engine |
-| Cross-node topic routing | backlog | M6, `DistributedRouter` (§4) |
+| Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
 | MQTT 5 | backlog | M7 — 3.1.1 covers the device population seen so far |
 | Kafka/Pulsar/RabbitMQ bridges | backlog | M8 — needs new third-party deps, native-extension-shaped (008) |
 | Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
@@ -260,6 +276,15 @@ adapts to unilaterally. Concretely:
 
 ## 10. Open questions
 
+- **M6.1 — selective (HRW-owner) cross-node forwarding.** M6 ships broadcast fanout: every
+  PUBLISH is relayed to every peer node regardless of whether that peer has a matching
+  subscriber. Correct and coordinator-free, but O(nodes) messages per PUBLISH regardless of
+  actual interest — fine at the node counts seen so far, not something to assume scales
+  unbounded. A selective version needs either (a) a distributed per-topic subscription registry
+  (the expensive machinery this spec explicitly avoided reimplementing in §4), or (b) a
+  lower-level "send to this specific `NodeId`" primitive in Quark that `DistributedRouter::tell`
+  doesn't provide today (see §4's correction). Revisit if/when node counts or PUBLISH volume
+  make broadcast fanout a measured bottleneck, not preemptively.
 - **Cross-node session continuity** — if a device reconnects to a *different* AeroEdge node
   (mobile gateway, failover), does its persistent session/retained state need to follow it?
   v1 treats sessions as local-node; revisit once a real multi-node southbound deployment

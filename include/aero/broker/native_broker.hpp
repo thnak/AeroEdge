@@ -25,6 +25,16 @@
 // timeout (§3.1.2.10), and persistent sessions / session takeover (§3.1.2.4/§3.1.4) on top of Phase 1's
 // QoS 0/1 broker. Still single-node only — everything the Phase 1 scope banner above says still holds.
 //
+// MILESTONE 6 (017 §4, cross-node topic routing — OPT IN, backward compatible): this file itself stays
+// single-node — it still only ever writes PUBLISHes to ITS OWN sessions_/stored_sessions_. What M6 adds
+// is two seams a co-located `aero::broker::BrokerCluster` (broker_cluster.hpp) wires up: `deliver_remote_publish()`
+// (public — the far side of a cross-node relay hands a PUBLISH here for LOCAL match-and-deliver only) and
+// `set_peer_forwarder()` (a hook `deliver_publish()` calls, AFTER local delivery, for every LOCALLY-
+// originated PUBLISH). Neither is ever invoked unless a caller opts in — an unset peer_forwarder_ is a
+// no-op, so every existing single-node behavior/test is byte-for-byte unchanged. The two seams together
+// are also this file's loop-prevention boundary: a relay-delivered PUBLISH enters ONLY via
+// deliver_remote_publish(), which never calls the forwarder — so it can never bounce back out to peers.
+//
 // PORTABILITY / REUSE: built on quark::pal::net + aero::pal::poll (this session's PAL work) and the
 // MQTT wire codec shared with `MqttClientTransport` (mqtt_codec.hpp, 017 §9 N3) — no new socket or
 // framing code, only the server-side session state machine and topic routing are new.
@@ -149,6 +159,33 @@ public:
     void on_publish(std::function<void(std::string_view topic, std::span<const std::byte> payload,
                                        std::uint8_t qos)> cb) {
         on_publish_ = std::move(cb);
+    }
+
+    // M6 seam (017 §4): a hook `deliver_publish()` calls AFTER local delivery, for every LOCALLY-
+    // originated PUBLISH only (never for one arriving via deliver_remote_publish() below — that is
+    // exactly the loop-prevention invariant). Unset (the default) ⇒ no-op ⇒ single-node behavior is
+    // unchanged. `BrokerCluster` (broker_cluster.hpp) is the intended caller: it wires this to broadcast
+    // the PUBLISH to every peer node via `DistributedRouter`/`BrokerRelayActor`. Same signature as
+    // `on_publish()` (topic/payload/qos) — no retain flag, mirroring `deliver_remote_publish()` below.
+    void set_peer_forwarder(std::function<void(std::string_view topic, std::span<const std::byte> payload,
+                                               std::uint8_t qos)> cb) {
+        peer_forwarder_ = std::move(cb);
+    }
+
+    // M6 seam (017 §4): the far side of a cross-node relay. A peer node's `BrokerRelayActor` calls this
+    // for a PUBLISH that arrived over the wire from ANOTHER broker instance — it runs the SAME local
+    // match-and-deliver as a locally-originated PUBLISH (route_publish: every connected session with a
+    // matching subscription, plus offline persistent-session queuing), and on_publish_ fires here too
+    // (documented default: on_publish_ means "every PUBLISH this broker instance handles", local or
+    // relayed — a flow/MES consumer downstream of on_publish() should see relayed device data exactly
+    // like locally-received data). What it deliberately does NOT do: touch retained_ (a cross-node
+    // PUBLISH's retain semantics stay a property of the node the publisher actually dialed — see
+    // broker_cluster.hpp's banner for why), or call peer_forwarder_ (the loop-prevention boundary — a
+    // relay-delivered PUBLISH is never re-broadcast onward).
+    void deliver_remote_publish(std::string_view topic, std::span<const std::byte> payload,
+                                std::uint8_t qos) {
+        if (on_publish_) on_publish_(topic, payload, qos);
+        route_publish(std::string(topic), std::vector<std::byte>(payload.begin(), payload.end()), qos);
     }
 
 private:
@@ -563,7 +600,11 @@ private:
     // The action a PUBLISH ultimately performs once its QoS contract permits it: QoS 0/1 call this
     // immediately (handle_publish); QoS 2 defers it until PUBREL (handle_pubrel); a Will "publishes" this
     // directly with no wire packet or ack at all (teardown_session) — one shared path so retention,
-    // ingestion, and routing can never drift between the three.
+    // ingestion, and routing can never drift between the three. Every caller of THIS function is, by
+    // construction, a LOCALLY-originated PUBLISH (a directly-connected session's own PUBLISH/PUBREL, or
+    // its Will) — never a relay-delivered one (that path is deliver_remote_publish(), above, which is
+    // deliberately NOT routed through here — seeing peer_forwarder_ fire is exactly the loop-prevention
+    // invariant 017 M6 requires).
     void deliver_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
                          bool retain) {
         if (retain) {
@@ -575,6 +616,9 @@ private:
         }
         if (on_publish_) on_publish_(topic, payload, qos);
         route_publish(topic, payload, qos);
+        // M6 (017 §4): AFTER local delivery, so a peer's relayed copy can never arrive before this node's
+        // own subscribers see it. No-op single-node default (peer_forwarder_ unset) — see set_peer_forwarder().
+        if (peer_forwarder_) peer_forwarder_(topic, payload, qos);
     }
 
     // Fan out to every connected session with a matching subscription, at min(publish qos, granted
@@ -660,6 +704,10 @@ private:
 
     std::atomic<std::uint16_t> packet_id_{1};
     std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t)> on_publish_;
+
+    // M6 (017 §4): unset by default (single-node — 100% of Phase 1 through M3 behavior unchanged). Set by
+    // BrokerCluster via set_peer_forwarder() to broadcast every locally-originated PUBLISH to peer nodes.
+    std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t)> peer_forwarder_;
 };
 
 }  // namespace aero::broker
