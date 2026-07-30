@@ -16,8 +16,14 @@
 // `on_publish()` is the entire ingestion seam for now, exactly like the client transports' honest
 // scope banners already do for their own deferred pieces (QoS-1 retransmit, TLS, etc.).
 //
-// QoS 0/1 only (no QoS 2), MQTT 3.1.1 CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PINGREQ/DISCONNECT, `+`/`#`
-// wildcard subscriptions, retained messages. No authentication (v1 is a trusted-network broker).
+// MQTT 3.1.1 CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PUBREC/PUBREL/PUBCOMP/PINGREQ/DISCONNECT, QoS 0/1/2, `+`/`#`
+// wildcard subscriptions, retained messages, Last Will & Testament, keep-alive enforcement, and
+// persistent (clean-session=0) sessions with offline message queuing. No authentication (v1 is a
+// trusted-network broker).
+//
+// MILESTONE 1 (EMQX-parity follow-on to Phase 1): adds QoS 2 (§4.3.3), Will (§3.1.2.5/§3.14), keep-alive
+// timeout (§3.1.2.10), and persistent sessions / session takeover (§3.1.2.4/§3.1.4) on top of Phase 1's
+// QoS 0/1 broker. Still single-node only — everything the Phase 1 scope banner above says still holds.
 //
 // PORTABILITY / REUSE: built on quark::pal::net + aero::pal::poll (this session's PAL work) and the
 // MQTT wire codec shared with `MqttClientTransport` (mqtt_codec.hpp, 017 §9 N3) — no new socket or
@@ -25,7 +31,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <functional>
 #include <cstddef>
@@ -149,9 +157,24 @@ private:
         std::uint8_t qos = 0;  // granted QoS (v1: min(requested, 1))
     };
 
+    // A PUBLISH(QoS 2) that has been PUBREC'd but not yet PUBREL'd — 4.3.3's whole point is that the
+    // message is NOT acted on (retained/routed/ingested) until PUBREL confirms, so we have to hold onto
+    // it somewhere in the meantime. Session-scoped (packet ids are only unique per connection).
+    struct PendingQos2 {
+        std::string topic;
+        std::vector<std::byte> payload;
+        bool retain = false;
+    };
+
     // One Session per accepted connection. io_mu_ serializes every write to `fd` — a PUBLISH fanned
     // out to this session from ANOTHER session's reader thread must not interleave on the wire with
     // this session's own SUBACK/PINGRESP/PUBACK writes.
+    //
+    // Everything below `subs`/`subs_mu` (client_id, keep_alive_s, clean_session, last_activity, the Will
+    // fields, qos2_inflight) is touched ONLY by this session's own reader thread (session_loop runs one
+    // thread per Session, and MQTT packets on one connection are inherently serialized) — no lock needed.
+    // `kicked` is the one exception: a DIFFERENT session's thread (a session-takeover CONNECT, 3.1.4)
+    // sets it, so it alone is atomic.
     struct Session {
         explicit Session(quark::pal::fd_t f) : fd(f) {}
         quark::pal::fd_t fd;
@@ -159,11 +182,48 @@ private:
         std::mutex subs_mu;
         std::vector<Subscription> subs;
 
+        std::string client_id;
+        std::uint16_t keep_alive_s = 0;
+        bool clean_session = true;
+        std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
+        std::atomic<bool> kicked{false};  // superseded by a newer CONNECT under the same client-id (3.1.4)
+
+        bool has_will = false;
+        std::string will_topic;
+        std::vector<std::byte> will_payload;
+        std::uint8_t will_qos = 0;
+        bool will_retain = false;
+
+        std::unordered_map<std::uint16_t, PendingQos2> qos2_inflight;
+
         bool send_packet(std::byte type_flags, const std::vector<std::byte>& body) {
             std::lock_guard<std::mutex> g(io_mu);
             return aero::transport::mqtt::write_packet(fd, type_flags, body);
         }
     };
+
+    // A QoS ≥1 message that arrived for a client-id while it had no live connection (persistent session,
+    // clean_session=0) — held so it can be redelivered the moment that client-id reconnects.
+    struct QueuedMessage {
+        std::string topic;
+        std::vector<std::byte> payload;
+        std::uint8_t qos = 0;
+    };
+
+    // A clean_session=0 client's state while it is OFFLINE: its subscription list (so it doesn't have to
+    // re-SUBSCRIBE) and any QoS≥1 messages that arrived for it in the meantime. Only ever holds OFFLINE
+    // clients — the moment a client-id reconnects its entry is removed and ownership moves to the live
+    // Session (see handle_connect/teardown_session) — so route_publish() never has to cross-check "is
+    // this client-id actually live" before queuing into it.
+    struct StoredSession {
+        std::vector<Subscription> subs;
+        std::deque<QueuedMessage> queued;
+    };
+
+    // Cap on how many offline QoS≥1 messages a single persistent session accumulates before the oldest
+    // are dropped (bounded memory for a client that never comes back) — 100 is an arbitrary but generous
+    // "a device is offline for a while, not forever" allowance; revisit if a real deployment needs more.
+    static constexpr std::size_t kQueuedMessageCap = 100;
 
     void accept_loop() {
         while (running_.load(std::memory_order_acquire)) {
@@ -178,33 +238,220 @@ private:
         }
     }
 
+    // 0 == no keep-alive timeout at all (3.1.1 §3.1.2.10, spec-legal). Otherwise the server "MAY"
+    // disconnect after 1.5x the keep-alive interval of silence — we do, deterministically.
+    [[nodiscard]] static bool keep_alive_expired(const Session& s) noexcept {
+        if (s.keep_alive_s == 0) return false;
+        const auto limit = std::chrono::milliseconds(static_cast<std::int64_t>(s.keep_alive_s) * 1500);
+        return std::chrono::steady_clock::now() - s.last_activity > limit;
+    }
+
     void session_loop(const std::shared_ptr<Session>& s) {
+        bool clean_disconnect = false;  // true only for an explicit DISCONNECT (0xE0) — gates the Will
         while (running_.load(std::memory_order_acquire)) {
+            // Checked every iteration (not just on a read timeout): a session-takeover CONNECT (3.1.4)
+            // must end this session promptly even if it's mid-read of something else.
+            if (s->kicked.load(std::memory_order_acquire)) break;
+
+            // Explicit poll-then-read (rather than letting read_packet's own internal 200ms polling loop
+            // block until a full packet arrives) so a silent-but-still-open connection gets its keep-alive
+            // checked every ~200ms too, not just when a packet actually shows up (mirrors
+            // tcp_transport.hpp's accept_loop poll-timeout-as-heartbeat idiom).
+            const auto ready = aero::pal::wait_readable(s->fd, 200);
+            if (!ready) break;  // poll itself failed
+            if (!*ready) {
+                if (keep_alive_expired(*s)) break;  // 3.1.1 §3.1.2.10 — silent longer than 1.5x keep-alive
+                continue;
+            }
+
             auto pkt = aero::transport::mqtt::read_packet(s->fd, running_);
             if (!pkt) break;  // peer closed / error / running flipped false
+            s->last_activity = std::chrono::steady_clock::now();  // ANY inbound packet refreshes it
             const std::uint8_t type = pkt->type_flags & 0xF0;
             if (type == 0x10) {          // CONNECT
-                if (!handle_connect(*s)) break;
+                if (!handle_connect(s, *pkt)) break;
             } else if (type == 0x80) {   // SUBSCRIBE
                 if (!handle_subscribe(*s, *pkt)) break;
             } else if (type == 0x30) {   // PUBLISH
                 if (!handle_publish(*s, *pkt)) break;
+            } else if (type == 0x60) {   // PUBREL (4.3.3 step 3; low nibble MUST be 0x2, not checked —
+                                          // mirrors this file's existing tolerance of e.g. SUBSCRIBE's flags)
+                if (!handle_pubrel(*s, *pkt)) break;
             } else if (type == 0xC0) {   // PINGREQ
                 if (!s->send_packet(std::byte{0xD0}, {})) break;  // PINGRESP, no body
-            } else if (type == 0xE0) {   // DISCONNECT
+            } else if (type == 0xE0) {   // DISCONNECT (3.1.1 §3.14): graceful — no Will on a clean
+                                          // disconnect, so discard it BEFORE teardown runs.
+                s->has_will = false;
+                clean_disconnect = true;
                 break;
             }
             // 0x40 PUBACK from the peer (ack of a QoS-1 delivery we sent): no retry state kept in v1
             // (mirrors MqttClientTransport's own honest "no QoS-1 sender-side retransmit" scope) — read
             // and discard, already consumed by read_packet above.
         }
+        teardown_session(s, clean_disconnect);
+    }
+
+    // Common end-of-life path for every way a session stops (clean DISCONNECT, socket error/reset,
+    // keep-alive timeout, or losing a session-takeover race) — Will delivery and persistent-session
+    // handoff both key off exactly this one place so neither can be bypassed by a code path forgetting to
+    // call them.
+    void teardown_session(const std::shared_ptr<Session>& s, bool clean_disconnect) {
+        // Will (3.1.2.5 / 3.14): fires on every ungraceful end (socket error, peer reset, keep-alive
+        // expiry, session takeover) — `clean_disconnect` is the ONLY case that already cleared has_will.
+        if (!clean_disconnect && s->has_will)
+            deliver_publish(s->will_topic, s->will_payload, s->will_qos, s->will_retain);
+
+        // Persistent-session handoff (3.1.1 §3.1.2.4): only persist if this session is STILL the
+        // client-id's current owner in client_sessions_ — a session that just lost a takeover race must
+        // not resurrect stale state over the new connection that already replaced it there.
+        if (!s->client_id.empty()) {
+            std::lock_guard<std::mutex> g(client_sessions_mu_);
+            const auto it = client_sessions_.find(s->client_id);
+            const bool still_owner = it != client_sessions_.end() && it->second == s;
+            if (still_owner) {
+                client_sessions_.erase(it);
+                if (!s->clean_session) {
+                    StoredSession stored;
+                    {
+                        std::lock_guard<std::mutex> subg(s->subs_mu);
+                        stored.subs = s->subs;
+                    }
+                    std::lock_guard<std::mutex> sg(stored_sessions_mu_);
+                    stored_sessions_[s->client_id] = std::move(stored);
+                }
+            }
+        }
+
         remove_session(s);
         quark::pal::close_fd(s->fd);
     }
 
-    bool handle_connect(Session& s) {
-        std::vector<std::byte> body{std::byte{0x00}, std::byte{0x00}};  // session-present=0, rc=0 (accepted)
-        return s.send_packet(std::byte{0x20}, body);                   // CONNACK
+    bool handle_connect(const std::shared_ptr<Session>& s, const aero::transport::mqtt::Packet& pkt) {
+        const std::vector<std::byte>& b = pkt.body;
+        auto read_u16 = [&](std::size_t p) -> std::uint16_t {
+            return static_cast<std::uint16_t>((std::to_integer<std::uint8_t>(b[p]) << 8) |
+                                               std::to_integer<std::uint8_t>(b[p + 1]));
+        };
+        std::size_t pos = 0;
+        if (pos + 2 > b.size()) return false;
+        const std::uint16_t proto_len = read_u16(pos);
+        pos += 2;
+        if (pos + proto_len > b.size()) return false;
+        pos += proto_len;  // protocol name ("MQTT"/"MQIsdp") — not validated, matches Phase 1's posture
+        if (pos + 1 > b.size()) return false;
+        pos += 1;  // protocol level — not validated
+
+        if (pos + 1 > b.size()) return false;
+        const std::uint8_t connect_flags = std::to_integer<std::uint8_t>(b[pos]);
+        pos += 1;
+        if (pos + 2 > b.size()) return false;
+        const std::uint16_t keep_alive = read_u16(pos);
+        pos += 2;
+
+        if (pos + 2 > b.size()) return false;
+        const std::uint16_t client_id_len = read_u16(pos);
+        pos += 2;
+        if (pos + client_id_len > b.size()) return false;
+        std::string client_id(reinterpret_cast<const char*>(b.data() + pos), client_id_len);
+        pos += client_id_len;
+
+        // Connect-flags bit layout (3.1.1 §3.1.2.3): bit2=Will Flag, bits4-3=Will QoS, bit5=Will Retain,
+        // bit1=Clean Session.
+        const bool will_flag = (connect_flags & 0x04) != 0;
+        const std::uint8_t will_qos = (connect_flags >> 3) & 0x03;
+        const bool will_retain = (connect_flags & 0x20) != 0;
+        const bool clean_session = (connect_flags & 0x02) != 0;
+
+        std::string will_topic;
+        std::vector<std::byte> will_payload;
+        if (will_flag) {
+            if (pos + 2 > b.size()) return false;
+            const std::uint16_t wt_len = read_u16(pos);
+            pos += 2;
+            if (pos + wt_len > b.size()) return false;
+            will_topic.assign(reinterpret_cast<const char*>(b.data() + pos), wt_len);
+            pos += wt_len;
+            if (pos + 2 > b.size()) return false;
+            const std::uint16_t wm_len = read_u16(pos);
+            pos += 2;
+            if (pos + wm_len > b.size()) return false;
+            will_payload.assign(b.begin() + static_cast<std::ptrdiff_t>(pos),
+                                b.begin() + static_cast<std::ptrdiff_t>(pos + wm_len));
+            pos += wm_len;
+        }
+        // Username/password (if present) are only skipped over, never consulted — v1 has no
+        // authentication (Phase 1 scope banner) — but they still have to be parsed past so `pos` would be
+        // correctly aligned for anything that follows (defensive; nothing currently does).
+        if (connect_flags & 0x80) {  // username flag
+            if (pos + 2 > b.size()) return false;
+            const std::uint16_t ulen = read_u16(pos);
+            pos += 2;
+            if (pos + ulen > b.size()) return false;
+            pos += ulen;
+        }
+        if (connect_flags & 0x40) {  // password flag
+            if (pos + 2 > b.size()) return false;
+            const std::uint16_t plen = read_u16(pos);
+            pos += 2;
+            if (pos + plen > b.size()) return false;
+            pos += plen;
+        }
+
+        s->client_id = client_id;
+        s->keep_alive_s = keep_alive;
+        s->clean_session = clean_session;
+        s->last_activity = std::chrono::steady_clock::now();
+        if (will_flag) {
+            s->has_will = true;
+            s->will_topic = std::move(will_topic);
+            s->will_payload = std::move(will_payload);
+            s->will_qos = will_qos;
+            s->will_retain = will_retain;
+        }
+
+        bool session_present = false;
+        std::vector<Subscription> restored_subs;
+        std::vector<QueuedMessage> to_flush;
+        if (!client_id.empty()) {
+            // Session takeover (3.1.4): a second CONNECT under a client-id already live closes the
+            // first. "Closes" here means flip the OLD session's `kicked` flag, which IT notices in its
+            // own poll loop and tears down on ITS OWN thread — this file never closes a socket from a
+            // thread that doesn't own it (matches stop()'s and session_loop's existing discipline).
+            {
+                std::lock_guard<std::mutex> g(client_sessions_mu_);
+                const auto it = client_sessions_.find(client_id);
+                if (it != client_sessions_.end() && it->second != s)
+                    it->second->kicked.store(true, std::memory_order_release);
+                client_sessions_[client_id] = s;
+            }
+
+            std::lock_guard<std::mutex> g(stored_sessions_mu_);
+            if (clean_session) {
+                stored_sessions_.erase(client_id);  // 3.1.2.4: clean=1 discards any prior session state
+            } else {
+                const auto it = stored_sessions_.find(client_id);
+                if (it != stored_sessions_.end()) {
+                    restored_subs = it->second.subs;
+                    to_flush.assign(it->second.queued.begin(), it->second.queued.end());
+                    stored_sessions_.erase(it);  // ownership moves to this now-live session
+                    session_present = true;
+                }
+            }
+        }
+        if (!restored_subs.empty()) {
+            std::lock_guard<std::mutex> g(s->subs_mu);
+            s->subs = std::move(restored_subs);
+        }
+
+        std::vector<std::byte> body{static_cast<std::byte>(session_present ? 0x01 : 0x00), std::byte{0x00}};  // rc=0
+        if (!s->send_packet(std::byte{0x20}, body)) return false;  // CONNACK
+
+        // Flush anything that arrived while this persistent session was offline — AFTER CONNACK, per
+        // 3.1.1 (the client only knows to expect them once it's seen session-present=1).
+        for (const QueuedMessage& m : to_flush)
+            if (!publish_to(*s, m.topic, m.payload, m.qos, /*retain=*/false)) return false;
+        return true;
     }
 
     bool handle_subscribe(Session& s, const aero::transport::mqtt::Packet& pkt) {
@@ -271,9 +518,54 @@ private:
 
         std::vector<std::byte> payload(b.begin() + static_cast<std::ptrdiff_t>(pos), b.end());
 
-        // Retention is stored (and, below, fanned out to subscribers) BEFORE the PUBACK is sent, not
-        // after — a publisher that has received its PUBACK must be able to assume a subsequent SUBSCRIBE
-        // from anyone will already see this retained value / delivery (no ack-before-visible race).
+        if (qos == 2) {
+            // Exactly-once (4.3.3): stash until PUBREL confirms receipt, then — and ONLY then — retain/
+            // ingest/route it. Re-inserting under the same packet_id on a retransmitted PUBLISH (the
+            // sender's PUBREC was lost) is a harmless overwrite with identical content, not a double
+            // routing — the actual routing only ever happens once, from handle_pubrel.
+            s.qos2_inflight[packet_id] = PendingQos2{topic, payload, retain};
+            std::vector<std::byte> ack;
+            aero::transport::mqtt::put_u16_be(ack, packet_id);
+            return s.send_packet(std::byte{0x50}, ack);  // PUBREC
+        }
+
+        // QoS 0/1: act BEFORE acking — a publisher that has received its PUBACK must be able to assume a
+        // subsequent SUBSCRIBE/retained-replay from anyone will already see this value/delivery (no
+        // ack-before-visible race).
+        deliver_publish(topic, payload, qos, retain);
+        if (qos == 1) {
+            std::vector<std::byte> ack;
+            aero::transport::mqtt::put_u16_be(ack, packet_id);
+            if (!s.send_packet(std::byte{0x40}, ack)) return false;  // PUBACK
+        }
+        return true;
+    }
+
+    // PUBREL (4.3.3 step 3): the sender has now durably committed to this packet_id, so this is where a
+    // QoS-2 PUBLISH FINALLY gets acted on — the one thing that distinguishes QoS 2 from QoS 1 (which acts
+    // immediately). PUBCOMP is sent unconditionally, even for an unknown packet_id (a retried PUBREL after
+    // we already completed it and forgot it) — the sender's handshake must terminate either way.
+    bool handle_pubrel(Session& s, const aero::transport::mqtt::Packet& pkt) {
+        const std::vector<std::byte>& b = pkt.body;
+        if (b.size() < 2) return false;
+        const std::uint16_t packet_id =
+            (std::to_integer<std::uint8_t>(b[0]) << 8) | std::to_integer<std::uint8_t>(b[1]);
+        const auto it = s.qos2_inflight.find(packet_id);
+        if (it != s.qos2_inflight.end()) {
+            deliver_publish(it->second.topic, it->second.payload, /*qos=*/2, it->second.retain);
+            s.qos2_inflight.erase(it);
+        }
+        std::vector<std::byte> ack;
+        aero::transport::mqtt::put_u16_be(ack, packet_id);
+        return s.send_packet(std::byte{0x70}, ack);  // PUBCOMP
+    }
+
+    // The action a PUBLISH ultimately performs once its QoS contract permits it: QoS 0/1 call this
+    // immediately (handle_publish); QoS 2 defers it until PUBREL (handle_pubrel); a Will "publishes" this
+    // directly with no wire packet or ack at all (teardown_session) — one shared path so retention,
+    // ingestion, and routing can never drift between the three.
+    void deliver_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
+                         bool retain) {
         if (retain) {
             std::lock_guard<std::mutex> g(retained_mu_);
             if (payload.empty())
@@ -281,21 +573,15 @@ private:
             else
                 retained_[topic] = payload;
         }
-
-        if (qos > 0) {
-            std::vector<std::byte> ack;
-            aero::transport::mqtt::put_u16_be(ack, packet_id);
-            if (!s.send_packet(std::byte{0x40}, ack)) return false;  // PUBACK
-        }
-
         if (on_publish_) on_publish_(topic, payload, qos);
         route_publish(topic, payload, qos);
-        return true;
     }
 
     // Fan out to every connected session with a matching subscription, at min(publish qos, granted
     // qos) — a snapshot copy of sessions_ is taken under the lock so the actual socket writes (which
-    // may block briefly on backpressure) never happen while holding sessions_mu_.
+    // may block briefly on backpressure) never happen while holding sessions_mu_. Also queues into any
+    // OFFLINE persistent (clean_session=0) session whose stored subscriptions match — QoS ≥1 only, since
+    // there is nothing to durably queue a QoS-0 "at most once" message as.
     void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos) {
         std::vector<std::shared_ptr<Session>> snapshot;
         {
@@ -312,6 +598,18 @@ private:
             for (const Subscription& sub : matches) {
                 const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
                 (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false);
+            }
+        }
+
+        if (qos == 0) return;
+        std::lock_guard<std::mutex> g(stored_sessions_mu_);
+        for (auto& [client_id, stored] : stored_sessions_) {
+            for (const Subscription& sub : stored.subs) {
+                if (!topic_matches(sub.filter, topic)) continue;
+                const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
+                if (stored.queued.size() >= kQueuedMessageCap) stored.queued.pop_front();  // drop-oldest
+                stored.queued.push_back(QueuedMessage{topic, payload, deliver_qos});
+                break;  // one queued copy per client-id even if multiple subs match the same topic
             }
         }
     }
@@ -349,6 +647,16 @@ private:
 
     std::mutex retained_mu_;
     std::unordered_map<std::string, std::vector<std::byte>> retained_;
+
+    // client-id → the Session currently claiming it (session takeover, 3.1.4). Only ever holds LIVE
+    // sessions; an entry is removed the moment its Session tears down (teardown_session).
+    std::mutex client_sessions_mu_;
+    std::unordered_map<std::string, std::shared_ptr<Session>> client_sessions_;
+
+    // client-id → offline persistent-session state (3.1.2.4). Only ever holds OFFLINE clients; see
+    // StoredSession's comment for the invariant this relies on.
+    std::mutex stored_sessions_mu_;
+    std::unordered_map<std::string, StoredSession> stored_sessions_;
 
     std::atomic<std::uint16_t> packet_id_{1};
     std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t)> on_publish_;
