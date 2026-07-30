@@ -5,11 +5,14 @@
 // (016 §2.3) from `--mes-host`/`--mes-port` — omit them and `/mes/outbox` just reports
 // `{"configured": false}`. Optionally wires the Fleet/OTA/placement view (016 §2.1/§2.2) from
 // repeated `--fleet-device ID[:VERSION]` flags — omit them and `/fleet`/`/ota/rollouts` report
-// `{"configured": false}`. This is the deployable edge-node binary — one per node. All control logic
-// lives in Runtime/RestApi; main is just wiring + args.
+// `{"configured": false}`. Optionally wires the native MQTT broker / southbound termination (017)
+// from `--broker-port`/`--broker-bind` — omit them and `/broker/status` reports `{"configured": false}`.
+// This is the deployable edge-node binary — one per node. All control logic lives in Runtime/RestApi;
+// main is just wiring + args.
 //
 //   aero-runtime [--app path.json] [--host 0.0.0.0] [--port 8080] [--mes-host H --mes-port P]
 //                [--fleet-device ID[:VERSION] ...] [--fleet-node-flag FLAG ...]
+//                [--broker-port P] [--broker-bind H]
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +21,7 @@
 #include <string>
 
 #include "aero/api/rest_api.hpp"
+#include "aero/broker/native_broker.hpp"
 #include "aero/mes/mes.hpp"
 #include "aero/runtime/runtime.hpp"
 #include "httplib.h"
@@ -50,6 +54,8 @@ int main(int argc, char** argv) {
     std::string mes_path = "/production";
     std::string mes_token;
     aero::runtime::Runtime::FleetConfig fleet_cfg;
+    aero::broker::Config broker_cfg;
+    bool broker_enabled = false;  // only true if a --broker-* flag was actually given (017)
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -71,11 +77,18 @@ int main(int argc, char** argv) {
             fleet_cfg.devices.push_back(parse_fleet_device(argv[++i]));
         } else if (a == "--fleet-node-flag" && i + 1 < argc) {
             fleet_cfg.node_flags.push_back(argv[++i]);
+        } else if (a == "--broker-port" && i + 1 < argc) {
+            broker_cfg.listen_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+            broker_enabled = true;
+        } else if (a == "--broker-bind" && i + 1 < argc) {
+            broker_cfg.bind_host = argv[++i];
+            broker_enabled = true;
         } else {
             std::fprintf(stderr,
                          "usage: aero-runtime [--app path.json] [--host H] [--port P] "
                          "[--mes-host H --mes-port P [--mes-path PATH] [--mes-token TOKEN]] "
-                         "[--fleet-device ID[:VERSION] ...] [--fleet-node-flag FLAG ...]\n");
+                         "[--fleet-device ID[:VERSION] ...] [--fleet-node-flag FLAG ...] "
+                         "[--broker-port P] [--broker-bind H]\n");
             return 2;
         }
     }
@@ -103,6 +116,16 @@ int main(int argc, char** argv) {
             return 3;
         }
         std::printf("MES gateway wired to %s:%d%s\n", mes_host.c_str(), mes_port, mes_path.c_str());
+    }
+
+    if (broker_enabled) {
+        auto r = rt.configure_broker(broker_cfg);
+        if (!r) {
+            std::fprintf(stderr, "native broker configure failed: %s\n", r.error().c_str());
+            return 3;
+        }
+        std::printf("native broker listening on %s:%d\n", broker_cfg.bind_host.c_str(),
+                    static_cast<int>(broker_cfg.listen_port));
     }
 
     if (!app_path.empty()) {

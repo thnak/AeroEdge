@@ -1,10 +1,28 @@
 # 017 — Native Broker and Southbound Termination
 
-> Draft v0.1. AeroEdge provides its own embedded MQTT broker — a **fully-distributed plugin**
+> Draft v0.2. AeroEdge provides its own embedded MQTT broker — a **fully-distributed plugin**
 > behind the 014 transport seam (014 §4 B3), not a fork of an existing broker and not a
 > dependency on one. It exists to (a) remove EMQX's Business Source License as a blocker to
 > shipping AeroEdge as a product, and (b) terminate device-facing ("southbound") MQTT at the
-> edge node itself instead of requiring separate broker infrastructure per deployment.
+> edge node itself instead of requiring separate broker infrastructure per deployment. The goal
+> is EMQX **capability** parity for the pieces that matter to AeroEdge's deployments — not a
+> line-for-line reimplementation of EMQX's own architecture, and explicitly not its licensed-away
+> multi-node clustering (§3/§4 cover how AeroEdge gets that property for free instead).
+
+## Status (updated as milestones ship — keep this current, don't let it drift like v0.1's §6 did)
+
+| Milestone | What | Status |
+|---|---|---|
+| Phase 1 | Single-node MQTT 3.1.1 core: CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PINGREQ/DISCONNECT, wildcard routing, retained messages, QoS 0/1 | **Shipped** |
+| M1 | QoS 2, Last Will & Testament, keep-alive enforcement, persistent/clean sessions + takeover | **Shipped** |
+| M2 | `Runtime::configure_broker()`, `GET /broker/status`, CLI flags — `aero-broker` now linked into `aero-runtime` | **Shipped** |
+| M3 | Bridge seam (`IBridgeSink`: MQTT-to-MQTT, HTTP webhook) + rule engine reusing `ExprRuleNode` (008 §6) | **Shipped** |
+| M4 | Studio dashboard page for the broker | Backlog, blocked on M2 (done) — not yet built |
+| M5 | TLS + Quark 020 per-topic authorization/ACL | Backlog |
+| M6 | Cross-node topic routing via `DistributedRouter` | Backlog |
+| M7 | MQTT 5 | Backlog |
+| M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | Backlog |
+| M9 | Multi-protocol southbound (OPC-UA/Modbus) — likely its own spec (018?) | Backlog |
 
 ## 1. Why
 
@@ -132,27 +150,38 @@ rebuild:
   (`RestMesAdapter` today). This spec adds no second path to the MES; it is one more producer
   into the same seam 012 already defines (M1–M3 unaffected).
 
-## 6. MQTT scope (v1) — the floor, not EMQX's ceiling
+## 6. MQTT scope — capability parity where it matters, not a line-for-line EMQX clone
 
-EMQX's BSL-restricted surface (from the survey: 30+ bridge connectors, schema registry, SQL
-rule engine, multi-protocol gateways for CoAP/LwM2M/OCPP/etc., a dashboard) is enterprise
-integration breadth AeroEdge does not need to match — that breadth is exactly what the license
-is gatekeeping, and duplicating it would recreate the problem this spec exists to avoid. The
-native broker's floor is the one industrial edge actually needs:
+EMQX's BSL-restricted surface (from the survey: 30+ bridge connectors, a schema registry, a SQL
+rule engine, multi-protocol gateways for CoAP/LwM2M/OCPP/etc., a dashboard) is real
+functionality AeroEdge deployments need — the revised direction (see Status above) is to match
+that *capability* by **reusing what AeroEdge already has** (the existing `ExprRuleNode`
+expression engine for rules, `httplib`/`RestMesAdapter`'s pattern for HTTP bridging,
+`MqttClientTransport`'s codec for MQTT bridging, Studio's existing page pattern for a
+dashboard) rather than copying EMQX's own from-scratch implementation of each. What's still
+explicitly declined is EMQX's *long tail* (Kafka/Pulsar/RabbitMQ bridges needing new
+dependencies, MQTT 5, CoAP/LwM2M/OCPP gateways) — those are backlog milestones (M7-M9), not
+principled exclusions the way v0.1 framed the whole breadth:
 
-| Capability | v1 | Rationale |
+| Capability | Status | Rationale / where |
 |---|---|---|
-| MQTT 3.1.1: CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PINGREQ/DISCONNECT | yes | matches the existing client codec (§4); covers the vast majority of PLC/sensor MQTT stacks |
-| QoS 0, QoS 1 | yes | QoS 1 is AeroEdge's own floor for at-least-once (014 §5); QoS 0 for genuinely lossy telemetry |
-| QoS 2 | no (v1) | rare in device firmware; revisit if a real device needs it |
-| Topic wildcards (`+`, `#`) on SUBSCRIBE | yes | needed for any non-trivial topic tree |
-| Retained messages | yes | last-known-value is a natural fit for Tag semantics (002/003) |
-| Persistent sessions across reconnect | local-node only, v1 | see §4 — no cluster-wide session sync yet |
-| TLS | yes | C5 (014) — required for any non-loopback deployment |
-| Per-topic ACL / authorization | via Quark 020 principal, not a bespoke ACL engine | reuse, don't rebuild (thin-over-Quark) |
-| MQTT 5 | no (v1) | 3.1.1 covers the device population we've seen; revisit on real demand |
-| Bridging to Kafka/other brokers, rule engine, dashboard | out of scope | EMQX's own paid-tier breadth; not this spec's problem to solve |
-| Shared subscriptions, multi-protocol gateways (CoAP/LwM2M/OCPP) | out of scope (v1) | no current AeroEdge/AeroMes use case |
+| MQTT 3.1.1: CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PUBREC/PUBREL/PUBCOMP/PINGREQ/DISCONNECT | **shipped** | Phase 1 + M1 |
+| QoS 0, 1, 2 | **shipped** | QoS 2 (PUBREC/PUBREL/PUBCOMP, §4.3.3) landed in M1 |
+| Topic wildcards (`+`, `#`) on SUBSCRIBE | **shipped** | Phase 1 |
+| Retained messages | **shipped** | Phase 1 — last-known-value fits Tag semantics (002/003) |
+| Last Will & Testament | **shipped** | M1 |
+| Keep-alive enforcement (1.5× timeout) | **shipped** | M1 |
+| Persistent/clean sessions + takeover | **shipped**, in-memory, single-node | M1; cluster-wide session sync is M6 |
+| Bridging (MQTT-to-MQTT, HTTP webhook) | **shipped** | M3, `IBridgeSink`/`MqttBridgeSink`/`HttpWebhookBridgeSink` |
+| Rule engine (topic filter + expression gate → sink) | **shipped**, reuses `ExprRuleNode` | M3, not a new DSL |
+| Dashboard | backlog | M4, blocked on M2 (done) |
+| TLS | backlog | M5 — C5 (014) still applies; v1-and-beyond is plaintext/trusted-network until this lands |
+| Per-topic ACL / authorization | backlog | M5, via Quark 020 principal, not a bespoke ACL engine |
+| Cross-node topic routing | backlog | M6, `DistributedRouter` (§4) |
+| MQTT 5 | backlog | M7 — 3.1.1 covers the device population seen so far |
+| Kafka/Pulsar/RabbitMQ bridges | backlog | M8 — needs new third-party deps, native-extension-shaped (008) |
+| Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
+| Shared subscriptions | not yet scheduled | no current AeroEdge/AeroMes use case; revisit on demand |
 
 ## 7. MES integration — defined here, not borrowed from AeroMes as-is
 
@@ -187,8 +216,14 @@ adapts to unilaterally. Concretely:
 
 ## 9. Invariants (normative)
 
-- **N1** — the native broker is an opt-in plugin (`aero-broker`); `aero-core`/`aero-runtime`
-  never depend on it (014 B3).
+- **N1** — the native broker is an opt-in-to-*configure* plugin (`aero-broker`): `aero-runtime`
+  links it and exposes `Runtime::configure_broker()` (M2), the same posture as `aero-mes`/
+  `aero-ota` (daemon-lifetime subsystems, inert until explicitly configured) — **not** the
+  `aero-transport` posture (excluded from `aero-runtime` entirely, swapped in per-deployment
+  behind the Transport seam instead). `aero-core` still never depends on it. (Revises v0.1's
+  wording, which conflated "opt-in" with "never linked" — see 014 B3's actual requirement:
+  `aero-core`/`aero-runtime` never *require* it, which configure-gating satisfies without
+  needing exclusion from the link graph.)
 - **N2** — no cluster-wide broker state (session table, topic tree) is invented; topic
   ownership and cross-node delivery ride Quark's existing coordinator-free placement/routing
   (010, 026) unchanged.
@@ -204,6 +239,24 @@ adapts to unilaterally. Concretely:
 - **N7** — QoS ≥ 1 delivery from device → AeroEdge is at-least-once with dedup at the
   consuming actor (mirrors 014's C3 posture for inter-actor MQTT); QoS 0 is an explicit,
   opt-in, lossy choice per topic.
+- **N8** — QoS 2 is exactly-once *per session*: a message is only routed/delivered after PUBCOMP
+  completes the handshake (§4.3.3), never on PUBREC alone; a retransmitted PUBLISH under the
+  same packet id is deduped, not re-routed.
+- **N9** — Last Will delivery is keyed on HOW a session ended: an ungraceful end (socket error/
+  reset, or losing a session-takeover race) fires the will; a clean DISCONNECT never does
+  (§3.14) — the broker must distinguish these, not treat every disconnect identically.
+- **N10** — persistent-session state (subscriptions + queued QoS≥1 messages) is bounded (a
+  capped, drop-oldest queue) and in-memory only — it does not survive a broker process restart
+  in the current milestone (that would be a durability feature, tracked separately, not implied
+  by "persistent" here).
+- **N11** — bridge sinks (`IBridgeSink`) and the rule engine never block the broker's session
+  threads on slow downstream I/O in a way that stalls PUBLISH processing for unrelated topics —
+  each sink call is expected to be fire-and-forget or bounded, mirroring 012's outbox posture
+  (M3 review should confirm this holds as sinks grow more sophisticated, e.g. Kafka in M8).
+- **N12** — the rule engine reuses `ExprRuleNode`'s grammar/evaluator verbatim; it does not fork
+  or extend the expression language for broker-specific needs — if broker rules eventually need
+  something the flow-rule grammar can't express, that is a change to the shared grammar (008),
+  not a second one.
 
 ## 10. Open questions
 
@@ -216,8 +269,8 @@ adapts to unilaterally. Concretely:
   jointly with AeroMes, not inferred from its current webhook alone.
 - **Retained-message durability** — whether a retained value survives a node restart (ties to
   007 State/Persistence) or is memory-only per session in v1.
-- **QoS 2 and MQTT 5** — deferred until a real device/integration needs them; don't build
-  ahead of demand.
+- **MQTT 5** (M7) — deferred until a real device/integration needs it; don't build ahead of
+  demand. (QoS 2 shipped in M1 — no longer open.)
 - **Shared secrets / device provisioning** — how a device gets its TLS identity/PSK in the
   first place (fleet-level concern, may tie to 011 OTA's existing device identity story).
 - **Southbound OPC-UA/Modbus termination** — this spec is MQTT-only; whether the same

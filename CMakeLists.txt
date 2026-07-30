@@ -111,14 +111,20 @@ target_include_directories(aero-transport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(aero-transport INTERFACE quark::quark Threads::Threads)
 add_library(aero::transport ALIAS aero-transport)
 
-# aero-broker — AeroEdge's own embedded MQTT server (017, Phase 1): local wire-protocol session state
-# (CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PINGREQ/DISCONNECT), single-node topic routing, retained messages.
-# Shares its wire codec with aero-transport's MqttClientTransport (017 §9 N3). Single-node only in
-# Phase 1 — cross-node routing over Quark's DistributedRouter is deferred (017 follow-on phases).
-# Deliberately NOT linked by aero-core/aero-runtime yet — Phase 1 is a standalone library + test.
+# aero-broker — AeroEdge's own embedded MQTT server (017): local wire-protocol session state
+# (CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PUBREC/PUBREL/PUBCOMP/PINGREQ/DISCONNECT, QoS 0/1/2, Last Will,
+# keep-alive, persistent sessions), single-node topic routing, retained messages. Shares its wire codec
+# with aero-transport's MqttClientTransport (017 §9 N3). Single-node only — cross-node routing over
+# Quark's DistributedRouter is deferred (017 follow-on phases).
+# Linked by aero-runtime below (a daemon-lifetime subsystem exactly like aero-mes/aero-ota, not an
+# optional backend behind a seam the way aero-transport is) — see aero-runtime's Runtime::configure_broker().
+# bridge.hpp (017 §6, revised scope) adds bridging (MQTT + HTTP webhook sinks) and a rule engine over
+# `on_publish()`, reusing aero-nodes' ExprRuleNode (008 §6) for the rule/expression side and httplib
+# (RestMesAdapter's own pattern, mes/rest_mes_adapter.hpp) for the HTTP sink — hence the added deps.
 add_library(aero-broker INTERFACE)
 target_include_directories(aero-broker INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-broker INTERFACE aero-transport quark::quark Threads::Threads)
+target_link_libraries(aero-broker INTERFACE
+  aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json quark::quark Threads::Threads)
 add_library(aero::broker ALIAS aero-broker)
 
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration
@@ -140,8 +146,8 @@ add_library(aero::schema ALIAS aero-schema)
 add_library(aero-runtime INTERFACE)
 target_include_directories(aero-runtime INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-runtime INTERFACE
-  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-ota aero-cluster aero-schema quark::quark
-  aero-thirdparty-json Threads::Threads)
+  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-ota aero-cluster aero-schema aero-broker
+  quark::quark aero-thirdparty-json Threads::Threads)
 add_library(aero::runtime ALIAS aero-runtime)
 
 # aero-api — the thin REST/SSE management shell over aero-runtime (013 §5/§9). httplib lives here only.

@@ -14,6 +14,7 @@
 //   GET    /fleet            → Runtime.fleet_status() (016 §2.1 — real, single-daemon scope)
 //   GET    /ota/rollouts     → Runtime.ota_status() (016 §2.2 — real orchestration, mock drivers)
 //   POST   /ota/rollouts     → body = {"version","bytes"} → Runtime.start_rollout()
+//   GET    /broker/status    → Runtime.broker_status() (017 §1/§5 — native MQTT broker, Phase 1)
 //
 // httplib (cpp-httplib) is confined to aero-api/aero-cli (R1): it never enters aero-core/aero-sdk.
 #pragma once
@@ -159,6 +160,14 @@ public:
             }
             res.status = 200;
             res.set_content(rt_.ota_status().dump(), "application/json");
+        });
+
+        // Native MQTT broker observability (017 §1/§5): {"configured": false} until the daemon has been
+        // given a listen port to bind (see aero_runtime_main.cpp --broker-port/--broker-bind). Phase 1
+        // exposes read-only status only — no session/subscription introspection endpoint yet, since
+        // NativeBroker itself doesn't expose that beyond listen_port() (see runtime.hpp broker_status()).
+        svr.Get("/broker/status", [this](const httplib::Request&, httplib::Response& res) {
+            res.set_content(rt_.broker_status().dump(), "application/json");
         });
     }
 

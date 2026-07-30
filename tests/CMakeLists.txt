@@ -187,6 +187,15 @@ target_link_libraries(native_broker PRIVATE aero::broker)
 add_test(NAME native_broker COMMAND native_broker)
 set_tests_properties(native_broker PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 §6 (revised scope) gate: bridge.hpp — bridging (MqttBridgeSink, HttpWebhookBridgeSink) + the
+# BrokerRuleEngine reusing aero-nodes' ExprRuleNode (008 §6) as the content gate over on_publish().
+# MqttBridgeSink is proven against a real NativeBroker; HttpWebhookBridgeSink against a local httplib
+# server (same pattern as tests/mes/mes_outbox.cpp / tests/api/api_integration.cpp).
+add_executable(bridge broker/bridge.cpp)
+target_link_libraries(bridge PRIVATE aero::broker aero::nodes aero-thirdparty-httplib aero-thirdparty-json)
+add_test(NAME bridge COMMAND bridge)
+set_tests_properties(bridge PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # uv drives the Python-hosted backends (amqtt broker / grpcio server) the REAL MQTT & gRPC gates need.
 # Absent uv, those tests SKIP (exit 0 with a SKIP line) rather than fail — the backend is external infra.
 find_program(AERO_UV_BIN uv)

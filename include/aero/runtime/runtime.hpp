@@ -32,6 +32,7 @@
 
 #include <optional>
 
+#include "aero/broker/native_broker.hpp"
 #include "aero/cluster/cluster.hpp"
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
@@ -133,6 +134,7 @@ public:
     ~Runtime() {
         (void)undeploy();
         if (mes_engine_) mes_engine_->stop();
+        if (broker_) broker_->stop();
     }
 
     Runtime(const Runtime&) = delete;
@@ -599,6 +601,39 @@ public:
         return {};
     }
 
+    // ---- Native MQTT broker / southbound termination (017, Phase 1) ---------------------------------
+    // Daemon-lifetime subsystem, same shape as the MES gateway/fleet above: configure once at daemon
+    // start (its own ownership, independent of any deployed Application's deploy/undeploy cycle — the
+    // broker's job is accepting device connections, not running the flow), a second call is rejected
+    // rather than silently replacing the listening broker underneath live sessions.
+    std::expected<void, std::string> configure_broker(const aero::broker::Config& cfg) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (broker_) {
+            return std::unexpected("native broker already configured");
+        }
+        auto b = std::make_unique<aero::broker::NativeBroker>(cfg);
+        auto r = b->start();
+        if (!r) return std::unexpected(r.error());
+        broker_ = std::move(b);
+        return {};
+    }
+
+    // Broker observability (017): {"configured": false} until configure_broker(). Phase 1's NativeBroker
+    // exposes only listen_port() as a public accessor beyond start/stop/on_publish — no session count or
+    // subscription list is available yet, so that's all this reports for now (gap noted for a follow-on
+    // phase once the broker grows a status()-shaped accessor).
+    nlohmann::json broker_status() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json j;
+        if (!broker_) {
+            j["configured"] = false;
+            return j;
+        }
+        j["configured"] = true;
+        j["listen_port"] = broker_->listen_port();
+        return j;
+    }
+
 private:
     static const char* rollout_state_name(aero::ota::RolloutState s) noexcept {
         switch (s) {
@@ -699,6 +734,9 @@ private:
     std::unique_ptr<aero::ota::FleetActor> ota_;
     std::uint64_t ota_trust_key_ = 0;
     std::vector<aero::ota::WaveResult> last_waves_;
+
+    // Native MQTT broker lifetime (daemon-scoped, set by configure_broker() above).
+    std::unique_ptr<aero::broker::NativeBroker> broker_;
 };
 
 }  // namespace aero::runtime
