@@ -196,6 +196,14 @@ target_link_libraries(bridge PRIVATE aero::broker aero::nodes aero-thirdparty-ht
 add_test(NAME bridge COMMAND bridge)
 set_tests_properties(bridge PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# M5 TLS+ACL milestone gate: acl.hpp — the broker-local per-topic Authorizer seam (Allow/Deny-all
+# triviality, TopicAclAuthorizer's Closed/Open default posture, exact + wildcard principal/topic
+# matching, first-match-wins ordering, Publish/Subscribe action independence). Pure logic, no sockets.
+add_executable(acl broker/acl.cpp)
+target_link_libraries(acl PRIVATE aero::broker)
+add_test(NAME acl COMMAND acl)
+set_tests_properties(acl PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # uv drives the Python-hosted backends (amqtt broker / grpcio server) the REAL MQTT & gRPC gates need.
 # Absent uv, those tests SKIP (exit 0 with a SKIP line) rather than fail — the backend is external infra.
 find_program(AERO_UV_BIN uv)
@@ -297,3 +305,17 @@ add_executable(breadth_nodes nodes/breadth_nodes.cpp)
 target_link_libraries(breadth_nodes PRIVATE aero::nodes aero::runtime)
 add_test(NAME breadth_nodes COMMAND breadth_nodes)
 set_tests_properties(breadth_nodes PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M5: TLS+ACL milestone — non-blocking TLS byte-channel PAL (include/aero/pal/tls.hpp) -----------
+# `TlsServerContext`/`TlsSession` proven over a REAL loopback TCP socket against mbedTLS's own CLIENT
+# APIs (tls.hpp itself is server-only — AeroEdge's broker is always the TLS server): a genuine non-
+# blocking handshake completes and data round-trips through recv_some/send_some (server-auth-only TLS),
+# mTLS accepts a client cert signed by the configured ca_file, and mTLS REJECTS a connection with no
+# client cert when one is required. Also smoke-checks io_channel.hpp's PlainChannel/TlsChannel surface.
+# Uses the pre-generated, checked-in TEST-ONLY certs under pal/certs/ (never used in production).
+add_executable(tls_channel pal/tls_channel.cpp)
+target_link_libraries(tls_channel PRIVATE aero::sdk Threads::Threads aero-thirdparty-tls)
+target_compile_definitions(tls_channel PRIVATE
+  AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
+add_test(NAME tls_channel COMMAND tls_channel)
+set_tests_properties(tls_channel PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
