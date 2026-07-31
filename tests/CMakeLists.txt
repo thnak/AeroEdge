@@ -214,6 +214,15 @@ target_link_libraries(acl PRIVATE aero::broker)
 add_test(NAME acl COMMAND acl)
 set_tests_properties(acl PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 M7 gate: MQTT 5 support in NativeBroker — protocol negotiation, CONNECT/Will/PUBLISH/SUBSCRIBE
+# Properties parsing (mqtt_codec.hpp's read_varint/read_properties), and v5 CONNACK/SUBACK reason codes,
+# over real loopback sockets (mirrors native_broker.cpp's TestClient pattern) plus standalone unit
+# coverage of the Properties codec itself.
+add_executable(mqtt5 broker/mqtt5.cpp)
+target_link_libraries(mqtt5 PRIVATE aero::broker)
+add_test(NAME mqtt5 COMMAND mqtt5)
+set_tests_properties(mqtt5 PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # uv drives the Python-hosted backends (amqtt broker / grpcio server) the REAL MQTT & gRPC gates need.
 # Absent uv, those tests SKIP (exit 0 with a SKIP line) rather than fail — the backend is external infra.
 find_program(AERO_UV_BIN uv)
