@@ -208,6 +208,54 @@ if(AERO_ENABLE_OPCUA)
   endif()
 endif()
 
+# ---- RabbitMQ (rabbitmq-c, vendored via CMake FetchContent) ----------------
+# M8 (017 §6 Status): the bridge seam (`aero::broker::IBridgeSink`, broker/bridge.hpp) gets a third sink,
+# `RabbitMqBridgeSink` (broker/rabbitmq_bridge_sink.hpp), over rabbitmq-c (github.com/alanxz/rabbitmq-c,
+# MIT), the standard open-source C AMQP 0-9-1 client library. Mirrors `MqttBridgeSink`'s eager-connect/
+# fail-fast posture (bridge.hpp's own banner) — no reconnect loop, that is a driver-specific obligation
+# (006 §8), not a bridge-sink one. v1 scope: PUBLISH only, no TLS/SASL-EXTERNAL (matches this project's
+# OPC-UA v1 "no security policy" precedent above), no publisher confirms, no exchange auto-declare. Kafka/
+# Pulsar bridges remain backlog (M8.1/M8.2, 017 §6 Status) — out of scope here. Fetched (not vendored
+# under third_party/) for the same reason as mbedTLS/open62541 above: a real C library that needs
+# compiling, not just #include'ing.
+option(AERO_ENABLE_RABBITMQ "Build with RabbitMQ bridge sink support (rabbitmq-c, fetched via CMake FetchContent)" ON)
+if(AERO_ENABLE_RABBITMQ)
+  include(FetchContent)
+  FetchContent_Declare(
+    rabbitmq_c
+    GIT_REPOSITORY https://github.com/alanxz/rabbitmq-c.git
+    GIT_TAG        v0.17.0  # latest tagged release at the time this was pinned (confirmed via git
+                             # ls-remote --tags against the upstream repo)
+  )
+  # Keep rabbitmq-c's own build lean/quiet, mirroring the mbedTLS/open62541 forced-cache-var pattern
+  # above — force the cache vars ITS OWN CMakeLists.txt reads BEFORE FetchContent_MakeAvailable:
+  #   ENABLE_SSL_SUPPORT OFF — drops rabbitmq-c's own OpenSSL find_package requirement entirely: no
+  #     TLS/security in this v1 (matches the OPC-UA v1 "no security policy" precedent above).
+  #   BUILD_EXAMPLES / BUILD_TOOLS OFF — only the client library, never rabbitmq-c's own example
+  #     programs or CLI tools as build targets.
+  #   RUN_SYSTEM_TESTS OFF — rabbitmq-c's own live-broker system tests never build as a FetchContent
+  #     subproject anyway; forced explicitly here for clarity, not because it would otherwise fire.
+  #   BUILD_STATIC_LIBS is left at its upstream default (ON) — the static target is what gets linked,
+  #     below; we don't need the shared one.
+  set(ENABLE_SSL_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(RUN_SYSTEM_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(rabbitmq_c)
+endif()
+
+# aero-thirdparty-rabbitmq — INTERFACE seam over rabbitmq-c (mirrors aero-thirdparty-opcua's shape above).
+# With AERO_ENABLE_RABBITMQ on, links the real static target rabbitmq-c's own CMakeLists.txt registers:
+# `rabbitmq::rabbitmq-static` — and defines AERO_RABBITMQ_ENABLED=1 so
+# include/aero/broker/rabbitmq_bridge_sink.hpp can compile its real rabbitmq-c-backed implementation
+# instead of the "not compiled in" stub. With AERO_ENABLE_RABBITMQ off this stays a genuine no-op
+# INTERFACE target: no fetch attempted, no network access needed, nothing to link.
+add_library(aero-thirdparty-rabbitmq INTERFACE)
+if(AERO_ENABLE_RABBITMQ)
+  target_link_libraries(aero-thirdparty-rabbitmq INTERFACE rabbitmq::rabbitmq-static)
+  target_compile_definitions(aero-thirdparty-rabbitmq INTERFACE AERO_RABBITMQ_ENABLED=1)
+endif()
+
 # ---- Vendored, header-only third-party deps (already fetched under third_party/) -------------
 # Wired as INTERFACE targets so the one-way layering (R1) can fence the heavy httplib to aero-api /
 # aero-cli only; nlohmann::json may be used more broadly (schema/core), never httplib.
@@ -314,11 +362,15 @@ add_library(aero::transport ALIAS aero-transport)
 # M5 (TLS+ACL milestone) adds aero-thirdparty-tls: native_broker.hpp's TLS listener (aero/pal/tls.hpp)
 # needs the real mbedTLS-backed implementation (AERO_TLS_ENABLED + the mbedtls libs), not the "not
 # compiled in" stub, whenever this library is actually linked into a binary.
+# M8 adds aero-thirdparty-rabbitmq: rabbitmq_bridge_sink.hpp's RabbitMqBridgeSink needs the real
+# rabbitmq-c-backed implementation (AERO_RABBITMQ_ENABLED + the rabbitmq-c static lib), not the "not
+# compiled in" stub, whenever this library is actually linked into a binary — same reasoning as the
+# TLS listener above.
 add_library(aero-broker INTERFACE)
 target_include_directories(aero-broker INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-broker INTERFACE
   aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json aero-thirdparty-tls
-  quark::quark Threads::Threads)
+  aero-thirdparty-rabbitmq quark::quark Threads::Threads)
 add_library(aero::broker ALIAS aero-broker)
 
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration
