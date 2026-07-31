@@ -70,10 +70,11 @@ struct Packet {
 // ===== MQTT 5 Properties (017 M7) =======================================================================
 // Bounded, skip-unknown property codec — the same tier as the byte helpers above (put_str/
 // put_remaining_length), shared by NativeBroker's v5 CONNECT/Will/PUBLISH/SUBSCRIBE parsing (017 N3
-// precedent: one codec, not a copy per caller). v1 deliberately surfaces exactly ONE property
-// (Session Expiry Interval) to callers — everything else in the type table below exists only so its
-// bytes can be correctly SKIPPED (a receiver must know a property's WIRE TYPE to know its length even
-// for a property it never acts on; guessing wrong silently corrupts every field that follows it).
+// precedent: one codec, not a copy per caller). v1 (M7) surfaced exactly ONE property (Session Expiry
+// Interval); M7.1 adds a second (Topic Alias, for inbound PUBLISH alias resolution) — everything else in
+// the type table below exists only so its bytes can be correctly SKIPPED (a receiver must know a
+// property's WIRE TYPE to know its length even for a property it never acts on; guessing wrong silently
+// corrupts every field that follows it).
 
 // Reads an MQTT Variable Byte Integer (§1.5.5) starting at `body[pos]`, advancing `pos` past it on
 // success. IDENTICAL encoding to the fixed header's Remaining Length (put_remaining_length above is the
@@ -133,11 +134,13 @@ inline std::optional<PropWireType> property_wire_type(std::uint32_t id) noexcept
     }
 }
 
-// The only property this codec's callers currently need out of a Properties block. Session Expiry TTL
-// enforcement is out of scope for v1 (017 M7.1, Open Questions) — this is parsed-and-surfaced, not acted
-// on; every other recognized property is recognized only so it can be skipped (never stored anywhere).
+// The properties this codec's callers currently need out of a Properties block: Session Expiry Interval
+// (017 M7.1 — TTL enforcement lives in NativeBroker, this codec just surfaces the parsed value) and Topic
+// Alias (017 M7.1 — inbound PUBLISH alias resolution, also NativeBroker-side). Every other recognized
+// property is recognized only so it can be skipped (never stored anywhere).
 struct ParsedProperties {
     std::optional<std::uint32_t> session_expiry_interval;
+    std::optional<std::uint16_t> topic_alias;
 };
 
 // Reads a Property Length varint, then walks exactly that many bytes as a sequence of
@@ -165,10 +168,17 @@ inline std::optional<ParsedProperties> read_properties(const std::vector<std::by
                 if (pos + 1 > end) return std::nullopt;
                 pos += 1;
                 break;
-            case PropWireType::TwoByteInt:
+            case PropWireType::TwoByteInt: {
                 if (pos + 2 > end) return std::nullopt;
+                if (*id == 0x23) {  // Topic Alias
+                    const std::uint16_t v = static_cast<std::uint16_t>(
+                        (std::to_integer<std::uint8_t>(body[pos]) << 8) |
+                        std::to_integer<std::uint8_t>(body[pos + 1]));
+                    result.topic_alias = v;
+                }
                 pos += 2;
                 break;
+            }
             case PropWireType::FourByteInt: {
                 if (pos + 4 > end) return std::nullopt;
                 if (*id == 0x11) {  // Session Expiry Interval
@@ -218,6 +228,15 @@ inline std::optional<ParsedProperties> read_properties(const std::vector<std::by
 // bare zero-length Property Length). A general properties WRITER isn't built because nothing calls for
 // one yet — do not add one speculatively.
 inline void put_empty_properties(std::vector<std::byte>& out) { put_remaining_length(out, 0); }
+
+// The one non-empty outbound property v1 needs: Topic Alias Maximum (0x22) in CONNACK, so a v5 client
+// knows the broker accepts inbound aliases (absent/0 => client MUST NOT send any, MQTT 5 §3.1.2.11.2).
+inline void put_topic_alias_max_properties(std::vector<std::byte>& out, std::uint16_t max) {
+    std::vector<std::byte> records{std::byte{0x22}};
+    put_u16_be(records, max);
+    put_remaining_length(out, static_cast<std::uint32_t>(records.size()));
+    out.insert(out.end(), records.begin(), records.end());
+}
 
 // Read exactly n bytes off `ch`: TRY `recv_some` first, and only poll `ch.fd()` (200ms timeout, so the
 // caller notices `running` flip to false promptly instead of blocking forever on a stalled peer) when
