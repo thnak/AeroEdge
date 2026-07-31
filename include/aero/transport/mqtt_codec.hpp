@@ -67,6 +67,158 @@ struct Packet {
     std::vector<std::byte> body;
 };
 
+// ===== MQTT 5 Properties (017 M7) =======================================================================
+// Bounded, skip-unknown property codec — the same tier as the byte helpers above (put_str/
+// put_remaining_length), shared by NativeBroker's v5 CONNECT/Will/PUBLISH/SUBSCRIBE parsing (017 N3
+// precedent: one codec, not a copy per caller). v1 deliberately surfaces exactly ONE property
+// (Session Expiry Interval) to callers — everything else in the type table below exists only so its
+// bytes can be correctly SKIPPED (a receiver must know a property's WIRE TYPE to know its length even
+// for a property it never acts on; guessing wrong silently corrupts every field that follows it).
+
+// Reads an MQTT Variable Byte Integer (§1.5.5) starting at `body[pos]`, advancing `pos` past it on
+// success. IDENTICAL encoding to the fixed header's Remaining Length (put_remaining_length above is the
+// write-side counterpart) — 1-4 bytes, 7 bits of value per byte, high bit = continuation. `nullopt` on a
+// malformed encoding (more than 4 continuation bytes) or running past `body.size()`.
+inline std::optional<std::uint32_t> read_varint(const std::vector<std::byte>& body, std::size_t& pos) {
+    std::uint32_t mult = 1, value = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (pos >= body.size()) return std::nullopt;
+        const std::uint8_t e = std::to_integer<std::uint8_t>(body[pos]);
+        ++pos;
+        value += static_cast<std::uint32_t>(e & 0x7F) * mult;
+        if ((e & 0x80) == 0) return value;
+        mult *= 128;
+    }
+    return std::nullopt;  // 5th continuation byte — malformed (spec caps this at 4 bytes)
+}
+
+// MQTT 5 property wire types (§2.2.2) — only the shapes actually needed to skip a property's value.
+enum class PropWireType : std::uint8_t {
+    Byte,
+    TwoByteInt,
+    FourByteInt,
+    VarInt,
+    Binary,
+    Utf8String,
+    Utf8StringPair,
+};
+
+// Property-ID -> wire-type lookup, covering every ID that can legally appear in the four packet-property
+// sets NativeBroker parses: CONNECT, CONNECT Will, PUBLISH, SUBSCRIBE (MQTT 5 §2.2.2, cross-checked
+// against §3.1.2.11/§3.1.3.2/§3.3.2.3/§3.8.2.1). An ID outside this table is one this codec has never
+// seen documented for these four packet types — read_properties() below treats that as unrecoverable
+// (it has no way to know how many bytes to skip) rather than guessing.
+inline std::optional<PropWireType> property_wire_type(std::uint32_t id) noexcept {
+    switch (id) {
+        case 0x01: return PropWireType::Byte;            // Payload Format Indicator (PUBLISH/Will)
+        case 0x02: return PropWireType::FourByteInt;      // Message Expiry Interval (PUBLISH/Will)
+        case 0x03: return PropWireType::Utf8String;       // Content Type (PUBLISH/Will)
+        case 0x08: return PropWireType::Utf8String;       // Response Topic (PUBLISH/Will)
+        case 0x09: return PropWireType::Binary;            // Correlation Data (PUBLISH/Will)
+        case 0x0B: return PropWireType::VarInt;             // Subscription Identifier (PUBLISH/SUBSCRIBE)
+        case 0x11: return PropWireType::FourByteInt;      // Session Expiry Interval (CONNECT) — the one
+                                                            // property this codec surfaces, see below
+        case 0x15: return PropWireType::Utf8String;       // Authentication Method (CONNECT)
+        case 0x16: return PropWireType::Binary;             // Authentication Data (CONNECT)
+        case 0x17: return PropWireType::Byte;             // Request Problem Information (CONNECT)
+        case 0x18: return PropWireType::FourByteInt;      // Will Delay Interval (Will)
+        case 0x19: return PropWireType::Byte;             // Request Response Information (CONNECT)
+        case 0x21: return PropWireType::TwoByteInt;       // Receive Maximum (CONNECT)
+        case 0x22: return PropWireType::TwoByteInt;       // Topic Alias Maximum (CONNECT)
+        case 0x23: return PropWireType::TwoByteInt;       // Topic Alias (PUBLISH)
+        case 0x26: return PropWireType::Utf8StringPair;   // User Property (CONNECT/Will/PUBLISH/SUBSCRIBE,
+                                                            // repeatable)
+        case 0x27: return PropWireType::FourByteInt;      // Maximum Packet Size (CONNECT)
+        default: return std::nullopt;
+    }
+}
+
+// The only property this codec's callers currently need out of a Properties block. Session Expiry TTL
+// enforcement is out of scope for v1 (017 M7.1, Open Questions) — this is parsed-and-surfaced, not acted
+// on; every other recognized property is recognized only so it can be skipped (never stored anywhere).
+struct ParsedProperties {
+    std::optional<std::uint32_t> session_expiry_interval;
+};
+
+// Reads a Property Length varint, then walks exactly that many bytes as a sequence of
+// `{property_id (varint), value}` TLV records, using property_wire_type() to know each value's length.
+// Stores session_expiry_interval when ID 0x11 appears; every other recognized ID is just skipped past.
+// `nullopt` on: a malformed Property Length varint, a truncated record, an ID not in the type table
+// above (this codec has no way to know its length, so it fails closed rather than guessing), or a
+// records total that doesn't exactly fill the declared Property Length. Advances `pos` to just past the
+// whole Properties block on success.
+inline std::optional<ParsedProperties> read_properties(const std::vector<std::byte>& body, std::size_t& pos) {
+    const auto prop_len = read_varint(body, pos);
+    if (!prop_len) return std::nullopt;
+    if (pos + *prop_len > body.size()) return std::nullopt;
+    const std::size_t end = pos + *prop_len;
+
+    ParsedProperties result;
+    while (pos < end) {
+        const auto id = read_varint(body, pos);
+        if (!id || pos > end) return std::nullopt;
+        const auto wire_type = property_wire_type(*id);
+        if (!wire_type) return std::nullopt;  // unrecognized ID — length unknown, fail closed
+
+        switch (*wire_type) {
+            case PropWireType::Byte:
+                if (pos + 1 > end) return std::nullopt;
+                pos += 1;
+                break;
+            case PropWireType::TwoByteInt:
+                if (pos + 2 > end) return std::nullopt;
+                pos += 2;
+                break;
+            case PropWireType::FourByteInt: {
+                if (pos + 4 > end) return std::nullopt;
+                if (*id == 0x11) {  // Session Expiry Interval
+                    std::uint32_t v = 0;
+                    for (std::size_t i = 0; i < 4; ++i)
+                        v = (v << 8) | std::to_integer<std::uint8_t>(body[pos + i]);
+                    result.session_expiry_interval = v;
+                }
+                pos += 4;
+                break;
+            }
+            case PropWireType::VarInt: {
+                const auto v = read_varint(body, pos);
+                if (!v || pos > end) return std::nullopt;
+                break;
+            }
+            case PropWireType::Binary:
+            case PropWireType::Utf8String: {
+                if (pos + 2 > end) return std::nullopt;
+                const std::uint16_t len = static_cast<std::uint16_t>(
+                    (std::to_integer<std::uint8_t>(body[pos]) << 8) | std::to_integer<std::uint8_t>(body[pos + 1]));
+                pos += 2;
+                if (pos + len > end) return std::nullopt;
+                pos += len;
+                break;
+            }
+            case PropWireType::Utf8StringPair: {
+                for (int k = 0; k < 2; ++k) {
+                    if (pos + 2 > end) return std::nullopt;
+                    const std::uint16_t len = static_cast<std::uint16_t>(
+                        (std::to_integer<std::uint8_t>(body[pos]) << 8) |
+                        std::to_integer<std::uint8_t>(body[pos + 1]));
+                    pos += 2;
+                    if (pos + len > end) return std::nullopt;
+                    pos += len;
+                }
+                break;
+            }
+        }
+    }
+    if (pos != end) return std::nullopt;  // records didn't exactly fill the declared Property Length
+    return result;
+}
+
+// The only properties-WRITING shape v1 needs: every v5 ack NativeBroker sends this milestone (CONNACK/
+// SUBACK) carries zero properties (3.4.2.1-style "Success and nothing to say" is legal to encode as a
+// bare zero-length Property Length). A general properties WRITER isn't built because nothing calls for
+// one yet — do not add one speculatively.
+inline void put_empty_properties(std::vector<std::byte>& out) { put_remaining_length(out, 0); }
+
 // Read exactly n bytes off `ch`: TRY `recv_some` first, and only poll `ch.fd()` (200ms timeout, so the
 // caller notices `running` flip to false promptly instead of blocking forever on a stalled peer) when
 // that attempt reports would_block. `Channel` is any type exposing

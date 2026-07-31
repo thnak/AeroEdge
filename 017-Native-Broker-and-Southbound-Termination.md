@@ -20,7 +20,7 @@
 | M4 | Studio dashboard page for the broker | **Shipped** |
 | M5 | TLS + per-topic ACL for the native MQTT broker | **Shipped** — southbound (device-facing) TLS + ACL; cluster-link TLS deferred, M5.1 |
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
-| M7 | MQTT 5 | Backlog |
+| M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties (Topic Alias, Shared Subs, Request/Response, Enhanced Auth) deferred, M7.1 |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | Backlog |
 | M9 | Multi-protocol southbound (OPC-UA/Modbus) — likely its own spec (018?) | Backlog |
 
@@ -194,7 +194,7 @@ principled exclusions the way v0.1 framed the whole breadth:
 | TLS | **shipped** | M5, `aero/pal/tls.hpp` (mbedTLS-backed `TlsServerContext`/`TlsSession`) — server-auth and optional mTLS (client-cert-required) southbound listener |
 | Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
-| MQTT 5 | backlog | M7 — 3.1.1 covers the device population seen so far |
+| MQTT 5 | **shipped**, protocol negotiation + properties parsing only | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; feature properties (Topic Alias, Shared Subs, Request/Response, Enhanced Auth) deferred, M7.1 |
 | Kafka/Pulsar/RabbitMQ bridges | backlog | M8 — needs new third-party deps, native-extension-shaped (008) |
 | Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
 | Shared subscriptions | not yet scheduled | no current AeroEdge/AeroMes use case; revisit on demand |
@@ -324,8 +324,34 @@ adapts to unilaterally. Concretely:
   jointly with AeroMes, not inferred from its current webhook alone.
 - **Retained-message durability** — whether a retained value survives a node restart (ties to
   007 State/Persistence) or is memory-only per session in v1.
-- **MQTT 5** (M7) — deferred until a real device/integration needs it; don't build ahead of
-  demand. (QoS 2 shipped in M1 — no longer open.)
+- **M7.1 — MQTT 5 feature properties.** M7 ships protocol negotiation (CONNECT protocol-level
+  0x04/0x05, reject-if-neither with a 3.1.1-shaped CONNACK) and Properties PARSING for every
+  packet type that carries them in this broker's supported set (CONNECT, CONNECT Will, PUBLISH,
+  SUBSCRIBE) via a bounded, skip-unknown codec (`mqtt_codec.hpp`'s `read_properties`), plus the
+  v5-shaped CONNACK/SUBACK reason codes (0x00/0x84/0x86 CONNACK; 0x87 SUBACK). What's deferred,
+  because none of it is acted on yet even though the bytes are correctly parsed-and-skipped or
+  not yet parsed at all:
+  - **Topic Alias** (compression) — parsed-and-discarded (0x23), never applied to shrink repeat
+    PUBLISHes.
+  - **Shared Subscriptions** (`$share/...`) — no special-cased SUBSCRIBE filter handling.
+  - **Request/Response pattern** — Response Topic (0x08) and Correlation Data (0x09) are parsed-
+    and-skipped, never actually round-tripped to a responder.
+  - **Enhanced/SASL Authentication** — the `0xF0` AUTH packet is not implemented; Authentication
+    Method/Data (0x15/0x16) are parsed-and-skipped on CONNECT.
+  - **User Properties end-to-end** — parsed-and-skipped everywhere; not surfaced through
+    `NativeBroker::on_publish()`'s callback (would change that public signature).
+  - **Message Expiry Interval / Maximum Packet Size enforcement** — parsed-and-skipped, no TTL or
+    size-limit behavior wired to either.
+  - **Session Expiry Interval TTL enforcement** — the ONE property this codec actually surfaces to
+    a caller (`ParsedProperties::session_expiry_interval`) is parsed and noted in `handle_connect`
+    but not acted on: a v5 session's persistent state still lives exactly as long as any v3.1.1
+    session's does today (in-memory, no independent TTL).
+  - **Server-initiated DISCONNECT with a reason code** — every existing reject path (protocol-
+    version mismatch, auth failure) still just closes the socket after its reject-ack, matching
+    the posture every prior milestone already used; a real v5 DISCONNECT-with-reason-code send
+    path doesn't exist yet.
+  Revisit any of these once a real device/integration actually needs it — same "don't build
+  ahead of demand" posture M7's own predecessor entry held, now narrowed to what's left.
 - **Shared secrets / device provisioning** — how a device gets its TLS identity/PSK in the
   first place (fleet-level concern, may tie to 011 OTA's existing device identity story).
 - **Southbound OPC-UA/Modbus termination** — this spec is MQTT-only; whether the same

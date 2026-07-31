@@ -279,6 +279,11 @@ private:
         std::string client_id;
         std::uint16_t keep_alive_s = 0;
         bool clean_session = true;
+        // M7: negotiated in handle_connect, set ONCE (never mutated again) and read afterward only by
+        // this SAME session's own reader thread (matches this struct's existing single-thread-owns-
+        // Session-state discipline, see this struct's banner) — 4 (MQTT 3.1.1) is the default so every
+        // function that doesn't branch on it yet keeps behaving exactly as before this milestone.
+        std::uint8_t protocol_version = 4;
         std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
         std::atomic<bool> kicked{false};  // superseded by a newer CONNECT under the same client-id (3.1.4)
 
@@ -461,7 +466,27 @@ private:
         if (pos + proto_len > b.size()) return false;
         pos += proto_len;  // protocol name ("MQTT"/"MQIsdp") — not validated, matches Phase 1's posture
         if (pos + 1 > b.size()) return false;
-        pos += 1;  // protocol level — not validated
+        const std::uint8_t protocol_level = std::to_integer<std::uint8_t>(b[pos]);
+        pos += 1;
+
+        // M7: protocol version negotiation — the FIRST thing this function does that can reject the
+        // CONNECT, deliberately earlier than the M5 auth-gate below (nothing that mutates session state
+        // has been parsed yet at this point, so there is nothing to be careful about undoing). 0x04 =
+        // MQTT 3.1.1 (existing path, byte-for-byte unchanged below); 0x05 = MQTT 5 (new path, gated by
+        // `is_v5`/`s->protocol_version` throughout this file). Anything else: reject with the 3.1.1-shaped
+        // 2-byte CONNACK body (rc=0x01, "unacceptable protocol version", 3.1.1 §3.2.2.3) regardless of
+        // what the client might have claimed — we can't trust a v5-shaped ack for a version we don't
+        // recognize, and this 2-byte shape is legal for a rejecting server to send either way.
+        if (protocol_level != 0x04 && protocol_level != 0x05) {
+            (void)s->send_packet(std::byte{0x20}, {std::byte{0x00}, std::byte{0x01}});
+            return false;
+        }
+        const bool is_v5 = protocol_level == 0x05;
+        s->protocol_version = is_v5 ? 5 : 4;  // set once here, read-only from here on (see Session's field
+                                               // comment) — a rejected CONNECT still gets to report the
+                                               // wire-level version it negotiated in its reject CONNACK's
+                                               // shape below, which is not part of the "zero trace" the M5
+                                               // auth gate protects (client_id/has_will/session tables).
 
         if (pos + 1 > b.size()) return false;
         const std::uint8_t connect_flags = std::to_integer<std::uint8_t>(b[pos]);
@@ -469,6 +494,19 @@ private:
         if (pos + 2 > b.size()) return false;
         const std::uint16_t keep_alive = read_u16(pos);
         pos += 2;
+
+        // M7 v5: CONNECT Properties sit here in the wire order (Protocol Name -> Level -> Flags ->
+        // Keep Alive -> Properties -> Client Identifier, MQTT 5 §3.1.2) — a new insertion point relative
+        // to 3.1.1's Keep-Alive-straight-to-Client-ID order. Session Expiry Interval is parsed and kept
+        // (below) but its TTL is not enforced (017 M7.1, Open Questions); every other property in the
+        // table is recognized only so read_properties() can correctly skip past it.
+        std::optional<std::uint32_t> connect_session_expiry;
+        if (is_v5) {
+            auto props = aero::transport::mqtt::read_properties(b, pos);
+            if (!props) return false;  // malformed CONNECT properties
+            connect_session_expiry = props->session_expiry_interval;
+        }
+        (void)connect_session_expiry;  // parsed, not acted on in v1 (see comment above)
 
         if (pos + 2 > b.size()) return false;
         const std::uint16_t client_id_len = read_u16(pos);
@@ -487,6 +525,14 @@ private:
         std::string will_topic;
         std::vector<std::byte> will_payload;
         if (will_flag) {
+            // M7 v5: a SEPARATE Will Properties block, positioned immediately before Will Topic (MQTT 5
+            // §3.1.3.2) — distinct from the CONNECT-level Properties block already consumed above.
+            // Discarded (none of Will Delay Interval/Payload Format/etc. are acted on in v1); malformed
+            // -> treated exactly like any other malformed CONNECT field.
+            if (is_v5) {
+                auto will_props = aero::transport::mqtt::read_properties(b, pos);
+                if (!will_props) return false;
+            }
             if (pos + 2 > b.size()) return false;
             const std::uint16_t wt_len = read_u16(pos);
             pos += 2;
@@ -530,12 +576,18 @@ private:
         if (cfg_.authenticate) {
             auto principal = cfg_.authenticate(username, password);
             if (!principal) {
-                // 3.2.2.3: CONNACK body is {session_present_byte, return_code_byte}; rc=0x04 = "bad
-                // username or password". session_present is always 0 here — nothing was ever restored.
-                // Best-effort send (write failure doesn't change the outcome: the connection closes
-                // either way) then close, WITHOUT touching client_id/has_will/client_sessions_/
-                // stored_sessions_ — s->client_id etc. are still their pre-CONNECT defaults.
-                (void)s->send_packet(std::byte{0x20}, {std::byte{0x00}, std::byte{0x04}});
+                // 3.2.2.3 (v4) / 3.2.2.2 (v5): reject with the version-appropriate CONNACK shape.
+                // session_present/ack_flags is always 0 here — nothing was ever restored. Best-effort send
+                // (write failure doesn't change the outcome: the connection closes either way) then close,
+                // WITHOUT touching client_id/has_will/client_sessions_/stored_sessions_ — s->client_id etc.
+                // are still their pre-CONNECT defaults.
+                if (is_v5) {
+                    std::vector<std::byte> body{std::byte{0x00}, std::byte{0x86}};  // Bad User Name or Password
+                    aero::transport::mqtt::put_empty_properties(body);
+                    (void)s->send_packet(std::byte{0x20}, body);
+                } else {
+                    (void)s->send_packet(std::byte{0x20}, {std::byte{0x00}, std::byte{0x04}});
+                }
                 return false;
             }
             s->principal = std::move(*principal);
@@ -587,7 +639,12 @@ private:
             s->subs = std::move(restored_subs);
         }
 
-        std::vector<std::byte> body{static_cast<std::byte>(session_present ? 0x01 : 0x00), std::byte{0x00}};  // rc=0
+        // v4 (unchanged): {session_present_byte, rc_byte}, rc=0. v5: {ack_flags_byte, reason_code_byte}
+        // followed by an (empty, v1) Properties block — same session-present bit, bit 0, MQTT 5 §3.2.2.1.1
+        // — then reason code 0x00 Success (verified against the spec: CONNACK's v5 variable header is
+        // Ack Flags, Reason Code, Properties, in that order).
+        std::vector<std::byte> body{static_cast<std::byte>(session_present ? 0x01 : 0x00), std::byte{0x00}};
+        if (is_v5) aero::transport::mqtt::put_empty_properties(body);
         if (!s->send_packet(std::byte{0x20}, body)) return false;  // CONNACK
 
         // Flush anything that arrived while this persistent session was offline — AFTER CONNACK, per
@@ -603,6 +660,16 @@ private:
         const std::uint16_t packet_id =
             (std::to_integer<std::uint8_t>(b[0]) << 8) | std::to_integer<std::uint8_t>(b[1]);
         std::size_t pos = 2;
+
+        // M7 v5: SUBSCRIBE Properties (MQTT 5 §3.8.2.1) sit here, before the per-filter payload loop.
+        // Discarded — Subscription Identifier/User Property aren't acted on in v1 — but must still be
+        // walked past correctly or the filter loop below would misparse the first filter's length as
+        // properties bytes. Malformed -> treated like any other malformed SUBSCRIBE (return false).
+        if (s.protocol_version == 5) {
+            auto props = aero::transport::mqtt::read_properties(b, pos);
+            if (!props) return false;
+        }
+
         std::vector<Subscription> added;
         std::vector<std::byte> granted;  // SUBACK return codes, one per filter, in order
         while (pos + 2 <= b.size()) {
@@ -626,7 +693,9 @@ private:
                 added.push_back(Subscription{filter, qos});
                 granted.push_back(static_cast<std::byte>(qos));
             } else {
-                granted.push_back(std::byte{0x80});  // SUBACK failure (3.9.3)
+                // 3.9.3 (v4): 0x80 SUBACK failure. MQTT 5 §3.9.3: 0x87 Not Authorized is the v5-specific
+                // reason code for the same denial — v4 sessions keep 0x80 unchanged.
+                granted.push_back(s.protocol_version == 5 ? std::byte{0x87} : std::byte{0x80});
             }
         }
         {
@@ -634,8 +703,12 @@ private:
             std::lock_guard<std::mutex> g(s.subs_mu);
             for (const Subscription& sub : added) s.subs.push_back(sub);
         }
+        // SUBACK variable header (MQTT 5 §3.9.2): Packet Identifier, then Properties, THEN the payload's
+        // reason-code list — verified against the spec rather than assumed (Properties precede the
+        // reason codes, mirroring PUBACK/PUBREC's own Packet-Id-then-Properties shape elsewhere in v5).
         std::vector<std::byte> vh;
         aero::transport::mqtt::put_u16_be(vh, packet_id);
+        if (s.protocol_version == 5) aero::transport::mqtt::put_empty_properties(vh);
         vh.insert(vh.end(), granted.begin(), granted.end());
         if (!s.send_packet(std::byte{0x90}, vh)) return false;  // SUBACK
 
@@ -668,6 +741,17 @@ private:
             if (pos + 2 > b.size()) return false;
             packet_id = (std::to_integer<std::uint8_t>(b[pos]) << 8) | std::to_integer<std::uint8_t>(b[pos + 1]);
             pos += 2;
+        }
+
+        // M7 v5: PUBLISH Properties (MQTT 5 §3.3.2.3) sit here — after Packet Identifier for QoS>0, or
+        // directly after Topic Name for QoS 0 (there is no packet id to parse first) — and BEFORE the
+        // payload. Discarded (Topic Alias/Response Topic/etc. aren't acted on in v1: the single biggest
+        // deliberate scope cut in this milestone), but `pos` MUST land exactly past them before the
+        // payload slice below runs, or the properties bytes would leak into (or truncate) the delivered
+        // payload. Malformed -> treated like any other malformed PUBLISH (return false).
+        if (s.protocol_version == 5) {
+            auto props = aero::transport::mqtt::read_properties(b, pos);
+            if (!props) return false;
         }
 
         std::vector<std::byte> payload(b.begin() + static_cast<std::ptrdiff_t>(pos), b.end());
