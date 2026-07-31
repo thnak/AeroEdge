@@ -29,14 +29,15 @@
 // confirming read_properties both surfaces the session-expiry value AND advances `pos` exactly past
 // everything, including the User Properties it deliberately does not store.
 //
-// NOTE on outbound PUBLISH framing: this milestone's PUBLISH scope cut is INBOUND parsing only
-// (handle_publish reads and discards a v5 publisher's Properties block) — the broker's existing
-// publish_to() (broker -> subscriber) is untouched by M7 and keeps its pre-M7 wire shape (Topic,
-// [Packet Id], Payload, no Properties field) for every subscriber regardless of protocol version. So
-// V5TestClient::wait_publish() below deliberately parses inbound PUBLISHes the same way the v4
-// TestClient in native_broker.cpp already does — this is not an oversight, it matches the brief's
-// actual in-scope task list (protocol negotiation + CONNECT/Will/PUBLISH/SUBSCRIBE properties PARSING,
-// not a general properties WRITER for every outbound packet).
+// NOTE on outbound PUBLISH framing (M7/M7.1 — SUPERSEDED by 017 M7.2 PR A, see below): through M7.1 the
+// PUBLISH scope cut was INBOUND parsing only (handle_publish reads and discards a v5 publisher's
+// Properties block) — the broker's publish_to() (broker -> subscriber) was untouched and kept its pre-M7
+// wire shape (Topic, [Packet Id], Payload, no Properties field at all) for every subscriber regardless of
+// protocol version — this was actually a latent §3.3.1 bug for v5 (an empty Properties field is mandatory,
+// not just "nothing to say"). 017 M7.2 PR A fixes this: publish_to() now writes a real v5 Properties block
+// (empty when no extras are active, non-empty when e.g. Message Expiry applies). V5TestClient::wait_publish()
+// below is updated accordingly (see its own comment) — this is the single highest regression risk in the
+// M7.2 PR A change, per that function's comment.
 //
 // M7.1 (017 Open Questions follow-on) adds three more feature properties on top of M7's negotiation +
 // parsing groundwork, tested below in a dedicated section:
@@ -50,6 +51,13 @@
 //     (test_disconnect_reason_keep_alive_timeout_v4_no_regression);
 //   - inbound Topic Alias resolution (test_topic_alias_inbound): establishing + reusing a client-side
 //     alias, plus the two invalid-alias DISCONNECT/0x94 paths (unknown alias, alias value 0).
+//
+// 017 M7.2 PR A (outbound Properties infra + Message Expiry Interval + Maximum Packet Size) is tested in
+// its own "M7.2 (PR A)" section below: the publish_to() v5-Properties fix itself (folded into every
+// existing v5 wait_publish() call surviving unmodified — see that function's comment), Message Expiry
+// Interval delivered-when-fresh / dropped-when-stale, Maximum Packet Size enforcement, and Will Message
+// Expiry honored. Response Topic, Correlation Data, and User Properties are explicitly OUT of scope for
+// this PR (see native_broker.hpp's PublishExtras banner) — not tested here, deferred to a future PR B.
 // Deterministic, exit-code-gated (0 = pass); bounded polling; clean shutdown.
 #include <atomic>
 #include <chrono>
@@ -117,11 +125,21 @@ class V5TestClient {
 public:
     ~V5TestClient() { close(); }
 
+    // M7.2 PR A: gained the trailing has_will/will_*/will_props_records knobs (mirrors native_broker.cpp's
+    // ConnectOptions pattern for the same need) so test_will_message_expiry_honored below can exercise a
+    // v5 Will carrying its own Message Expiry Interval — nothing in the pre-existing M7/M7.1 tests passes
+    // these, so they're all unaffected (has_will defaults false, exactly the old no-Will CONNECT shape).
     [[nodiscard]] RawAck connect_raw(std::uint16_t port, const std::string& client_id,
                                       std::uint8_t protocol_level,
                                       const std::vector<std::byte>& connect_props_records = {},
-                                      bool clean_session = true, std::uint16_t keep_alive_s = 60) {
+                                      bool clean_session = true, std::uint16_t keep_alive_s = 60,
+                                      bool has_will = false, const std::string& will_topic = "",
+                                      const std::string& will_message = "", std::uint8_t will_qos = 0,
+                                      bool will_retain = false,
+                                      const std::vector<std::byte>& will_props_records = {}) {
         RawAck result;
+        protocol_level_ = protocol_level;  // remembered so wait_publish() knows whether to expect a v5
+                                            // Properties block on inbound PUBLISH (see its own comment)
         auto fd = quark::pal::tcp_connect(quark::pal::ipv4_loopback, port);
         if (!fd) return result;
         fd_ = *fd;
@@ -134,6 +152,11 @@ public:
 
         std::uint8_t flags = 0;
         if (clean_session) flags |= 0x02;
+        if (has_will) {
+            flags |= 0x04;
+            flags |= static_cast<std::uint8_t>((will_qos & 0x03) << 3);
+            if (will_retain) flags |= 0x20;
+        }
         std::vector<std::byte> vh;
         mqtt::put_str(vh, "MQTT");
         vh.push_back(static_cast<std::byte>(protocol_level));
@@ -141,6 +164,13 @@ public:
         mqtt::put_u16_be(vh, keep_alive_s);
         if (protocol_level == 0x05) put_properties(vh, connect_props_records);
         mqtt::put_str(vh, client_id);
+        if (has_will) {
+            // Will Properties (MQTT 5 §3.1.3.2) sit immediately before Will Topic/Will Message — same
+            // wire order handle_connect() parses (native_broker.hpp).
+            if (protocol_level == 0x05) put_properties(vh, will_props_records);
+            mqtt::put_str(vh, will_topic);
+            mqtt::put_str(vh, will_message);
+        }
         if (!mqtt::write_packet(fd_, std::byte{0x10}, vh)) return result;
 
         auto ack = wait_for(0x20, 2000);
@@ -183,10 +213,31 @@ public:
         return qos == 0 || wait_for(0x40, 2000).has_value();
     }
 
-    // See this file's banner: the broker's outbound PUBLISH framing is untouched by M7 (no Properties
-    // field for any subscriber, v4 or v5) — this parses the SAME shape native_broker.cpp's TestClient
-    // does, deliberately.
+    // MANDATORY M7.2 PR A fix (see this file's banner — the single highest regression risk in that PR):
+    // through M7.1 the broker's outbound PUBLISH framing never carried a v5 Properties block at all (a
+    // latent §3.3.1 bug PR A fixes), so this used to parse the SAME shape as v4 unconditionally. Now that
+    // publish_to() writes a real (possibly-empty) Properties block for v5 sessions, this MUST skip it via
+    // mqtt::read_properties() before slicing the payload, or every v5 test's payload would be misparsed —
+    // starting with the leading Property Length byte(s) becoming part of a "payload" that no longer
+    // matches what was sent. v4 sessions are completely unaffected (protocol_level_ stays 0x04, no
+    // Properties block was ever written for them, none is skipped here either — byte-for-byte unchanged).
     [[nodiscard]] std::optional<std::pair<std::string, std::string>> wait_publish(int timeout_ms = 1500) {
+        auto got = wait_publish_v5_extras(timeout_ms);
+        if (!got) return std::nullopt;
+        return std::make_pair(std::move(got->topic), std::move(got->payload));
+    }
+
+    // A received PUBLISH's topic/payload PLUS its decoded v5 Properties (message_expiry_interval, in
+    // particular) — for tests that need to assert on the properties themselves (017 M7.2 PR A's Message
+    // Expiry tests: "delivered with remaining, not original, TTL"), not just the payload. For a v4
+    // session, `props` is always a default-constructed (all-nullopt/empty) ParsedProperties — there is no
+    // Properties block to decode.
+    struct ReceivedPublish {
+        std::string topic;
+        std::string payload;
+        mqtt::ParsedProperties props;
+    };
+    [[nodiscard]] std::optional<ReceivedPublish> wait_publish_v5_extras(int timeout_ms = 1500) {
         auto pkt = wait_for(0x30, timeout_ms);
         if (!pkt) return std::nullopt;
         const std::vector<std::byte>& b = pkt->body;
@@ -206,8 +257,19 @@ public:
             mqtt::put_u16_be(ackv, pid);
             (void)mqtt::write_packet(fd_, std::byte{0x40}, ackv);
         }
+        mqtt::ParsedProperties props;
+        if (protocol_level_ == 0x05) {
+            auto parsed = mqtt::read_properties(b, pos);
+            if (!parsed) return std::nullopt;  // malformed Properties block — broker bug, fail the test
+            props = std::move(*parsed);
+        }
+        if (pos > b.size()) return std::nullopt;
         std::string payload(reinterpret_cast<const char*>(b.data() + pos), b.size() - pos);
-        return std::make_pair(std::move(topic), std::move(payload));
+        ReceivedPublish result;
+        result.topic = std::move(topic);
+        result.payload = std::move(payload);
+        result.props = std::move(props);
+        return result;
     }
 
     // M7.1: an explicit, well-formed client->server DISCONNECT (0xE0, zero-length body — MQTT 5 §3.14.1
@@ -276,16 +338,18 @@ private:
     std::mutex mu_;
     std::vector<mqtt::Packet> inbox_;
     std::uint16_t packet_id_ = 0;
+    std::uint8_t protocol_level_ = 0x04;  // set in connect_raw — see wait_publish()'s comment
 };
 
 // ===== unit coverage: the Properties codec itself, no socket involved ==================================
 // Round-trips a CONNECT-shaped properties block: Session Expiry Interval (0x11) + two User Properties
-// (0x26, repeatable) + Topic Alias (0x23, M7.1) — proves read_properties surfaces BOTH values this codec
-// stores AND advances `pos` exactly past every record, including the ones it doesn't store. A two-byte
-// sentinel appended after the properties block confirms `pos` lands exactly at the boundary, not short
-// or long. (Topic Alias doesn't legally co-occur with Session Expiry Interval in a real CONNECT — it's a
-// PUBLISH-only property — but read_properties() itself is packet-type-agnostic, so this is a fair
-// same-codepath test of the codec in isolation.)
+// (0x26, repeatable) + Topic Alias (0x23, M7.1) + Message Expiry Interval (0x02, M7.2 PR A) + Maximum
+// Packet Size (0x27, M7.2 PR A) — proves read_properties surfaces every value this codec stores AND
+// advances `pos` exactly past every record, including the ones it doesn't store. A two-byte sentinel
+// appended after the properties block confirms `pos` lands exactly at the boundary, not short or long.
+// (Topic Alias/Message Expiry don't legally co-occur with Session Expiry Interval/Maximum Packet Size in
+// a real CONNECT — the former pair are PUBLISH-only — but read_properties() itself is packet-type-
+// agnostic, so this is a fair same-codepath test of the codec in isolation.)
 bool test_properties_codec() {
     bool ok = true;
     std::vector<std::byte> records;
@@ -293,6 +357,8 @@ bool test_properties_codec() {
     put_prop_str_pair(records, 0x26, "k1", "v1");           // User Property #1
     put_prop_str_pair(records, 0x26, "k2", "v2");           // User Property #2
     put_prop_u16(records, 0x23, 42);                        // Topic Alias (M7.1)
+    put_prop_u32(records, 0x02, 30);                        // Message Expiry Interval (M7.2 PR A)
+    put_prop_u32(records, 0x27, 65536);                     // Maximum Packet Size (M7.2 PR A)
 
     std::vector<std::byte> body;
     mqtt::put_remaining_length(body, static_cast<std::uint32_t>(records.size()));
@@ -306,6 +372,10 @@ bool test_properties_codec() {
     ok &= parsed.has_value() && parsed->session_expiry_interval.has_value() &&
           *parsed->session_expiry_interval == 3600u;
     ok &= parsed.has_value() && parsed->topic_alias.has_value() && *parsed->topic_alias == 42u;
+    ok &= parsed.has_value() && parsed->message_expiry_interval.has_value() &&
+          *parsed->message_expiry_interval == 30u;
+    ok &= parsed.has_value() && parsed->maximum_packet_size.has_value() &&
+          *parsed->maximum_packet_size == 65536u;
     ok &= pos == body.size() - 2;  // stopped exactly at the sentinel, not before or past it
     ok &= pos < body.size() && std::to_integer<std::uint8_t>(body[pos]) == 0xAB;
 
@@ -619,10 +689,11 @@ bool test_disconnect_reason_session_taken_over() {
 // (M7.1-6) Inbound Topic Alias (MQTT 5 §3.3.2.3.4): a v5 publisher establishes Topic Alias 5 on
 // "sensor/x" via a normal PUBLISH (topic name + alias together), then a SECOND PUBLISH with an EMPTY
 // topic name and only the alias resolves to the SAME topic — a subscriber sees both deliveries with the
-// correctly resolved topic (outbound PUBLISH framing is untouched by this milestone, see this file's
-// banner, so V5TestClient::wait_publish() needs no changes). A fresh connection that never established
-// an alias (or sends alias value 0, which is always invalid) gets 0xE0/0x94 DISCONNECT and nothing is
-// ever delivered.
+// correctly resolved topic (this test carries no Message Expiry, so it exercises publish_to()'s M7.2 PR A
+// Properties-writing path with an empty properties block — a fair unmodified-assertion regression check
+// for the wait_publish() fix, see this file's banner). A fresh connection that never established an alias
+// (or sends alias value 0, which is always invalid) gets 0xE0/0x94 DISCONNECT and nothing is ever
+// delivered.
 bool test_topic_alias_inbound() {
     bool ok = true;
     NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
@@ -689,6 +760,166 @@ bool test_topic_alias_inbound() {
     return ok;
 }
 
+// ===== 017 M7.2 PR A coverage: outbound Properties infra (publish_to() now writes a real v5 Properties
+//       block — fixing the previously-latent §3.3.1 "at least an empty Properties field" bug, see this
+//       file's banner), Message Expiry Interval TTL enforcement, and Maximum Packet Size enforcement.
+//       Response Topic/Correlation Data/User Properties are explicitly OUT of scope — see
+//       native_broker.hpp's PublishExtras banner — and are not exercised here. ========================
+
+// (M7.2-1) A retained PUBLISH with Message Expiry Interval=5s, replayed to a SUBSCRIBE that arrives
+// shortly afterward (not stale), is delivered with a REMAINING (not original) Message Expiry — proves
+// publish_to()'s choke point 1 recomputes time-to-live at send time rather than re-encoding the original
+// interval verbatim (Design §2's `remaining, not original` requirement).
+bool test_message_expiry_delivered_when_fresh() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "m72-fresh-pub", 0x05).ok;
+    std::vector<std::byte> pub_props;
+    put_prop_u32(pub_props, 0x02, 5);  // Message Expiry Interval = 5s
+    ok &= pub.publish_v5("m72/fresh", "still-fresh", /*qos=*/1, /*retain=*/true, /*is_v5=*/true, pub_props);
+    pub.close();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));  // let >1s of the 5s TTL elapse
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "m72-fresh-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72/fresh", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    auto got = sub.wait_publish_v5_extras();
+    ok &= got.has_value() && got->topic == "m72/fresh" && got->payload == "still-fresh";
+    ok &= got.has_value() && got->props.message_expiry_interval.has_value() &&
+          *got->props.message_expiry_interval < 5u;  // remaining, not the original 5
+
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.2-2) A retained PUBLISH with Message Expiry Interval=1s, replayed to a SUBSCRIBE that arrives AFTER
+// that 1s has already elapsed, is silently dropped by publish_to()'s choke point 1 — nothing is ever
+// delivered, not even a stale copy.
+bool test_message_expiry_dropped_when_stale() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "m72-stale-pub", 0x05).ok;
+    std::vector<std::byte> pub_props;
+    put_prop_u32(pub_props, 0x02, 1);  // Message Expiry Interval = 1s
+    ok &= pub.publish_v5("m72/stale", "should-not-arrive", /*qos=*/1, /*retain=*/true, /*is_v5=*/true,
+                         pub_props);
+    pub.close();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // > the 1s TTL
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "m72-stale-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72/stale", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    auto got = sub.wait_publish(500);
+    ok &= !got.has_value();  // retained replay dropped the stale message — timeout is the correct outcome
+
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.2-3) A subscriber CONNECTs with Maximum Packet Size (0x27) set to a small, precisely-computed byte
+// budget; a PUBLISH whose serialized wire size would exceed it is dropped (choke point 2 in publish_to()),
+// while one that fits exactly at the cap is delivered.
+//
+// Byte budget derivation for topic "m72/max" (7 chars), QoS 0 (no packet id), v5 (empty Properties block
+// when no extras are active — the M7.2 PR A fix — costs exactly 1 byte: a zero Property Length varint):
+//   variable header = topic (2-byte length prefix + 7) + properties (1, empty) + payload
+//                   = 9 + 1 + payload_len = 10 + payload_len
+//   wire packet      = fixed-header byte (1) + remaining-length varint (1, since vh stays < 128 bytes)
+//                       + variable header
+//                   = 2 + (10 + payload_len) = 12 + payload_len
+// Budget = 20 => an 8-byte payload totals exactly 20 (fits, delivered); a 9-byte payload totals 21
+// (exceeds, dropped).
+bool test_max_packet_size_enforced() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    std::vector<std::byte> sub_connect_props;
+    put_prop_u32(sub_connect_props, 0x27, 20);  // Maximum Packet Size = 20 bytes, see comment above
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "m72-cap-sub", /*protocol_level=*/0x05, sub_connect_props).ok;
+    auto suback = sub.subscribe_v5("m72/max", /*qos=*/0, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "m72-cap-pub", 0x05).ok;
+
+    // Exceeds the cap by 1 byte (total 21 > 20) — must be dropped, not delivered.
+    ok &= pub.publish_v5("m72/max", "123456789", /*qos=*/0, /*retain=*/false, /*is_v5=*/true);
+    auto too_big = sub.wait_publish(500);
+    ok &= !too_big.has_value();
+
+    // Fits exactly at the cap (total 20 == 20) — must be delivered.
+    ok &= pub.publish_v5("m72/max", "12345678", /*qos=*/0, /*retain=*/false, /*is_v5=*/true);
+    auto fits = sub.wait_publish();
+    ok &= fits.has_value() && fits->first == "m72/max" && fits->second == "12345678";
+
+    pub.close();
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.2-4) A v5 client's retained Will carries Message Expiry Interval=1s (Design §2's Will-extras wiring
+// — Session::will_extras, populated in handle_connect from the Will Properties block, consulted by
+// teardown_session's Will-delivery call). After an abrupt disconnect fires the Will (stored retained,
+// since will_retain=true), waiting past that 1s and THEN subscribing must NOT deliver the now-stale Will
+// PUBLISH — proves the Will path shares deliver_publish()'s Message Expiry choke point exactly like a
+// regular PUBLISH, not a silently-dropped feature (leaving will_extras always-empty, as it was before this
+// PR, would make this test fail: the Will would be replayed as if it never expires).
+bool test_will_message_expiry_honored() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    std::vector<std::byte> will_props;
+    put_prop_u32(will_props, 0x02, 1);  // Will's Message Expiry Interval = 1s
+
+    {
+        V5TestClient dying;
+        auto ack = dying.connect_raw(port, "m72-will-dying", /*protocol_level=*/0x05,
+                                     /*connect_props_records=*/{}, /*clean_session=*/true,
+                                     /*keep_alive_s=*/60, /*has_will=*/true, /*will_topic=*/"m72/will",
+                                     /*will_message=*/"should-be-stale", /*will_qos=*/1,
+                                     /*will_retain=*/true, will_props);
+        ok &= ack.ok;
+        dying.close();  // no DISCONNECT sent — abrupt end, fires the Will (3.1.2.5), stored retained
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // > the Will's 1s Message Expiry
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "m72-will-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72/will", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    auto got = sub.wait_publish(500);
+    ok &= !got.has_value();  // the stale retained Will is dropped by publish_to()'s choke point, not replayed
+
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -710,6 +941,10 @@ int main() {
          test_disconnect_reason_keep_alive_timeout_v4_no_regression},
         {"test_disconnect_reason_session_taken_over", test_disconnect_reason_session_taken_over},
         {"test_topic_alias_inbound", test_topic_alias_inbound},
+        {"test_message_expiry_delivered_when_fresh", test_message_expiry_delivered_when_fresh},
+        {"test_message_expiry_dropped_when_stale", test_message_expiry_dropped_when_stale},
+        {"test_max_packet_size_enforced", test_max_packet_size_enforced},
+        {"test_will_message_expiry_honored", test_will_message_expiry_honored},
     };
     bool ok = true;
     for (const auto& t : tests) {

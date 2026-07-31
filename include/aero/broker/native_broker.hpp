@@ -60,6 +60,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -233,6 +234,18 @@ private:
         std::uint8_t qos = 0;  // granted QoS (v1: min(requested, 1))
     };
 
+    // 017 M7.2 PR A: carries the subset of MQTT 5 PUBLISH properties this broker acts on end-to-end, from
+    // ingestion (handle_publish/Will-parse) through to the outbound wire (publish_to). This PR populates
+    // only expiry_deadline; response_topic/correlation_data/user_properties are always empty until a
+    // future PR B — shaped now so that PR doesn't need a second pass touching every call site below.
+    struct PublishExtras {
+        std::optional<std::chrono::steady_clock::time_point> expiry_deadline;  // absolute deadline,
+            // computed ONCE at ingestion time — never re-derived from a re-sent "original interval".
+        std::optional<std::string> response_topic;                // future PR B
+        std::optional<std::vector<std::byte>> correlation_data;    // future PR B
+        std::vector<std::pair<std::string, std::string>> user_properties;  // future PR B
+    };
+
     // A PUBLISH(QoS 2) that has been PUBREC'd but not yet PUBREL'd — 4.3.3's whole point is that the
     // message is NOT acted on (retained/routed/ingested) until PUBREL confirms, so we have to hold onto
     // it somewhere in the meantime. Session-scoped (packet ids are only unique per connection).
@@ -240,6 +253,9 @@ private:
         std::string topic;
         std::vector<std::byte> payload;
         bool retain = false;
+        PublishExtras extras;  // 017 M7.2 PR A: stashed at PUBLISH time, threaded through unchanged to
+                                // handle_pubrel's deliver_publish() — a QoS2 message's Message Expiry must
+                                // not silently reset to "never expires" between PUBLISH and PUBREL.
     };
 
     // One Session per accepted connection. io_mu_ serializes every write to `channel` — a PUBLISH fanned
@@ -289,6 +305,12 @@ private:
         // sessions never populate this, and neither does a v5 session that omitted the property) — treated
         // identically to "never expires" by teardown_session, so the pre-M7.1 default behavior is unchanged.
         std::optional<std::uint32_t> session_expiry_interval;
+        // M7.2 PR A: negotiated (v5 only) in handle_connect from CONNECT's Maximum Packet Size property
+        // (0x27), set ONCE (never mutated again) — same single-thread-owned/set-once discipline as
+        // session_expiry_interval above. nullopt means "no cap advertised" (v4 sessions, and v5 sessions
+        // that omitted the property) — publish_to()'s size choke point is a no-op in that case, so pre-
+        // M7.2 behavior (no outbound size cap at all) is unchanged.
+        std::optional<std::uint32_t> max_packet_size;
         std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
         std::atomic<bool> kicked{false};  // superseded by a newer CONNECT under the same client-id (3.1.4)
 
@@ -297,6 +319,12 @@ private:
         std::vector<std::byte> will_payload;
         std::uint8_t will_qos = 0;
         bool will_retain = false;
+        // M7.2 PR A: the Will's own PublishExtras (Message Expiry, if the Will Properties block carried
+        // one) — populated in handle_connect alongside will_topic/will_payload/etc., consulted in
+        // teardown_session's Will-delivery call. See deliver_publish's banner: Will/regular PUBLISH share
+        // one delivery path so retention/ingestion/routing can never drift between them; leaving this
+        // always-empty would quietly violate that for Message Expiry specifically.
+        PublishExtras will_extras;
 
         std::string principal = "anonymous";  // M5: set from Config::authenticate's return, else default
 
@@ -319,6 +347,17 @@ private:
         std::string topic;
         std::vector<std::byte> payload;
         std::uint8_t qos = 0;
+        PublishExtras extras;  // 017 M7.2 PR A: carried through so an offline-queued message's Message
+                                // Expiry is still honored (checked in publish_to()) when it's finally
+                                // flushed to a reconnecting client.
+    };
+
+    // 017 M7.2 PR A: the retained-message table's value type — was a bare `std::vector<std::byte>`
+    // payload; now carries that PUBLISH's extras too (Message Expiry, specifically) so a retained message
+    // replayed to a future SUBSCRIBE still honors its original TTL instead of being treated as eternal.
+    struct RetainedMessage {
+        std::vector<std::byte> payload;
+        PublishExtras extras;
     };
 
     // A clean_session=0 client's state while it is OFFLINE: its subscription list (so it doesn't have to
@@ -451,7 +490,7 @@ private:
         // Will (3.1.2.5 / 3.14): fires on every ungraceful end (socket error, peer reset, keep-alive
         // expiry, session takeover) — `clean_disconnect` is the ONLY case that already cleared has_will.
         if (!clean_disconnect && s->has_will)
-            deliver_publish(s->will_topic, s->will_payload, s->will_qos, s->will_retain);
+            deliver_publish(s->will_topic, s->will_payload, s->will_qos, s->will_retain, s->will_extras);
 
         // Persistent-session handoff (3.1.1 §3.1.2.4): only persist if this session is STILL the
         // client-id's current owner in client_sessions_ — a session that just lost a takeover race must
@@ -532,13 +571,16 @@ private:
         // Keep Alive -> Properties -> Client Identifier, MQTT 5 §3.1.2) — a new insertion point relative
         // to 3.1.1's Keep-Alive-straight-to-Client-ID order. M7.1: Session Expiry Interval is now stored
         // onto s->session_expiry_interval below and its TTL enforced (see StoredSession::expires_at,
-        // teardown_session, and the session-restore logic further down); every other property in the
-        // table is recognized only so read_properties() can correctly skip past it.
+        // teardown_session, and the session-restore logic further down). M7.2 PR A: Maximum Packet Size is
+        // now stored onto s->max_packet_size below and enforced in publish_to()'s choke point 2; every
+        // other property in the table is recognized only so read_properties() can correctly skip past it.
         std::optional<std::uint32_t> connect_session_expiry;
+        std::optional<std::uint32_t> connect_max_packet_size;
         if (is_v5) {
             auto props = aero::transport::mqtt::read_properties(b, pos);
             if (!props) return false;  // malformed CONNECT properties
             connect_session_expiry = props->session_expiry_interval;
+            connect_max_packet_size = props->maximum_packet_size;
         }
 
         if (pos + 2 > b.size()) return false;
@@ -557,14 +599,21 @@ private:
 
         std::string will_topic;
         std::vector<std::byte> will_payload;
+        PublishExtras will_extras;
         if (will_flag) {
             // M7 v5: a SEPARATE Will Properties block, positioned immediately before Will Topic (MQTT 5
-            // §3.1.3.2) — distinct from the CONNECT-level Properties block already consumed above.
-            // Discarded (none of Will Delay Interval/Payload Format/etc. are acted on in v1); malformed
-            // -> treated exactly like any other malformed CONNECT field.
+            // §3.1.3.2) — distinct from the CONNECT-level Properties block already consumed above. Most
+            // properties in it (Will Delay Interval/Payload Format/etc.) still aren't acted on in v1/M7.2
+            // PR A; malformed -> treated exactly like any other malformed CONNECT field. M7.2 PR A: Message
+            // Expiry Interval (0x02) IS now captured into will_extras so a Will PUBLISH's TTL isn't
+            // silently dropped while regular PUBLISHes honor it (see Session::will_extras's own comment —
+            // this file documents Will/regular PUBLISH as one shared delivery path so they can't drift).
             if (is_v5) {
                 auto will_props = aero::transport::mqtt::read_properties(b, pos);
                 if (!will_props) return false;
+                if (will_props->message_expiry_interval)
+                    will_extras.expiry_deadline = std::chrono::steady_clock::now() +
+                                                  std::chrono::seconds(*will_props->message_expiry_interval);
             }
             if (pos + 2 > b.size()) return false;
             const std::uint16_t wt_len = read_u16(pos);
@@ -630,6 +679,7 @@ private:
         s->keep_alive_s = keep_alive;
         s->clean_session = clean_session;
         s->session_expiry_interval = connect_session_expiry;  // M7.1: nullopt for v4 / v5-without-property
+        s->max_packet_size = connect_max_packet_size;  // M7.2 PR A: nullopt for v4 / v5-without-property
         s->last_activity = std::chrono::steady_clock::now();
         if (will_flag) {
             s->has_will = true;
@@ -637,6 +687,7 @@ private:
             s->will_payload = std::move(will_payload);
             s->will_qos = will_qos;
             s->will_retain = will_retain;
+            s->will_extras = std::move(will_extras);  // M7.2 PR A
         }
 
         bool session_present = false;
@@ -696,7 +747,7 @@ private:
         // Flush anything that arrived while this persistent session was offline — AFTER CONNACK, per
         // 3.1.1 (the client only knows to expect them once it's seen session-present=1).
         for (const QueuedMessage& m : to_flush)
-            if (!publish_to(*s, m.topic, m.payload, m.qos, /*retain=*/false)) return false;
+            if (!publish_to(*s, m.topic, m.payload, m.qos, /*retain=*/false, m.extras)) return false;
         return true;
     }
 
@@ -759,12 +810,14 @@ private:
         if (!s.send_packet(std::byte{0x90}, vh)) return false;  // SUBACK
 
         // Retained-message replay (3.1.1 §3.8.4): a new matching SUBSCRIBE gets the retained payload
-        // immediately, at the subscription's granted QoS.
+        // immediately, at the subscription's granted QoS. M7.2 PR A: msg.extras carries the retained
+        // message's own Message Expiry through — publish_to()'s choke point re-checks it at replay time,
+        // so a long-stale retained message is silently dropped instead of replayed as if fresh.
         std::lock_guard<std::mutex> rg(retained_mu_);
         for (const Subscription& sub : added) {
-            for (const auto& [topic, payload] : retained_) {
+            for (const auto& [topic, msg] : retained_) {
                 if (topic_matches(sub.filter, topic)) {
-                    if (!publish_to(s, topic, payload, sub.qos, /*retain=*/true)) return false;
+                    if (!publish_to(s, topic, msg.payload, sub.qos, /*retain=*/true, msg.extras)) return false;
                 }
             }
         }
@@ -793,13 +846,19 @@ private:
         // directly after Topic Name for QoS 0 (there is no packet id to parse first) — and BEFORE the
         // payload. `pos` MUST land exactly past them before the payload slice below runs, or the
         // properties bytes would leak into (or truncate) the delivered payload. Malformed -> treated like
-        // any other malformed PUBLISH (return false). M7.1: Topic Alias (0x23) is now captured (everything
-        // else in the block is still discarded — Response Topic/etc. remain out of scope).
+        // any other malformed PUBLISH (return false). M7.1: Topic Alias (0x23) is now captured. M7.2 PR A:
+        // Message Expiry Interval (0x02) is now captured too, turned into an absolute deadline below
+        // (everything else in the block is still discarded — Response Topic/Correlation Data/User
+        // Properties remain out of scope for this PR, see PublishExtras's own comment).
         std::optional<std::uint16_t> topic_alias;
+        PublishExtras extras;
         if (s.protocol_version == 5) {
             auto props = aero::transport::mqtt::read_properties(b, pos);
             if (!props) return false;
             topic_alias = props->topic_alias;
+            if (props->message_expiry_interval)
+                extras.expiry_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(*props->message_expiry_interval);
         }
 
         std::vector<std::byte> payload(b.begin() + static_cast<std::ptrdiff_t>(pos), b.end());
@@ -848,7 +907,7 @@ private:
             // ingest/route it. Re-inserting under the same packet_id on a retransmitted PUBLISH (the
             // sender's PUBREC was lost) is a harmless overwrite with identical content, not a double
             // routing — the actual routing only ever happens once, from handle_pubrel.
-            s.qos2_inflight[packet_id] = PendingQos2{resolved_topic, payload, retain};
+            s.qos2_inflight[packet_id] = PendingQos2{resolved_topic, payload, retain, extras};
             std::vector<std::byte> ack;
             aero::transport::mqtt::put_u16_be(ack, packet_id);
             return s.send_packet(std::byte{0x50}, ack);  // PUBREC
@@ -857,7 +916,7 @@ private:
         // QoS 0/1: act BEFORE acking — a publisher that has received its PUBACK must be able to assume a
         // subsequent SUBSCRIBE/retained-replay from anyone will already see this value/delivery (no
         // ack-before-visible race).
-        if (allowed) deliver_publish(resolved_topic, payload, qos, retain);
+        if (allowed) deliver_publish(resolved_topic, payload, qos, retain, extras);
         if (qos == 1) {
             if (!allowed) return true;  // silent drop: no PUBACK
             std::vector<std::byte> ack;
@@ -881,7 +940,11 @@ private:
             (std::to_integer<std::uint8_t>(b[0]) << 8) | std::to_integer<std::uint8_t>(b[1]);
         const auto it = s.qos2_inflight.find(packet_id);
         if (it != s.qos2_inflight.end()) {
-            deliver_publish(it->second.topic, it->second.payload, /*qos=*/2, it->second.retain);
+            // M7.2 PR A: pass the PendingQos2 entry's STORED extras through, not a fresh empty one — a
+            // QoS2 message's Message Expiry was already computed at PUBLISH time and must survive
+            // unchanged to this PUBREL-time delivery (see PendingQos2's own comment).
+            deliver_publish(it->second.topic, it->second.payload, /*qos=*/2, it->second.retain,
+                            it->second.extras);
             s.qos2_inflight.erase(it);
         }
         std::vector<std::byte> ack;
@@ -898,16 +961,16 @@ private:
     // deliberately NOT routed through here — seeing peer_forwarder_ fire is exactly the loop-prevention
     // invariant 017 M6 requires).
     void deliver_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
-                         bool retain) {
+                         bool retain, const PublishExtras& extras = {}) {
         if (retain) {
             std::lock_guard<std::mutex> g(retained_mu_);
             if (payload.empty())
                 retained_.erase(topic);  // zero-length retained PUBLISH clears retention (3.1.1 §3.3.1.3)
             else
-                retained_[topic] = payload;
+                retained_[topic] = RetainedMessage{payload, extras};  // M7.2 PR A: carry extras along
         }
         if (on_publish_) on_publish_(topic, payload, qos);
-        route_publish(topic, payload, qos);
+        route_publish(topic, payload, qos, extras);
         // M6 (017 §4): AFTER local delivery, so a peer's relayed copy can never arrive before this node's
         // own subscribers see it. No-op single-node default (peer_forwarder_ unset) — see set_peer_forwarder().
         if (peer_forwarder_) peer_forwarder_(topic, payload, qos);
@@ -917,8 +980,12 @@ private:
     // qos) — a snapshot copy of sessions_ is taken under the lock so the actual socket writes (which
     // may block briefly on backpressure) never happen while holding sessions_mu_. Also queues into any
     // OFFLINE persistent (clean_session=0) session whose stored subscriptions match — QoS ≥1 only, since
-    // there is nothing to durably queue a QoS-0 "at most once" message as.
-    void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos) {
+    // there is nothing to durably queue a QoS-0 "at most once" message as. M7.2 PR A: `extras` (Message
+    // Expiry, primarily) is threaded through to both the live fan-out (publish_to's own choke point
+    // re-checks it at actual send time) and the offline queue (QueuedMessage::extras, re-checked when
+    // flushed on reconnect).
+    void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
+                       const PublishExtras& extras = {}) {
         std::vector<std::shared_ptr<Session>> snapshot;
         {
             std::lock_guard<std::mutex> g(sessions_mu_);
@@ -933,7 +1000,7 @@ private:
             }
             for (const Subscription& sub : matches) {
                 const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
-                (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false);
+                (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false, extras);
             }
         }
 
@@ -944,7 +1011,7 @@ private:
                 if (!topic_matches(sub.filter, topic)) continue;
                 const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
                 if (stored.queued.size() >= kQueuedMessageCap) stored.queued.pop_front();  // drop-oldest
-                stored.queued.push_back(QueuedMessage{topic, payload, deliver_qos});
+                stored.queued.push_back(QueuedMessage{topic, payload, deliver_qos, extras});
                 break;  // one queued copy per client-id even if multiple subs match the same topic
             }
         }
@@ -959,12 +1026,53 @@ private:
         (void)s.send_packet(std::byte{0xE0}, body);
     }
 
+    // 017 M7.2 PR A: this function used to write ZERO Properties bytes for outbound PUBLISH, for EVERY
+    // protocol version — not even an empty MQTT 5 Properties field, which is actually a latent correctness
+    // bug (§3.3.1 requires one, mandatory-even-empty, for v5; see this file's M7/M7.1 banners' own honest
+    // "outbound PUBLISH framing is untouched" scope notes, now superseded). This rewrite fixes that AS A
+    // DOCUMENTED BYPRODUCT while adding the two PR A choke points below. v4 sessions never enter the
+    // `protocol_version == 5` branch — wire shape is byte-for-byte unchanged for them, a hard invariant.
     bool publish_to(Session& s, const std::string& topic, const std::vector<std::byte>& payload,
-                    std::uint8_t qos, bool retain) {
+                    std::uint8_t qos, bool retain, const PublishExtras& extras = {}) {
+        // Choke point 1 — Message Expiry: check first, before building anything, so an already-stale
+        // message (offline queue flush, retained replay, or plain fanout racing a long expiry) never gets
+        // serialized. Silent drop (return true, not false) — mirrors this file's existing ACL-denial idiom:
+        // "this one message doesn't go out" must not tear the session down.
+        if (extras.expiry_deadline && std::chrono::steady_clock::now() >= *extras.expiry_deadline) {
+            return true;
+        }
+
         std::vector<std::byte> vh;
         aero::transport::mqtt::put_str(vh, topic);
         if (qos > 0) aero::transport::mqtt::put_u16_be(vh, next_packet_id());
+
+        if (s.protocol_version == 5) {
+            aero::transport::mqtt::PropertyWriter pw;
+            if (extras.expiry_deadline) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                    *extras.expiry_deadline - std::chrono::steady_clock::now())
+                                          .count();
+                // remaining > 0 here — choke point 1 above already returned on <= 0.
+                pw.put_u32(0x02, static_cast<std::uint32_t>(remaining));
+            }
+            // A future PR B adds here: put_str(0x08, response_topic), put_binary(0x09, correlation_data),
+            // a put_str_pair(0x26, ...) loop for user_properties — extras is already shaped for all three
+            // (PublishExtras's own comment), this PR just never populates them.
+            std::vector<std::byte> props;
+            pw.write(props);  // valid Properties block even when pw is empty (one 0x00 byte) — the §3.3.1 fix
+            vh.insert(vh.end(), props.begin(), props.end());
+        }
         vh.insert(vh.end(), payload.begin(), payload.end());
+
+        // Choke point 2 — Maximum Packet Size: after Properties are written (so the check covers the real
+        // wire size, not an underestimate), before send.
+        if (s.max_packet_size) {
+            std::vector<std::byte> len_scratch;
+            aero::transport::mqtt::put_remaining_length(len_scratch, static_cast<std::uint32_t>(vh.size()));
+            const std::size_t total = 1 + len_scratch.size() + vh.size();  // fixed-header byte + rem-len + vh
+            if (total > *s.max_packet_size) return true;  // silent drop, same idiom as choke point 1
+        }
+
         std::uint8_t flags = static_cast<std::uint8_t>(qos << 1);
         if (retain) flags |= 0x01;
         return s.send_packet(static_cast<std::byte>(0x30 | flags), vh);
@@ -999,7 +1107,7 @@ private:
     std::vector<std::thread> session_threads_;
 
     std::mutex retained_mu_;
-    std::unordered_map<std::string, std::vector<std::byte>> retained_;
+    std::unordered_map<std::string, RetainedMessage> retained_;
 
     // client-id → the Session currently claiming it (session takeover, 3.1.4). Only ever holds LIVE
     // sessions; an entry is removed the moment its Session tears down (teardown_session).

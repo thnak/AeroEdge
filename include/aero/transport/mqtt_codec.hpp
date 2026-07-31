@@ -28,7 +28,10 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "pal/net.hpp"  // quark::pal::* — fd_t, recv_some/send_some/would_block
@@ -71,10 +74,12 @@ struct Packet {
 // Bounded, skip-unknown property codec — the same tier as the byte helpers above (put_str/
 // put_remaining_length), shared by NativeBroker's v5 CONNECT/Will/PUBLISH/SUBSCRIBE parsing (017 N3
 // precedent: one codec, not a copy per caller). v1 (M7) surfaced exactly ONE property (Session Expiry
-// Interval); M7.1 adds a second (Topic Alias, for inbound PUBLISH alias resolution) — everything else in
-// the type table below exists only so its bytes can be correctly SKIPPED (a receiver must know a
-// property's WIRE TYPE to know its length even for a property it never acts on; guessing wrong silently
-// corrupts every field that follows it).
+// Interval); M7.1 added a second (Topic Alias, for inbound PUBLISH alias resolution); M7.2 PR A adds two
+// more (Message Expiry Interval, Maximum Packet Size) plus an outbound PropertyWriter (below) so
+// NativeBroker::publish_to() can finally write a real v5 Properties block — everything else in the type
+// table below exists only so its bytes can be correctly SKIPPED (a receiver must know a property's WIRE
+// TYPE to know its length even for a property it never acts on; guessing wrong silently corrupts every
+// field that follows it).
 
 // Reads an MQTT Variable Byte Integer (§1.5.5) starting at `body[pos]`, advancing `pos` past it on
 // success. IDENTICAL encoding to the fixed header's Remaining Length (put_remaining_length above is the
@@ -135,17 +140,28 @@ inline std::optional<PropWireType> property_wire_type(std::uint32_t id) noexcept
 }
 
 // The properties this codec's callers currently need out of a Properties block: Session Expiry Interval
-// (017 M7.1 — TTL enforcement lives in NativeBroker, this codec just surfaces the parsed value) and Topic
-// Alias (017 M7.1 — inbound PUBLISH alias resolution, also NativeBroker-side). Every other recognized
-// property is recognized only so it can be skipped (never stored anywhere).
+// (017 M7.1 — TTL enforcement lives in NativeBroker, this codec just surfaces the parsed value), Topic
+// Alias (017 M7.1 — inbound PUBLISH alias resolution, also NativeBroker-side), and, as of 017 M7.2 PR A,
+// Message Expiry Interval + Maximum Packet Size (017 M7.2 PR A — PUBLISH TTL and per-session outbound
+// size cap, both enforced in NativeBroker). response_topic/correlation_data/user_properties are shaped
+// here already but stay unpopulated until a future PR B — read_properties() below does NOT store into
+// them yet (see its own comment); every other recognized property is recognized only so it can be
+// skipped (never stored anywhere).
 struct ParsedProperties {
     std::optional<std::uint32_t> session_expiry_interval;
     std::optional<std::uint16_t> topic_alias;
+    std::optional<std::uint32_t> message_expiry_interval;   // 017 M7.2 PR A — 0x02
+    std::optional<std::uint32_t> maximum_packet_size;        // 017 M7.2 PR A — 0x27
+    std::optional<std::string> response_topic;                // future PR B — 0x08, always nullopt for now
+    std::optional<std::vector<std::byte>> correlation_data;    // future PR B — 0x09, always nullopt for now
+    std::vector<std::pair<std::string, std::string>> user_properties;  // future PR B — 0x26, always empty
 };
 
 // Reads a Property Length varint, then walks exactly that many bytes as a sequence of
 // `{property_id (varint), value}` TLV records, using property_wire_type() to know each value's length.
-// Stores session_expiry_interval when ID 0x11 appears; every other recognized ID is just skipped past.
+// Stores session_expiry_interval (0x11), message_expiry_interval (0x02), and maximum_packet_size (0x27)
+// when their IDs appear; every other recognized ID (including 0x08/0x09/0x26, left for a future PR B) is
+// just skipped past.
 // `nullopt` on: a malformed Property Length varint, a truncated record, an ID not in the type table
 // above (this codec has no way to know its length, so it fails closed rather than guessing), or a
 // records total that doesn't exactly fill the declared Property Length. Advances `pos` to just past the
@@ -181,11 +197,17 @@ inline std::optional<ParsedProperties> read_properties(const std::vector<std::by
             }
             case PropWireType::FourByteInt: {
                 if (pos + 4 > end) return std::nullopt;
-                if (*id == 0x11) {  // Session Expiry Interval
+                if (*id == 0x11 || *id == 0x02 || *id == 0x27) {
                     std::uint32_t v = 0;
                     for (std::size_t i = 0; i < 4; ++i)
                         v = (v << 8) | std::to_integer<std::uint8_t>(body[pos + i]);
-                    result.session_expiry_interval = v;
+                    if (*id == 0x11) {         // Session Expiry Interval
+                        result.session_expiry_interval = v;
+                    } else if (*id == 0x02) {  // Message Expiry Interval (017 M7.2 PR A)
+                        result.message_expiry_interval = v;
+                    } else {                    // 0x27 — Maximum Packet Size (017 M7.2 PR A)
+                        result.maximum_packet_size = v;
+                    }
                 }
                 pos += 4;
                 break;
@@ -223,10 +245,9 @@ inline std::optional<ParsedProperties> read_properties(const std::vector<std::by
     return result;
 }
 
-// The only properties-WRITING shape v1 needs: every v5 ack NativeBroker sends this milestone (CONNACK/
-// SUBACK) carries zero properties (3.4.2.1-style "Success and nothing to say" is legal to encode as a
-// bare zero-length Property Length). A general properties WRITER isn't built because nothing calls for
-// one yet — do not add one speculatively.
+// The only properties-WRITING shape v1/M7.1 needed: every v5 ack NativeBroker sent through M7.1 (CONNACK/
+// SUBACK/DISCONNECT) carries zero properties (3.4.2.1-style "Success and nothing to say" is legal to
+// encode as a bare zero-length Property Length). Still used by CONNACK/SUBACK/DISCONNECT — unchanged.
 inline void put_empty_properties(std::vector<std::byte>& out) { put_remaining_length(out, 0); }
 
 // The one non-empty outbound property v1 needs: Topic Alias Maximum (0x22) in CONNACK, so a v5 client
@@ -237,6 +258,52 @@ inline void put_topic_alias_max_properties(std::vector<std::byte>& out, std::uin
     put_remaining_length(out, static_cast<std::uint32_t>(records.size()));
     out.insert(out.end(), records.begin(), records.end());
 }
+
+// A general outbound Properties writer — previously deferred (see this file's now-stale prior banner
+// above put_empty_properties, which used to say "nothing calls for one yet") because nothing needed to
+// combine more than one fixed property per packet. 017 M7.2 PR A's PUBLISH properties (Message Expiry,
+// and a future PR B's Response Topic/Correlation Data/User Properties) are each independently optional
+// and must combine onto ONE Properties block on NativeBroker::publish_to() — that needs a builder, not
+// more fixed-shape put_..._properties() functions. Only put_u32/put_str are exercised by PR A (Message
+// Expiry is the only property PR A ever writes); put_binary/put_str_pair are added now anyway since this
+// class's whole job is to also be PR B's writer, and a half-built builder just invites a second edit pass
+// later for no benefit.
+class PropertyWriter {
+public:
+    void put_u32(std::uint8_t id, std::uint32_t v) {
+        records_.push_back(static_cast<std::byte>(id));
+        put_u32_be(v);
+    }
+    void put_str(std::uint8_t id, std::string_view v) {
+        records_.push_back(static_cast<std::byte>(id));
+        aero::transport::mqtt::put_str(records_, v);  // qualified: the free function, not this member
+    }
+    void put_binary(std::uint8_t id, std::span<const std::byte> v) {
+        records_.push_back(static_cast<std::byte>(id));
+        put_u16_be(records_, static_cast<std::uint16_t>(v.size()));
+        records_.insert(records_.end(), v.begin(), v.end());
+    }
+    void put_str_pair(std::uint8_t id, std::string_view k, std::string_view v) {
+        records_.push_back(static_cast<std::byte>(id));
+        aero::transport::mqtt::put_str(records_, k);
+        aero::transport::mqtt::put_str(records_, v);
+    }
+    [[nodiscard]] bool empty() const noexcept { return records_.empty(); }
+    // Writes a valid Properties block to `out` — a Property Length varint (0 when nothing was added:
+    // MQTT 5 §2.2.2.2 makes an empty Properties block legal, exactly the "at least the mandatory
+    // zero-length field" fix 017 M7.2 PR A applies to publish_to(), see native_broker.hpp) followed by
+    // every record added via put_u32/put_str/put_binary/put_str_pair above, in call order.
+    void write(std::vector<std::byte>& out) const {
+        put_remaining_length(out, static_cast<std::uint32_t>(records_.size()));
+        out.insert(out.end(), records_.begin(), records_.end());
+    }
+
+private:
+    void put_u32_be(std::uint32_t v) {
+        for (int i = 3; i >= 0; --i) records_.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+    }
+    std::vector<std::byte> records_;
+};
 
 // Read exactly n bytes off `ch`: TRY `recv_some` first, and only poll `ch.fd()` (200ms timeout, so the
 // caller notices `running` flip to false promptly instead of blocking forever on a stalled peer) when
