@@ -59,6 +59,21 @@ jobs:
       - name: Build
         working-directory: AeroEdge
         run: cmake --build build -j
+      - name: Diagnose open62541 archive (TEMPORARY — investigating M9b CI-only link failure)
+        if: always()
+        working-directory: AeroEdge
+        run: |
+          echo "--- CMAKE_AR/CMAKE_RANLIB from cache ---"
+          grep -i "^CMAKE_AR\|^CMAKE_RANLIB" build/CMakeCache.txt || true
+          echo "--- which ar/llvm-ar on PATH ---"
+          which ar; which llvm-ar-20 2>/dev/null; which llvm-ar 2>/dev/null; true
+          echo "--- archive file ---"
+          ls -la build/bin/libopen62541.a || true
+          file build/bin/libopen62541.a || true
+          echo "--- ar t (member listing) ---"
+          ar t build/bin/libopen62541.a 2>&1 | head -20 || true
+          echo "--- df -h (disk space) ---"
+          df -h /home/runner/work || true
       - name: Test
         working-directory: AeroEdge
         run: ctest --test-dir build --output-on-failure
