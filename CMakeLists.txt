@@ -22,6 +22,37 @@ endif()
 # ---- Threads (httplib + Quark worker lanes need pthreads) ------------------
 find_package(Threads REQUIRED)
 
+# ---- Pair the C compiler with CMAKE_CXX_COMPILER, if not already set -------
+# AeroEdge itself is pure C++ (LANGUAGES CXX above) and never triggered CMake's C-language detection
+# before mbedTLS (below): mbedTLS's own root CMakeLists.txt calls `project(MbedTLS C)`, so the FIRST
+# time C is ever probed in this build is inside that FetchContent_MakeAvailable call, lazily. Left to
+# its own devices, CMake probes whatever `cc` resolves to on PATH — on a system where that's GCC while
+# CMAKE_CXX_COMPILER is Clang (e.g. this project's CI matrix, which builds several legs with clang++-N
+# and passes Clang-only flags like `--gcc-install-dir=...` through CMAKE_CXX_FLAGS/CMAKE_EXE_LINKER_FLAGS
+# — the LATTER is language-agnostic and so also reaches the C-compiler-ABI probe), the probe can fail
+# outright (GCC's `cc` doesn't understand a Clang driver flag) or silently mix toolchains. Deriving a
+# same-family, same-version C compiler from CMAKE_CXX_COMPILER before mbedTLS ever asks for one avoids
+# both — this only fires when the caller didn't already pin CMAKE_C_COMPILER explicitly.
+if(NOT CMAKE_C_COMPILER)
+  get_filename_component(_aero_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  get_filename_component(_aero_cxx_name "${CMAKE_CXX_COMPILER}" NAME)
+  set(_aero_c_name "")
+  if(_aero_cxx_name MATCHES "^clang\\+\\+(.*)$")
+    set(_aero_c_name "clang${CMAKE_MATCH_1}")
+  elseif(_aero_cxx_name MATCHES "^g\\+\\+(.*)$")
+    set(_aero_c_name "gcc${CMAKE_MATCH_1}")
+  endif()
+  if(_aero_c_name)
+    if(_aero_cxx_dir)
+      set(CMAKE_C_COMPILER "${_aero_cxx_dir}/${_aero_c_name}" CACHE STRING
+          "C compiler, paired with CMAKE_CXX_COMPILER" FORCE)
+    else()
+      set(CMAKE_C_COMPILER "${_aero_c_name}" CACHE STRING
+          "C compiler, paired with CMAKE_CXX_COMPILER" FORCE)
+    endif()
+  endif()
+endif()
+
 # ---- TLS (mbedTLS, vendored via CMake FetchContent) -------------------------
 # M5 (TLS+ACL milestone): the native MQTT broker's TLS byte-channel PAL (include/aero/pal/tls.hpp) needs
 # a TLS library. mbedTLS is small, portable C designed for embedded/edge targets (unlike OpenSSL's much
@@ -35,10 +66,13 @@ if(AERO_ENABLE_TLS)
     mbedtls
     GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
     GIT_TAG        v3.6.7  # latest v3.6.x LTS tag at the time this was pinned (checked empirically)
-    # See cmake/patch_mbedtls_toolchain.cmake's banner: neutralizes a real mbedTLS CMake false-positive
-    # (CMAKE_C_SIMULATE_ID=MSVC for Clang's GNU-style driver targeting the MSVC ABI, this project's
-    # Windows toolchain) that otherwise appends cl.exe-only `/W3 /utf-8` flags clang++.exe rejects.
-    PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_mbedtls_toolchain.cmake"
+    # See cmake/patch_mbedtls.cmake's banner: two independent fixes — (1) neutralizes a real mbedTLS
+    # CMake false-positive (CMAKE_C_SIMULATE_ID=MSVC for Clang's GNU-style driver targeting the MSVC
+    # ABI, this project's Windows toolchain) that otherwise appends cl.exe-only `/W3 /utf-8` flags
+    # clang++.exe rejects; (2) disables MBEDTLS_SELF_TEST, whose unused self-test instrumentation
+    # includes an unsynchronized global counter that TSan correctly flags as a real data race under
+    # concurrent TLS handshakes.
+    PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_mbedtls.cmake"
   )
   # Keep mbedTLS's own build lean/quiet, mirroring the QUARK_BUILD_TESTS/BENCH/SAMPLES OFF pattern right
   # below (add_subdirectory(QuarkCpp)) — force the cache vars mbedTLS's CMakeLists reads BEFORE

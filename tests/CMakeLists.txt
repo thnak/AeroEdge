@@ -196,6 +196,16 @@ target_link_libraries(bridge PRIVATE aero::broker aero::nodes aero-thirdparty-ht
 add_test(NAME bridge COMMAND bridge)
 set_tests_properties(bridge PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 M6 gate: broker_cluster.hpp — cross-node PUBLISH broadcast over REAL loopback TCP. Two
+# NativeBroker+BrokerCluster pairs (aero::transport::TcpTransport under a Quark DistributedRouter,
+# StaticBrokerMembership) prove the cross-node hop (a node-2 PUBLISH reaches a node-1 subscriber) and
+# loop prevention (node 2's own subscriber sees its local PUBLISH exactly once, never a relayed-back
+# duplicate). Same aero::broker library as native_broker/bridge above — no new link target needed.
+add_executable(broker_cluster broker/broker_cluster.cpp)
+target_link_libraries(broker_cluster PRIVATE aero::broker)
+add_test(NAME broker_cluster COMMAND broker_cluster)
+set_tests_properties(broker_cluster PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # M5 TLS+ACL milestone gate: acl.hpp — the broker-local per-topic Authorizer seam (Allow/Deny-all
 # triviality, TopicAclAuthorizer's Closed/Open default posture, exact + wildcard principal/topic
 # matching, first-match-wins ordering, Publish/Subscribe action independence). Pure logic, no sockets.

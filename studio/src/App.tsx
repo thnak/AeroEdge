@@ -5,6 +5,7 @@ import { FlowsPage } from "./pages/FlowsPage";
 import { FleetPage } from "./pages/FleetPage";
 import { OtaPage } from "./pages/OtaPage";
 import { MesPage } from "./pages/MesPage";
+import { BrokerPage } from "./pages/BrokerPage";
 
 export function App() {
   return (
@@ -15,6 +16,7 @@ export function App() {
           <NavLink to="/fleet">Fleet</NavLink>
           <NavLink to="/ota">OTA</NavLink>
           <NavLink to="/mes">MES</NavLink>
+          <NavLink to="/broker">Broker</NavLink>
         </>
       }
     >
@@ -24,6 +26,7 @@ export function App() {
         <Route path="/fleet" element={<FleetPage />} />
         <Route path="/ota" element={<OtaPage />} />
         <Route path="/mes" element={<MesPage />} />
+        <Route path="/broker" element={<BrokerPage />} />
       </Routes>
     </AppShell>
   );

@@ -35,6 +35,7 @@
 
 #include <chrono>
 #include <memory>
+#include <mutex>
 
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
@@ -42,6 +43,7 @@
 #include <mbedtls/net_sockets.h>  // MBEDTLS_ERR_NET_SEND_FAILED/RECV_FAILED (not pulled in by ssl.h alone)
 #include <mbedtls/pk.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/threading.h>  // mbedtls_threading_set_alt — see ensure_threading_registered() below
 #include <mbedtls/x509_crt.h>
 
 #include "aero/pal/poll.hpp"
@@ -89,6 +91,47 @@ inline int bio_recv(void* ctx, unsigned char* buf, std::size_t len) {
     if (r) return static_cast<int>(*r);
     if (r.error() == quark::pal::would_block()) return MBEDTLS_ERR_SSL_WANT_READ;
     return MBEDTLS_ERR_NET_RECV_FAILED;
+}
+
+// mbedTLS threading shim (MBEDTLS_THREADING_ALT, cmake/patch_mbedtls.cmake patch 3): TLS 1.3's PSA
+// crypto backend has process-wide global state (the PSA key-slot table) that needs synchronization
+// across concurrent handshake threads — mbedTLS's own docs require enabling its threading abstraction
+// for exactly this multi-thread-single-process shape, "even if individual TLS contexts are not shared
+// between threads" (mbedtls_config.h's MBEDTLS_THREADING_C comment). ALT (not PTHREAD) because this
+// project's Windows leg has no guaranteed pthread.h (Clang's GNU-style driver targeting the MSVC ABI,
+// not MinGW) while std::mutex is uniformly available everywhere this project builds. The patch script
+// only declares mbedtls_threading_mutex_t's STORAGE SHAPE (an opaque pointer, include/threading_alt.h,
+// dropped into mbedTLS's own include root so its C translation units find it) — the real mutex and the
+// one required mbedtls_threading_set_alt() registration call live here, in C++.
+inline void mbedtls_mutex_init_shim(mbedtls_threading_mutex_t* m) noexcept {
+    m->aero_native_mutex = new std::mutex();
+}
+inline void mbedtls_mutex_free_shim(mbedtls_threading_mutex_t* m) noexcept {
+    delete static_cast<std::mutex*>(m->aero_native_mutex);
+    m->aero_native_mutex = nullptr;
+}
+inline int mbedtls_mutex_lock_shim(mbedtls_threading_mutex_t* m) noexcept {
+    if (!m->aero_native_mutex) return MBEDTLS_ERR_THREADING_MUTEX_ERROR;
+    static_cast<std::mutex*>(m->aero_native_mutex)->lock();
+    return 0;
+}
+inline int mbedtls_mutex_unlock_shim(mbedtls_threading_mutex_t* m) noexcept {
+    if (!m->aero_native_mutex) return MBEDTLS_ERR_THREADING_MUTEX_ERROR;
+    static_cast<std::mutex*>(m->aero_native_mutex)->unlock();
+    return 0;
+}
+
+// mbedtls_threading_set_alt() "must be called once in the main thread before any other Mbed TLS
+// function is called" (threading.h) — std::call_once satisfies the "once" half; calling this as the
+// very first statement in every TlsServerContext::create() (this header's sole mbedTLS entry point)
+// satisfies "before any other Mbed TLS function", since nothing else in this codebase calls into
+// mbedTLS directly.
+inline void ensure_threading_registered() noexcept {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        mbedtls_threading_set_alt(&mbedtls_mutex_init_shim, &mbedtls_mutex_free_shim,
+                                  &mbedtls_mutex_lock_shim, &mbedtls_mutex_unlock_shim);
+    });
 }
 
 // Stateless deleter pairing an mbedTLS type's `_free` function with `delete`. Every mbedTLS struct this
@@ -203,6 +246,7 @@ public:
     // PEM file or key returns a descriptive error string (CONVENTIONS.md: std::expected, not exceptions,
     // for expected failure paths).
     [[nodiscard]] static std::expected<TlsServerContext, std::string> create(const ServerConfig& cfg) {
+        detail::ensure_threading_registered();  // must precede every other mbedTLS call — see its banner
         TlsServerContext ctx;
         ctx.entropy_.reset(detail::heap_init<mbedtls_entropy_context, mbedtls_entropy_init>());
         ctx.ctr_drbg_.reset(detail::heap_init<mbedtls_ctr_drbg_context, mbedtls_ctr_drbg_init>());

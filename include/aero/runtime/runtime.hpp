@@ -32,6 +32,7 @@
 
 #include <optional>
 
+#include "aero/broker/broker_cluster.hpp"
 #include "aero/broker/native_broker.hpp"
 #include "aero/cluster/cluster.hpp"
 #include "aero/core/compiled_flow.hpp"
@@ -134,7 +135,13 @@ public:
     ~Runtime() {
         (void)undeploy();
         if (mes_engine_) mes_engine_->stop();
+        // Order matters (017 M6): stop the broker's accept loop + every session thread BEFORE the cluster
+        // — that guarantees no locally-originated PUBLISH can still be mid-flight into
+        // NativeBroker::deliver_publish() (and so into peer_forwarder_) once broker_cluster_ starts tearing
+        // down its own engine/transport underneath it. Both stop()s are idempotent (harmless if either
+        // subsystem was never configured / already stopped).
         if (broker_) broker_->stop();
+        if (broker_cluster_) broker_cluster_->stop();
     }
 
     Runtime(const Runtime&) = delete;
@@ -606,7 +613,13 @@ public:
     // start (its own ownership, independent of any deployed Application's deploy/undeploy cycle — the
     // broker's job is accepting device connections, not running the flow), a second call is rejected
     // rather than silently replacing the listening broker underneath live sessions.
-    std::expected<void, std::string> configure_broker(const aero::broker::Config& cfg) {
+    // `cluster` (017 M6, opt-in): when omitted/`std::nullopt`, or its `peers` list is empty, NO
+    // `BrokerCluster` is constructed at all — no second engine, no inter-broker listener, behavior
+    // identical to every caller before M6 (single-node broker, exactly as configure_broker(cfg) alone
+    // always was). Only a non-empty peer list opts a deployment into cross-node PUBLISH broadcast.
+    std::expected<void, std::string> configure_broker(
+        const aero::broker::Config& cfg,
+        const std::optional<aero::broker::BrokerClusterConfig>& cluster = std::nullopt) {
         std::lock_guard<std::mutex> lock(mtx_);
         if (broker_) {
             return std::unexpected("native broker already configured");
@@ -615,6 +628,18 @@ public:
         auto r = b->start();
         if (!r) return std::unexpected(r.error());
         broker_ = std::move(b);
+
+        if (cluster && !cluster->peers.empty()) {
+            auto c = std::make_unique<aero::broker::BrokerCluster>(cluster->self, cluster->cluster_port,
+                                                                    cluster->peers, *broker_);
+            auto cr = c->start();
+            if (!cr) {
+                broker_->stop();
+                broker_.reset();
+                return std::unexpected(cr.error());
+            }
+            broker_cluster_ = std::move(c);
+        }
         return {};
     }
 
@@ -737,6 +762,9 @@ private:
 
     // Native MQTT broker lifetime (daemon-scoped, set by configure_broker() above).
     std::unique_ptr<aero::broker::NativeBroker> broker_;
+    // Cross-node PUBLISH broadcast (017 M6, opt-in) — nullptr unless configure_broker()'s cluster
+    // param was given a non-empty peer list. See ~Runtime() for the required stop() ordering.
+    std::unique_ptr<aero::broker::BrokerCluster> broker_cluster_;
 };
 
 }  // namespace aero::runtime

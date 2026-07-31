@@ -47,6 +47,14 @@ export interface MesOutboxStats {
   delivered?: number;
 }
 
+// 017 §1/§2/M2/M4 — {"configured": false} until the daemon has been given a broker listen port
+// (--broker-port/--broker-bind); "listen_port" only once configured. NativeBroker Phase 1 doesn't
+// expose session/subscription counts yet, so that's genuinely all this reports for now.
+export interface BrokerStatus {
+  configured: boolean;
+  listen_port?: number;
+}
+
 export interface ApiResult {
   ok: boolean;
   status: number;
@@ -112,6 +120,9 @@ export class AeroApi {
   // MES outbox observability + control (016 §2.3).
   mesOutboxStats(): Promise<ApiResult> { return this.req("GET", "/mes/outbox"); }
   drainMesOutbox(): Promise<ApiResult> { return this.req("POST", "/mes/outbox/drain"); }
+
+  // Native MQTT broker observability (017 §1/§2/M2/M4).
+  brokerStatus(): Promise<ApiResult> { return this.req("GET", "/broker/status"); }
 
   // Runtime-assisted discovery (015 §5): browsing an OPC UA address space / testing an MQTT
   // connection needs the runtime + a live device — which only the edge node can reach. The browser
