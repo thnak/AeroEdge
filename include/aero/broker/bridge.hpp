@@ -17,9 +17,12 @@
 // `broker.on_publish([&](auto t, auto p, auto q){ engine.handle_publish(t, p, q); });` — this header
 // never touches `NativeBroker`'s socket/session internals.
 //
-// Kafka/Pulsar/RabbitMQ bridges are OUT of scope here — those need new third-party client deps, a
-// separate future milestone. MQTT and HTTP-webhook cover the floor: republish to another broker
-// (cloud/second AeroEdge node) or to any HTTP-speaking downstream (a rules engine, a lake ingester).
+// Kafka/Pulsar bridges are OUT of scope here — those need new third-party client deps, separate future
+// milestones (M8.1/M8.2, see 017 §6 Status). RabbitMQ shipped in M8 (`RabbitMqBridgeSink`,
+// broker/rabbitmq_bridge_sink.hpp, over rabbitmq-c) as the one bridge in that family AeroEdge actually
+// vendors. MQTT, HTTP-webhook, and RabbitMQ together cover the floor: republish to another broker
+// (cloud/second AeroEdge node), to any HTTP-speaking downstream (a rules engine, a lake ingester), or to
+// an AMQP 0-9-1 broker (a common on-prem industrial message bus).
 //
 // DESIGN CALL — `MqttBridgeSink` (documented per the task, not mechanical): `MqttClientTransport`
 // (mqtt_client_transport.hpp) is a working MQTT 3.1.1 client, but its `send()`/`on_receive()` contract
@@ -138,12 +141,19 @@ namespace bridge_detail {
 // `aero::mes::MesConfig`'s own "some fields used by one adapter kind" shape, mes/mes.hpp):
 //   MqttBridgeSink       — `endpoint` only, as "tcp://host:port" (the downstream broker to dial).
 //   HttpWebhookBridgeSink — `endpoint`+`port` (the HTTP host:port), `path`, optional `token`.
+//   RabbitMqBridgeSink   — `endpoint` (bare host) + `port` (0 -> default 5672), `username`/`password`
+//                          (SASL PLAIN, default "guest"/"guest"), `vhost` (default "/"), `exchange`
+//                          (default "" -> the default exchange; `topic` is always the routing key).
 struct BridgeConfig {
-    std::string endpoint;                    // MQTT: "tcp://host:port". HTTP: bare host.
-    int port = 0;                            // HTTP webhook port only.
+    std::string endpoint;                    // MQTT: "tcp://host:port". HTTP/RabbitMQ: bare host.
+    int port = 0;                            // HTTP webhook / RabbitMQ port only (RabbitMQ: 0 -> 5672).
     std::string path = "/bridge";            // HTTP webhook POST path only.
     std::string token;                       // HTTP webhook: optional bearer token (Authorization).
     std::string client_id = "aero-bridge";   // MQTT: the CONNECT client identifier.
+    std::string username = "guest";          // RabbitMQ: SASL PLAIN username.
+    std::string password = "guest";          // RabbitMQ: SASL PLAIN password.
+    std::string vhost = "/";                 // RabbitMQ: virtual host.
+    std::string exchange;                    // RabbitMQ: exchange name ("" -> the default exchange).
 };
 
 // The seam AeroEdge owns for "republish a broker PUBLISH somewhere else" — same spirit as

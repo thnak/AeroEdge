@@ -196,6 +196,24 @@ target_link_libraries(bridge PRIVATE aero::broker aero::nodes aero-thirdparty-ht
 add_test(NAME bridge COMMAND bridge)
 set_tests_properties(bridge PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# M8 gate (017 §6 Status): RabbitMqBridgeSink (broker/rabbitmq_bridge_sink.hpp) over rabbitmq-c — a
+# fourth IBridgeSink alongside MqttBridgeSink/HttpWebhookBridgeSink. rabbitmq-c is client-only (ships no
+# test/mock broker), so this test hand-rolls a minimal fake AMQP 0-9-1 server (same quark::pal::net +
+# aero::pal::poll primitives every other socket test in this tree uses, mirroring
+# tests/drivers/modbus_tcp_driver.cpp's FakeModbusServer shape) to drive a REAL RabbitMqBridgeSink through
+# a full connect/login/channel-open/publish/close round trip, a refused-port connect() failure, and a
+# mid-session connection kill proving the NEXT publish() fails fast, never hangs. Not gated on
+# AERO_ENABLE_RABBITMQ (mirrors opcua_driver's own unconditional build below — consistent with this
+# tree's existing precedent for an optional vendored dependency's test target): with the option OFF,
+# RabbitMqBridgeSink's stub (rabbitmq_bridge_sink.hpp's #else branch) still compiles and links fine since
+# this test only calls the IBridgeSink surface, never rabbitmq-c's own headers directly — it would just
+# fail its assertions at runtime (stub connect()/publish() always return false), which the default-ON
+# option means nobody normally hits.
+add_executable(rabbitmq_bridge_sink broker/rabbitmq_bridge_sink.cpp)
+target_link_libraries(rabbitmq_bridge_sink PRIVATE aero::broker)
+add_test(NAME rabbitmq_bridge_sink COMMAND rabbitmq_bridge_sink)
+set_tests_properties(rabbitmq_bridge_sink PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # 017 M6 gate: broker_cluster.hpp — cross-node PUBLISH broadcast over REAL loopback TCP. Two
 # NativeBroker+BrokerCluster pairs (aero::transport::TcpTransport under a Quark DistributedRouter,
 # StaticBrokerMembership) prove the cross-node hop (a node-2 PUBLISH reaches a node-1 subscriber) and

@@ -21,7 +21,7 @@
 | M5 | TLS + per-topic ACL for the native MQTT broker | **Shipped** — southbound (device-facing) TLS + ACL; cluster-link TLS deferred, M5.1 |
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties (Topic Alias, Shared Subs, Request/Response, Enhanced Auth) deferred, M7.1 |
-| M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | Backlog |
+| M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | **Shipped** — RabbitMQ only; Kafka/Pulsar deferred, M8.1/M8.2 |
 | M9 | Multi-protocol southbound (OPC-UA/Modbus) | **Superseded by spec 018** — its own spec, as this row anticipated |
 
 ## 1. Why
@@ -195,7 +195,8 @@ principled exclusions the way v0.1 framed the whole breadth:
 | Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
 | MQTT 5 | **shipped**, protocol negotiation + properties parsing only | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; feature properties (Topic Alias, Shared Subs, Request/Response, Enhanced Auth) deferred, M7.1 |
-| Kafka/Pulsar/RabbitMQ bridges | backlog | M8 — needs new third-party deps, native-extension-shaped (008) |
+| RabbitMQ bridge | **shipped** | M8, `RabbitMqBridgeSink` (`broker/rabbitmq_bridge_sink.hpp`) over rabbitmq-c (AMQP 0-9-1); PUBLISH only, no TLS/SASL-EXTERNAL, no publisher confirms |
+| Kafka/Pulsar bridges | backlog | M8.1/M8.2 — needs new third-party deps (librdkafka / pulsar-client-cpp), native-extension-shaped (008) |
 | Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
 | Shared subscriptions | not yet scheduled | no current AeroEdge/AeroMes use case; revisit on demand |
 
@@ -352,6 +353,17 @@ adapts to unilaterally. Concretely:
     path doesn't exist yet.
   Revisit any of these once a real device/integration actually needs it — same "don't build
   ahead of demand" posture M7's own predecessor entry held, now narrowed to what's left.
+- **M8.1/M8.2 — Kafka and Pulsar bridges.** M8 ships `RabbitMqBridgeSink` (rabbitmq-c, AMQP 0-9-1)
+  as the one bridge in the Kafka/Pulsar/RabbitMQ family this milestone actually vendors — RabbitMQ
+  was picked first because it needed no new build-system machinery beyond the FetchContent pattern
+  mbedTLS/open62541 already established (plain C, no codegen step, MIT-licensed, no bundled
+  copyleft deps). Kafka (`librdkafka`) and Pulsar (`pulsar-client-cpp`) remain explicitly deferred
+  as separate future milestones, not folded into M8: both are materially heavier dependencies
+  (librdkafka alone is a much larger C library with its own vendored zstd/lz4/ssl knobs; pulsar-
+  client-cpp pulls in Boost + Protobuf) that deserve their own vendoring review rather than being
+  rushed in alongside RabbitMQ's comparatively small footprint. Revisit each independently once a
+  real deployment actually needs that specific broker, same "don't build ahead of demand" posture
+  M7.1's own entry holds.
 - **Shared secrets / device provisioning** — how a device gets its TLS identity/PSK in the
   first place (fleet-level concern, may tie to 011 OTA's existing device identity story).
 - **Southbound OPC-UA/Modbus termination** — this spec is MQTT-only; the same "AeroEdge
