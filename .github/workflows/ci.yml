@@ -19,9 +19,17 @@ jobs:
           - { compiler: g++-14,     build_type: Release, sanitizer: "",                 stdlib: "" }
           - { compiler: g++-14,     build_type: Debug,   sanitizer: "address,undefined", stdlib: "" }
           - { compiler: g++-14,     build_type: Debug,   sanitizer: "thread",            stdlib: "" }
-          - { compiler: clang++-20, build_type: Release, sanitizer: "",                 stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
-          - { compiler: clang++-20, build_type: Debug,   sanitizer: "address,undefined", stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
-          - { compiler: clang++-20, build_type: Debug,   sanitizer: "thread",            stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
+          # -fuse-ld=lld (M9b): this runner's default BFD ld (GNU binutils, ubuntu-24.04's stock version)
+          # hits a real archive-parsing bug against the open62541 static archive ("error adding symbols:
+          # file format not recognized") — confirmed NOT corruption (a diagnostic step inspecting the
+          # exact same file moments later always showed a perfectly valid ar archive) and NOT transient
+          # (a same-job retry, re-linking the identical already-on-disk archive, failed identically) —
+          # deterministic on this runner's BFD ld, never reproducible on any local machine tried (newer
+          # binutils). LLVM's lld ships alongside clang-20 from the same apt.llvm.org install and sidesteps
+          # the buggy component entirely — the standard fix for this class of BFD ld archive bug.
+          - { compiler: clang++-20, build_type: Release, sanitizer: "",                 stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -fuse-ld=lld" }
+          - { compiler: clang++-20, build_type: Debug,   sanitizer: "address,undefined", stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -fuse-ld=lld" }
+          - { compiler: clang++-20, build_type: Debug,   sanitizer: "thread",            stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -fuse-ld=lld" }
     name: ${{ matrix.compiler }} ${{ matrix.sanitizer == '' && 'release' || matrix.sanitizer }}
     steps:
       - uses: actions/checkout@v4
@@ -58,19 +66,7 @@ jobs:
           -DQUARK_DIR=${{ github.workspace }}/QuarkCpp
       - name: Build
         working-directory: AeroEdge
-        # M9b (open62541 vendoring) surfaced a transient, environment-level failure specific to
-        # clang++-20 on GitHub's hosted runners: the linker occasionally reports
-        # "bin/libopen62541.a: error adding symbols: file format not recognized" for an archive that a
-        # post-build diagnostic (file / ar t / hexdump of the exact same file, moments later) always
-        # shows is a completely valid, uncorrupted ar archive — confirmed across multiple CI runs, never
-        # reproducible on any local machine tried (WSL/native, matching compiler/flags/parallelism). Not
-        # an archiver-tool mismatch (CMAKE_AR is pinned to plain /usr/bin/ar, confirmed via the same
-        # diagnostic) and not disk exhaustion (confirmed >80G free at failure time) — a genuine transient
-        # file-visibility race between the archive-creation step and the final link step on this runner's
-        # storage, specific to how clang++-20 invokes the linker. Retry once: ninja is incremental, so a
-        # retry only re-attempts the failed link (every object stays cached), and if the file is simply
-        # not-yet-visible on the first attempt it reliably is by the second.
-        run: cmake --build build -j || (echo "::warning::Build failed, retrying once (see this step's comment)" && cmake --build build -j)
+        run: cmake --build build -j
       - name: Test
         working-directory: AeroEdge
         run: ctest --test-dir build --output-on-failure
