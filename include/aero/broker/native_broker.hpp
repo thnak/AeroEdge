@@ -284,6 +284,11 @@ private:
         // Session-state discipline, see this struct's banner) — 4 (MQTT 3.1.1) is the default so every
         // function that doesn't branch on it yet keeps behaving exactly as before this milestone.
         std::uint8_t protocol_version = 4;
+        // M7.1: negotiated (v5 only) in handle_connect, set ONCE (never mutated again) — same discipline
+        // as protocol_version above. nullopt means "no Session Expiry Interval property on CONNECT" (v4
+        // sessions never populate this, and neither does a v5 session that omitted the property) — treated
+        // identically to "never expires" by teardown_session, so the pre-M7.1 default behavior is unchanged.
+        std::optional<std::uint32_t> session_expiry_interval;
         std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
         std::atomic<bool> kicked{false};  // superseded by a newer CONNECT under the same client-id (3.1.4)
 
@@ -296,6 +301,10 @@ private:
         std::string principal = "anonymous";  // M5: set from Config::authenticate's return, else default
 
         std::unordered_map<std::uint16_t, PendingQos2> qos2_inflight;
+        // M7.1: inbound Topic Alias table (MQTT 5 §3.3.2.3.4) — client-established alias -> topic string,
+        // this session's own. Same single-thread-owned, no-lock discipline as qos2_inflight above (only
+        // this session's own reader thread ever touches it, via handle_publish).
+        std::unordered_map<std::uint16_t, std::string> topic_aliases;
 
         bool send_packet(std::byte type_flags, const std::vector<std::byte>& body) {
             std::lock_guard<std::mutex> g(io_mu);
@@ -320,12 +329,22 @@ private:
     struct StoredSession {
         std::vector<Subscription> subs;
         std::deque<QueuedMessage> queued;
+        // M7.1: Session Expiry Interval TTL (MQTT 5 §3.1.2.11.2) — nullopt means "never expires" (v4
+        // sessions, and v5 sessions that didn't send the property), identical to pre-M7.1 behavior.
+        // Set in teardown_session when the owning Session had a session_expiry_interval; consulted in
+        // handle_connect's session-restore logic to discard a stale entry instead of restoring it.
+        std::optional<std::chrono::steady_clock::time_point> expires_at;
     };
 
     // Cap on how many offline QoS≥1 messages a single persistent session accumulates before the oldest
     // are dropped (bounded memory for a client that never comes back) — 100 is an arbitrary but generous
     // "a device is offline for a while, not forever" allowance; revisit if a real deployment needs more.
     static constexpr std::size_t kQueuedMessageCap = 100;
+
+    // M7.1: the highest inbound Topic Alias value this broker accepts (advertised to v5 clients via
+    // CONNACK's Topic Alias Maximum property, MQTT 5 §3.1.2.11.2) — 16 is an arbitrary but generous
+    // "a device's PUBLISH topic set is small" allowance; revisit if a real deployment needs more.
+    static constexpr std::uint16_t kTopicAliasMax = 16;
 
     void accept_loop() {
         while (running_.load(std::memory_order_acquire)) {
@@ -376,7 +395,10 @@ private:
         while (running_.load(std::memory_order_acquire)) {
             // Checked every iteration (not just on a read timeout): a session-takeover CONNECT (3.1.4)
             // must end this session promptly even if it's mid-read of something else.
-            if (s->kicked.load(std::memory_order_acquire)) break;
+            if (s->kicked.load(std::memory_order_acquire)) {
+                send_disconnect(*s, 0x8E);  // Session taken over (M7.1)
+                break;
+            }
 
             // Explicit poll-then-read (rather than letting read_packet's own internal 200ms polling loop
             // block until a full packet arrives) so a silent-but-still-open connection gets its keep-alive
@@ -385,7 +407,10 @@ private:
             const auto ready = aero::pal::wait_readable(s->fd, 200);
             if (!ready) break;  // poll itself failed
             if (!*ready) {
-                if (keep_alive_expired(*s)) break;  // 3.1.1 §3.1.2.10 — silent longer than 1.5x keep-alive
+                if (keep_alive_expired(*s)) {  // 3.1.1 §3.1.2.10 — silent longer than 1.5x keep-alive
+                    send_disconnect(*s, 0x8D);  // Keep Alive timeout (M7.1)
+                    break;
+                }
                 continue;
             }
 
@@ -443,6 +468,14 @@ private:
                         std::lock_guard<std::mutex> subg(s->subs_mu);
                         stored.subs = s->subs;
                     }
+                    // M7.1: only set when the CONNECT actually carried Session Expiry Interval — nullopt
+                    // (v4, or v5 without the property) stays nullopt on `stored`, i.e. "never expires",
+                    // exactly matching pre-M7.1 behavior. An explicit 0 is handled correctly here too (no
+                    // special case needed): `now() + 0s` == `now()`, so handle_connect's `now() >=
+                    // expires_at` check treats it as already expired the moment it's looked up.
+                    if (s->session_expiry_interval)
+                        stored.expires_at = std::chrono::steady_clock::now() +
+                                            std::chrono::seconds(*s->session_expiry_interval);
                     std::lock_guard<std::mutex> sg(stored_sessions_mu_);
                     stored_sessions_[s->client_id] = std::move(stored);
                 }
@@ -497,8 +530,9 @@ private:
 
         // M7 v5: CONNECT Properties sit here in the wire order (Protocol Name -> Level -> Flags ->
         // Keep Alive -> Properties -> Client Identifier, MQTT 5 §3.1.2) — a new insertion point relative
-        // to 3.1.1's Keep-Alive-straight-to-Client-ID order. Session Expiry Interval is parsed and kept
-        // (below) but its TTL is not enforced (017 M7.1, Open Questions); every other property in the
+        // to 3.1.1's Keep-Alive-straight-to-Client-ID order. M7.1: Session Expiry Interval is now stored
+        // onto s->session_expiry_interval below and its TTL enforced (see StoredSession::expires_at,
+        // teardown_session, and the session-restore logic further down); every other property in the
         // table is recognized only so read_properties() can correctly skip past it.
         std::optional<std::uint32_t> connect_session_expiry;
         if (is_v5) {
@@ -506,7 +540,6 @@ private:
             if (!props) return false;  // malformed CONNECT properties
             connect_session_expiry = props->session_expiry_interval;
         }
-        (void)connect_session_expiry;  // parsed, not acted on in v1 (see comment above)
 
         if (pos + 2 > b.size()) return false;
         const std::uint16_t client_id_len = read_u16(pos);
@@ -596,6 +629,7 @@ private:
         s->client_id = client_id;
         s->keep_alive_s = keep_alive;
         s->clean_session = clean_session;
+        s->session_expiry_interval = connect_session_expiry;  // M7.1: nullopt for v4 / v5-without-property
         s->last_activity = std::chrono::steady_clock::now();
         if (will_flag) {
             s->has_will = true;
@@ -627,10 +661,20 @@ private:
             } else {
                 const auto it = stored_sessions_.find(client_id);
                 if (it != stored_sessions_.end()) {
-                    restored_subs = it->second.subs;
-                    to_flush.assign(it->second.queued.begin(), it->second.queued.end());
-                    stored_sessions_.erase(it);  // ownership moves to this now-live session
-                    session_present = true;
+                    // M7.1: a Session Expiry Interval TTL that has already elapsed means this stored
+                    // session is stale — treat it as if no stored session existed at all (erase, don't
+                    // restore subs/queued messages, session_present stays false) instead of resurrecting
+                    // state the client no longer has any right to expect back.
+                    const bool expired = it->second.expires_at &&
+                                        std::chrono::steady_clock::now() >= *it->second.expires_at;
+                    if (expired) {
+                        stored_sessions_.erase(it);
+                    } else {
+                        restored_subs = it->second.subs;
+                        to_flush.assign(it->second.queued.begin(), it->second.queued.end());
+                        stored_sessions_.erase(it);  // ownership moves to this now-live session
+                        session_present = true;
+                    }
                 }
             }
         }
@@ -640,11 +684,13 @@ private:
         }
 
         // v4 (unchanged): {session_present_byte, rc_byte}, rc=0. v5: {ack_flags_byte, reason_code_byte}
-        // followed by an (empty, v1) Properties block — same session-present bit, bit 0, MQTT 5 §3.2.2.1.1
-        // — then reason code 0x00 Success (verified against the spec: CONNACK's v5 variable header is
-        // Ack Flags, Reason Code, Properties, in that order).
+        // followed by a Properties block — same session-present bit, bit 0, MQTT 5 §3.2.2.1.1 — then
+        // reason code 0x00 Success (verified against the spec: CONNACK's v5 variable header is Ack Flags,
+        // Reason Code, Properties, in that order). M7.1: the Properties block is no longer empty — it now
+        // carries Topic Alias Maximum (0x22) so a v5 client knows the broker accepts inbound aliases up to
+        // kTopicAliasMax (MQTT 5 §3.1.2.11.2).
         std::vector<std::byte> body{static_cast<std::byte>(session_present ? 0x01 : 0x00), std::byte{0x00}};
-        if (is_v5) aero::transport::mqtt::put_empty_properties(body);
+        if (is_v5) aero::transport::mqtt::put_topic_alias_max_properties(body, kTopicAliasMax);
         if (!s->send_packet(std::byte{0x20}, body)) return false;  // CONNACK
 
         // Flush anything that arrived while this persistent session was offline — AFTER CONNACK, per
@@ -745,22 +791,49 @@ private:
 
         // M7 v5: PUBLISH Properties (MQTT 5 §3.3.2.3) sit here — after Packet Identifier for QoS>0, or
         // directly after Topic Name for QoS 0 (there is no packet id to parse first) — and BEFORE the
-        // payload. Discarded (Topic Alias/Response Topic/etc. aren't acted on in v1: the single biggest
-        // deliberate scope cut in this milestone), but `pos` MUST land exactly past them before the
-        // payload slice below runs, or the properties bytes would leak into (or truncate) the delivered
-        // payload. Malformed -> treated like any other malformed PUBLISH (return false).
+        // payload. `pos` MUST land exactly past them before the payload slice below runs, or the
+        // properties bytes would leak into (or truncate) the delivered payload. Malformed -> treated like
+        // any other malformed PUBLISH (return false). M7.1: Topic Alias (0x23) is now captured (everything
+        // else in the block is still discarded — Response Topic/etc. remain out of scope).
+        std::optional<std::uint16_t> topic_alias;
         if (s.protocol_version == 5) {
             auto props = aero::transport::mqtt::read_properties(b, pos);
             if (!props) return false;
+            topic_alias = props->topic_alias;
         }
 
         std::vector<std::byte> payload(b.begin() + static_cast<std::ptrdiff_t>(pos), b.end());
+
+        // M7.1: inbound Topic Alias resolution (MQTT 5 §3.3.2.3.4) — MUST happen BEFORE the ACL gate
+        // below, so an alias can never be used to bypass per-topic ACL by hiding the real topic string
+        // behind a numeric alias. A non-empty topic name + alias together ESTABLISHES/refreshes the
+        // mapping; an empty topic name + alias LOOKS UP a previously-established mapping. `topic_alias`
+        // is only ever populated when s.protocol_version == 5 (the block above is v5-gated), so
+        // `resolved_topic` always equals `topic` unchanged for v4 sessions — zero v4 behavior change.
+        std::string resolved_topic = topic;
+        if (topic_alias) {
+            if (*topic_alias == 0 || *topic_alias > kTopicAliasMax) {
+                send_disconnect(s, 0x94);  // Topic Alias invalid (MQTT 5 §3.14.4)
+                return false;
+            }
+            if (!topic.empty()) {
+                s.topic_aliases[*topic_alias] = topic;  // establish/refresh
+            } else {
+                auto it = s.topic_aliases.find(*topic_alias);
+                if (it == s.topic_aliases.end()) {
+                    send_disconnect(s, 0x94);  // unknown alias
+                    return false;
+                }
+                resolved_topic = it->second;
+            }
+        }
 
         // M5 ACL gate: unset Config::authorizer ⇒ unchanged Phase-1 behavior (everything allowed). On
         // denial: deliver_publish() (retain/on_publish_/route_publish) is never called, and for QoS 1/2
         // no ack is sent at all (silent drop — the publisher gets no confirmation, which IS the signal;
         // there is nothing to ack for QoS 0 either way).
-        const bool allowed = !cfg_.authorizer || cfg_.authorizer->allow(s.principal, topic, AclAction::Publish);
+        const bool allowed =
+            !cfg_.authorizer || cfg_.authorizer->allow(s.principal, resolved_topic, AclAction::Publish);
 
         if (qos == 2) {
             // DOCUMENTED CHOICE: QoS 2's authorization check happens HERE, at PUBLISH/PUBREC time, not
@@ -775,7 +848,7 @@ private:
             // ingest/route it. Re-inserting under the same packet_id on a retransmitted PUBLISH (the
             // sender's PUBREC was lost) is a harmless overwrite with identical content, not a double
             // routing — the actual routing only ever happens once, from handle_pubrel.
-            s.qos2_inflight[packet_id] = PendingQos2{topic, payload, retain};
+            s.qos2_inflight[packet_id] = PendingQos2{resolved_topic, payload, retain};
             std::vector<std::byte> ack;
             aero::transport::mqtt::put_u16_be(ack, packet_id);
             return s.send_packet(std::byte{0x50}, ack);  // PUBREC
@@ -784,7 +857,7 @@ private:
         // QoS 0/1: act BEFORE acking — a publisher that has received its PUBACK must be able to assume a
         // subsequent SUBSCRIBE/retained-replay from anyone will already see this value/delivery (no
         // ack-before-visible race).
-        if (allowed) deliver_publish(topic, payload, qos, retain);
+        if (allowed) deliver_publish(resolved_topic, payload, qos, retain);
         if (qos == 1) {
             if (!allowed) return true;  // silent drop: no PUBACK
             std::vector<std::byte> ack;
@@ -875,6 +948,15 @@ private:
                 break;  // one queued copy per client-id even if multiple subs match the same topic
             }
         }
+    }
+
+    // Best-effort server->client DISCONNECT (MQTT 5 §3.14) — v5 only; a v4 session has no such packet, so
+    // this is a silent no-op for it (every call site's socket-close behavior is unchanged for v4).
+    void send_disconnect(Session& s, std::uint8_t reason_code) {
+        if (s.protocol_version != 5) return;
+        std::vector<std::byte> body{static_cast<std::byte>(reason_code)};
+        aero::transport::mqtt::put_empty_properties(body);
+        (void)s.send_packet(std::byte{0xE0}, body);
     }
 
     bool publish_to(Session& s, const std::string& topic, const std::vector<std::byte>& payload,

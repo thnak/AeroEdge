@@ -7,8 +7,9 @@
 //
 // Proves, over real sockets:
 //   (1) a v5 CONNECT (protocol level 0x05) with a small CONNECT Properties block (Session Expiry
-//       Interval) gets a v5-shaped CONNACK back: {ack_flags, reason_code, empty-properties-length},
-//       3 bytes — not the 2-byte v4 {session_present, rc} shape;
+//       Interval) gets a v5-shaped CONNACK back: {ack_flags, reason_code, properties...} — not the
+//       2-byte v4 {session_present, rc} shape; the Properties block itself now carries Topic Alias
+//       Maximum (M7.1, see below), so this is also where that gets decoded/asserted;
 //   (2) an unsupported protocol-level byte (neither 0x04 nor 0x05) is rejected with the 3.1.1-shaped
 //       2-byte CONNACK {0x00, 0x01} and the connection is then closed by the broker;
 //   (3) a v5 PUBLISH carrying a non-trivial Properties block (Payload Format Indicator + a User
@@ -36,6 +37,19 @@
 // TestClient in native_broker.cpp already does — this is not an oversight, it matches the brief's
 // actual in-scope task list (protocol negotiation + CONNECT/Will/PUBLISH/SUBSCRIBE properties PARSING,
 // not a general properties WRITER for every outbound packet).
+//
+// M7.1 (017 Open Questions follow-on) adds three more feature properties on top of M7's negotiation +
+// parsing groundwork, tested below in a dedicated section:
+//   - Session Expiry Interval TTL enforcement: a persistent session's stored state now actually expires
+//     (test_session_expiry_ttl_enforced), with a control case proving the pre-M7.1 "never expires when
+//     the property is absent" behavior is unregressed (test_session_expiry_absent_no_regression);
+//   - server-initiated DISCONNECT (0xE0) with a reason code, sent for exactly two v5 cases — keep-alive
+//     timeout (test_disconnect_reason_keep_alive_timeout, reason 0x8D) and session takeover
+//     (test_disconnect_reason_session_taken_over, reason 0x8E) — with a v4 control case proving the
+//     "just close the socket, no packet" behavior is unregressed there
+//     (test_disconnect_reason_keep_alive_timeout_v4_no_regression);
+//   - inbound Topic Alias resolution (test_topic_alias_inbound): establishing + reusing a client-side
+//     alias, plus the two invalid-alias DISCONNECT/0x94 paths (unknown alias, alias value 0).
 // Deterministic, exit-code-gated (0 = pass); bounded polling; clean shutdown.
 #include <atomic>
 #include <chrono>
@@ -71,6 +85,10 @@ void put_prop_byte(std::vector<std::byte>& recs, std::uint8_t id, std::uint8_t v
     recs.push_back(static_cast<std::byte>(id));
     recs.push_back(static_cast<std::byte>(v));
 }
+void put_prop_u16(std::vector<std::byte>& recs, std::uint8_t id, std::uint16_t v) {
+    recs.push_back(static_cast<std::byte>(id));
+    mqtt::put_u16_be(recs, v);
+}
 void put_prop_str_pair(std::vector<std::byte>& recs, std::uint8_t id, const std::string& k, const std::string& v) {
     recs.push_back(static_cast<std::byte>(id));
     mqtt::put_str(recs, k);
@@ -102,7 +120,7 @@ public:
     [[nodiscard]] RawAck connect_raw(std::uint16_t port, const std::string& client_id,
                                       std::uint8_t protocol_level,
                                       const std::vector<std::byte>& connect_props_records = {},
-                                      bool clean_session = true) {
+                                      bool clean_session = true, std::uint16_t keep_alive_s = 60) {
         RawAck result;
         auto fd = quark::pal::tcp_connect(quark::pal::ipv4_loopback, port);
         if (!fd) return result;
@@ -120,7 +138,7 @@ public:
         mqtt::put_str(vh, "MQTT");
         vh.push_back(static_cast<std::byte>(protocol_level));
         vh.push_back(static_cast<std::byte>(flags));
-        mqtt::put_u16_be(vh, 60);
+        mqtt::put_u16_be(vh, keep_alive_s);
         if (protocol_level == 0x05) put_properties(vh, connect_props_records);
         mqtt::put_str(vh, client_id);
         if (!mqtt::write_packet(fd_, std::byte{0x10}, vh)) return result;
@@ -192,6 +210,22 @@ public:
         return std::make_pair(std::move(topic), std::move(payload));
     }
 
+    // M7.1: an explicit, well-formed client->server DISCONNECT (0xE0, zero-length body — MQTT 5 §3.14.1
+    // "Normal disconnection" is legal with no reason code / properties at all) — distinct from close()
+    // below, which just drops the socket with no packet (an ungraceful end, exercising the Will/session-
+    // persistence "not a clean disconnect" path instead).
+    [[nodiscard]] bool disconnect_v5() { return mqtt::write_packet(fd_, std::byte{0xE0}, {}); }
+
+    // Generic "wait for a packet with this fixed-header type nibble, hand back its raw body" — used by
+    // the M7.1 DISCONNECT-reason-code tests (0xE0) where, unlike CONNACK/SUBACK above, there's no
+    // dedicated wait_for wrapper yet.
+    [[nodiscard]] std::optional<std::vector<std::byte>> wait_for_packet(std::uint8_t type_high_nibble,
+                                                                          int timeout_ms = 2000) {
+        auto pkt = wait_for(type_high_nibble, timeout_ms);
+        if (!pkt) return std::nullopt;
+        return pkt->body;
+    }
+
     void close() {
         running_.store(false, std::memory_order_release);
         if (reader_.joinable()) reader_.join();
@@ -246,15 +280,19 @@ private:
 
 // ===== unit coverage: the Properties codec itself, no socket involved ==================================
 // Round-trips a CONNECT-shaped properties block: Session Expiry Interval (0x11) + two User Properties
-// (0x26, repeatable) — proves read_properties both surfaces the ONE value this codec stores AND advances
-// `pos` exactly past every record, including the ones it doesn't store. A two-byte sentinel appended
-// after the properties block confirms `pos` lands exactly at the boundary, not short or long.
+// (0x26, repeatable) + Topic Alias (0x23, M7.1) — proves read_properties surfaces BOTH values this codec
+// stores AND advances `pos` exactly past every record, including the ones it doesn't store. A two-byte
+// sentinel appended after the properties block confirms `pos` lands exactly at the boundary, not short
+// or long. (Topic Alias doesn't legally co-occur with Session Expiry Interval in a real CONNECT — it's a
+// PUBLISH-only property — but read_properties() itself is packet-type-agnostic, so this is a fair
+// same-codepath test of the codec in isolation.)
 bool test_properties_codec() {
     bool ok = true;
     std::vector<std::byte> records;
     put_prop_u32(records, 0x11, 3600);                     // Session Expiry Interval
     put_prop_str_pair(records, 0x26, "k1", "v1");           // User Property #1
     put_prop_str_pair(records, 0x26, "k2", "v2");           // User Property #2
+    put_prop_u16(records, 0x23, 42);                        // Topic Alias (M7.1)
 
     std::vector<std::byte> body;
     mqtt::put_remaining_length(body, static_cast<std::uint32_t>(records.size()));
@@ -267,6 +305,7 @@ bool test_properties_codec() {
     ok &= parsed.has_value();
     ok &= parsed.has_value() && parsed->session_expiry_interval.has_value() &&
           *parsed->session_expiry_interval == 3600u;
+    ok &= parsed.has_value() && parsed->topic_alias.has_value() && *parsed->topic_alias == 42u;
     ok &= pos == body.size() - 2;  // stopped exactly at the sentinel, not before or past it
     ok &= pos < body.size() && std::to_integer<std::uint8_t>(body[pos]) == 0xAB;
 
@@ -288,7 +327,9 @@ bool test_properties_codec() {
 }
 
 // (1) v5 CONNECT with a CONNECT Properties block (Session Expiry Interval) -> v5-shaped CONNACK:
-// {ack_flags, reason_code, empty-properties-length} = 3 bytes, not v4's 2-byte {session_present, rc}.
+// {ack_flags, reason_code, properties...}, not v4's 2-byte {session_present, rc}. M7.1: the Properties
+// block is no longer empty — it now carries Topic Alias Maximum (0x22) = kTopicAliasMax (16), which this
+// test decodes and asserts (folds in item (6) of the M7.1 test plan: CONNACK Topic Alias Maximum).
 bool test_v5_connect_roundtrip() {
     bool ok = true;
     NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
@@ -301,11 +342,16 @@ bool test_v5_connect_roundtrip() {
     V5TestClient c;
     auto ack = c.connect_raw(port, "v5-basic", /*protocol_level=*/0x05, connect_props);
     ok &= ack.ok;
-    ok &= ack.body.size() == 3;
-    if (ack.body.size() == 3) {
+    // ack_flags(1) + reason_code(1) + properties: prop-length-varint(1, value=3) + {id(1) + u16 value(2)}.
+    ok &= ack.body.size() == 6;
+    if (ack.body.size() == 6) {
         ok &= std::to_integer<std::uint8_t>(ack.body[0]) == 0x00;  // ack_flags: no session present
         ok &= std::to_integer<std::uint8_t>(ack.body[1]) == 0x00;  // reason code: Success
-        ok &= std::to_integer<std::uint8_t>(ack.body[2]) == 0x00;  // empty properties (Property Length 0)
+        ok &= std::to_integer<std::uint8_t>(ack.body[2]) == 0x03;  // Property Length = 3
+        ok &= std::to_integer<std::uint8_t>(ack.body[3]) == 0x22;  // Topic Alias Maximum property id
+        const std::uint16_t topic_alias_max = static_cast<std::uint16_t>(
+            (std::to_integer<std::uint8_t>(ack.body[4]) << 8) | std::to_integer<std::uint8_t>(ack.body[5]));
+        ok &= topic_alias_max == 16;
     }
 
     c.close();
@@ -425,6 +471,224 @@ bool test_v5_subscribe_denied() {
     return ok;
 }
 
+// ===== 017 M7.1 coverage: Session Expiry Interval TTL, server DISCONNECT reason codes, inbound Topic
+//       Alias — see this file's banner for M7's own scope; the tests below extend it, not replace it. ===
+
+// (M7.1-1) A persistent (Clean Start=0) v5 session that sent Session Expiry Interval=1 (second) on
+// CONNECT, then cleanly DISCONNECTs, has its stored session state (subs/queued messages) discarded if
+// the client doesn't reconnect within that 1s TTL — CONNACK's session-present bit must be 0 on the late
+// reconnect (not restored), instead of today's "persistent session state never expires" default.
+bool test_session_expiry_ttl_enforced() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    std::vector<std::byte> connect_props;
+    put_prop_u32(connect_props, 0x11, 1);  // Session Expiry Interval = 1s
+
+    V5TestClient c1;
+    auto ack1 = c1.connect_raw(port, "ttl-client", /*protocol_level=*/0x05, connect_props,
+                               /*clean_session=*/false);
+    ok &= ack1.ok;
+    auto suback = c1.subscribe_v5("ttl/topic", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+    ok &= c1.disconnect_v5();
+    c1.close();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // > the 1s TTL
+
+    V5TestClient c2;
+    auto ack2 = c2.connect_raw(port, "ttl-client", /*protocol_level=*/0x05, /*connect_props_records=*/{},
+                               /*clean_session=*/false);
+    ok &= ack2.ok;
+    ok &= !ack2.body.empty() && (std::to_integer<std::uint8_t>(ack2.body[0]) & 0x01) == 0;  // NOT restored
+
+    c2.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.1-2, control) Same sequence as above but WITHOUT Session Expiry Interval on the first CONNECT —
+// confirms today's "a persistent session with no expiry property never expires" behavior is completely
+// unregressed by the TTL enforcement added above.
+bool test_session_expiry_absent_no_regression() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient c1;
+    auto ack1 = c1.connect_raw(port, "no-ttl-client", /*protocol_level=*/0x05, /*connect_props_records=*/{},
+                               /*clean_session=*/false);
+    ok &= ack1.ok;
+    auto suback = c1.subscribe_v5("no-ttl/topic", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+    ok &= c1.disconnect_v5();
+    c1.close();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // same wait as the enforced case above
+
+    V5TestClient c2;
+    auto ack2 = c2.connect_raw(port, "no-ttl-client", /*protocol_level=*/0x05, /*connect_props_records=*/{},
+                               /*clean_session=*/false);
+    ok &= ack2.ok;
+    ok &= !ack2.body.empty() && (std::to_integer<std::uint8_t>(ack2.body[0]) & 0x01) == 1;  // still restored
+
+    c2.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.1-3) A v5 session that goes silent past 1.5x its 1s keep-alive interval gets an explicit
+// server->client DISCONNECT (0xE0) with reason code 0x8D (Keep Alive timeout) before the broker closes
+// the socket — check keep_alive_expired()'s 1500ms/keep-alive-second multiplier in native_broker.hpp.
+bool test_disconnect_reason_keep_alive_timeout() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient c;
+    auto ack = c.connect_raw(port, "v5-keepalive", /*protocol_level=*/0x05, /*connect_props_records=*/{},
+                             /*clean_session=*/true, /*keep_alive_s=*/1);
+    ok &= ack.ok;
+
+    auto disc = c.wait_for_packet(0xE0, 3000);
+    ok &= disc.has_value();
+    ok &= disc.has_value() && !disc->empty() && std::to_integer<std::uint8_t>((*disc)[0]) == 0x8D;
+
+    c.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.1-4, control) Same keep-alive-timeout conditions but a v4 session — MQTT 3.1.1 has no DISCONNECT-
+// from-server packet, so this must stay byte-for-byte the pre-M7.1 "just close the socket" behavior: no
+// 0xE0 ever arrives, the broker just drops the connection.
+bool test_disconnect_reason_keep_alive_timeout_v4_no_regression() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient c;
+    auto ack = c.connect_raw(port, "v4-keepalive", /*protocol_level=*/0x04, /*connect_props_records=*/{},
+                             /*clean_session=*/true, /*keep_alive_s=*/1);
+    ok &= ack.ok;
+
+    auto disc = c.wait_for_packet(0xE0, 3000);
+    ok &= !disc.has_value();  // no DISCONNECT packet ever arrives for v4
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (!c.peer_closed() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ok &= c.peer_closed();  // but the broker did close the socket
+
+    c.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.1-5) A session-takeover CONNECT (3.1.4) under a client-id already live causes the FIRST session to
+// receive an explicit DISCONNECT (0xE0) with reason code 0x8E (Session taken over) before it tears down.
+bool test_disconnect_reason_session_taken_over() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient c1;
+    auto ack1 = c1.connect_raw(port, "takeover-client", 0x05);
+    ok &= ack1.ok;
+
+    V5TestClient c2;
+    auto ack2 = c2.connect_raw(port, "takeover-client", 0x05);
+    ok &= ack2.ok;
+
+    auto disc = c1.wait_for_packet(0xE0, 2000);
+    ok &= disc.has_value();
+    ok &= disc.has_value() && !disc->empty() && std::to_integer<std::uint8_t>((*disc)[0]) == 0x8E;
+
+    c1.close();
+    c2.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.1-6) Inbound Topic Alias (MQTT 5 §3.3.2.3.4): a v5 publisher establishes Topic Alias 5 on
+// "sensor/x" via a normal PUBLISH (topic name + alias together), then a SECOND PUBLISH with an EMPTY
+// topic name and only the alias resolves to the SAME topic — a subscriber sees both deliveries with the
+// correctly resolved topic (outbound PUBLISH framing is untouched by this milestone, see this file's
+// banner, so V5TestClient::wait_publish() needs no changes). A fresh connection that never established
+// an alias (or sends alias value 0, which is always invalid) gets 0xE0/0x94 DISCONNECT and nothing is
+// ever delivered.
+bool test_topic_alias_inbound() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "alias-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("sensor/x", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "alias-pub", 0x05).ok;
+
+    std::vector<std::byte> establish_props;
+    put_prop_u16(establish_props, 0x23, 5);  // Topic Alias = 5, establishing it on "sensor/x"
+    ok &= pub.publish_v5("sensor/x", "payload-1", /*qos=*/1, /*retain=*/false, /*is_v5=*/true, establish_props);
+
+    auto got1 = sub.wait_publish();
+    ok &= got1.has_value() && got1->first == "sensor/x" && got1->second == "payload-1";
+
+    std::vector<std::byte> alias_only_props;
+    put_prop_u16(alias_only_props, 0x23, 5);  // same alias, no topic name this time
+    ok &= pub.publish_v5("", "payload-2", /*qos=*/1, /*retain=*/false, /*is_v5=*/true, alias_only_props);
+
+    auto got2 = sub.wait_publish();
+    ok &= got2.has_value() && got2->first == "sensor/x" && got2->second == "payload-2";
+
+    pub.close();
+
+    // Unknown alias on a FRESH connection (never established there) -> 0xE0/0x94, nothing delivered.
+    V5TestClient unknown_pub;
+    ok &= unknown_pub.connect_raw(port, "alias-unknown", 0x05).ok;
+    std::vector<std::byte> unknown_props;
+    put_prop_u16(unknown_props, 0x23, 5);
+    ok &= unknown_pub.publish_v5("", "should-not-arrive", /*qos=*/0, /*retain=*/false, /*is_v5=*/true,
+                                 unknown_props);
+
+    auto disc1 = unknown_pub.wait_for_packet(0xE0, 2000);
+    ok &= disc1.has_value() && !disc1->empty() && std::to_integer<std::uint8_t>((*disc1)[0]) == 0x94;
+
+    auto stray1 = sub.wait_publish(500);
+    ok &= !stray1.has_value();
+
+    unknown_pub.close();
+
+    // Alias value 0 is always invalid (MQTT 5 §3.3.2.3.4), even with a non-empty topic name.
+    V5TestClient zero_pub;
+    ok &= zero_pub.connect_raw(port, "alias-zero", 0x05).ok;
+    std::vector<std::byte> zero_props;
+    put_prop_u16(zero_props, 0x23, 0);
+    ok &= zero_pub.publish_v5("sensor/x", "should-not-arrive-either", /*qos=*/0, /*retain=*/false,
+                              /*is_v5=*/true, zero_props);
+
+    auto disc2 = zero_pub.wait_for_packet(0xE0, 2000);
+    ok &= disc2.has_value() && !disc2->empty() && std::to_integer<std::uint8_t>((*disc2)[0]) == 0x94;
+
+    auto stray2 = sub.wait_publish(500);
+    ok &= !stray2.has_value();
+
+    zero_pub.close();
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -439,6 +703,13 @@ int main() {
         {"test_v5_publish_properties_roundtrip", test_v5_publish_properties_roundtrip},
         {"test_v5_subscribe_with_subscription_identifier", test_v5_subscribe_with_subscription_identifier},
         {"test_v5_subscribe_denied", test_v5_subscribe_denied},
+        {"test_session_expiry_ttl_enforced", test_session_expiry_ttl_enforced},
+        {"test_session_expiry_absent_no_regression", test_session_expiry_absent_no_regression},
+        {"test_disconnect_reason_keep_alive_timeout", test_disconnect_reason_keep_alive_timeout},
+        {"test_disconnect_reason_keep_alive_timeout_v4_no_regression",
+         test_disconnect_reason_keep_alive_timeout_v4_no_regression},
+        {"test_disconnect_reason_session_taken_over", test_disconnect_reason_session_taken_over},
+        {"test_topic_alias_inbound", test_topic_alias_inbound},
     };
     bool ok = true;
     for (const auto& t : tests) {

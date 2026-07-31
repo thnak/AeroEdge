@@ -194,7 +194,7 @@ principled exclusions the way v0.1 framed the whole breadth:
 | TLS | **shipped** | M5, `aero/pal/tls.hpp` (mbedTLS-backed `TlsServerContext`/`TlsSession`) — server-auth and optional mTLS (client-cert-required) southbound listener |
 | Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
-| MQTT 5 | **shipped**, protocol negotiation + properties parsing only | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; feature properties (Topic Alias, Shared Subs, Request/Response, Enhanced Auth) deferred, M7.1 |
+| MQTT 5 | **shipped**, protocol negotiation + properties parsing + a v1 slice of feature properties | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias — outbound Topic Alias (compression), Shared Subs, Request/Response, User Properties end-to-end, Message Expiry/Max Packet Size enforcement, and Enhanced Auth remain deferred |
 | RabbitMQ bridge | **shipped** | M8, `RabbitMqBridgeSink` (`broker/rabbitmq_bridge_sink.hpp`) over rabbitmq-c (AMQP 0-9-1); PUBLISH only, no TLS/SASL-EXTERNAL, no publisher confirms |
 | Kafka/Pulsar bridges | backlog | M8.1/M8.2 — needs new third-party deps (librdkafka / pulsar-client-cpp), native-extension-shaped (008) |
 | Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
@@ -329,11 +329,36 @@ adapts to unilaterally. Concretely:
   0x04/0x05, reject-if-neither with a 3.1.1-shaped CONNACK) and Properties PARSING for every
   packet type that carries them in this broker's supported set (CONNECT, CONNECT Will, PUBLISH,
   SUBSCRIBE) via a bounded, skip-unknown codec (`mqtt_codec.hpp`'s `read_properties`), plus the
-  v5-shaped CONNACK/SUBACK reason codes (0x00/0x84/0x86 CONNACK; 0x87 SUBACK). What's deferred,
-  because none of it is acted on yet even though the bytes are correctly parsed-and-skipped or
-  not yet parsed at all:
-  - **Topic Alias** (compression) — parsed-and-discarded (0x23), never applied to shrink repeat
-    PUBLISHes.
+  v5-shaped CONNACK/SUBACK reason codes (0x00/0x84/0x86 CONNACK; 0x87 SUBACK).
+
+  **Shipped this pass (v1 slice):**
+  - **Session Expiry Interval TTL enforcement** — `Session::session_expiry_interval` (parsed from
+    CONNECT Properties) is now stored, and `StoredSession::expires_at` (set in `teardown_session`
+    when that property was present) is checked when a persistent session's owner reconnects:
+    an elapsed TTL discards the stored subs/queued messages instead of restoring them
+    (`session_present` stays 0). A v4 session, or a v5 session that never sent the property,
+    behaves exactly as before — `expires_at` stays `nullopt`, meaning "never expires".
+  - **Server-initiated DISCONNECT with a reason code** — `NativeBroker::send_disconnect()` sends a
+    v5-only `0xE0` before the socket closes, for the two cases that actually need one: keep-alive
+    timeout (reason `0x8D`) and session takeover (reason `0x8E`, MQTT 3.1.4). (**Correction from
+    the prior version of this bullet:** it previously named protocol-version mismatch and auth
+    failure as the motivating cases for this feature — that was wrong. Both of those happen
+    *before* a successful CONNACK, and MQTT 5 §3.14 forbids the server from sending DISCONNECT
+    before CONNACK succeeds; they correctly carry their reason in the CONNACK's own reason code
+    instead, unchanged by this pass.)
+  - **Inbound (client→broker) Topic Alias** — a v5 PUBLISH may establish an alias (topic name +
+    Topic Alias property together) or reuse one (empty topic name + Topic Alias only);
+    `NativeBroker` resolves it per-session (`Session::topic_aliases`) *before* the ACL gate, so an
+    alias can't be used to bypass per-topic authorization. The broker advertises Topic Alias
+    Maximum = 16 (`kTopicAliasMax`) in CONNACK; alias 0, or a value above the max, or an
+    unestablished alias, gets `0xE0`/`0x94` (Topic Alias invalid) instead of being silently
+    dropped or misrouted.
+
+  **Still deferred** — none of it is acted on yet even though the bytes are correctly
+  parsed-and-skipped or not yet parsed at all:
+  - **Topic Alias** (compression, i.e. the *outbound* broker→subscriber direction) — the broker
+    never assigns/uses an alias of its own when delivering a PUBLISH; `publish_to()`'s wire shape
+    is unchanged.
   - **Shared Subscriptions** (`$share/...`) — no special-cased SUBSCRIBE filter handling.
   - **Request/Response pattern** — Response Topic (0x08) and Correlation Data (0x09) are parsed-
     and-skipped, never actually round-tripped to a responder.
@@ -343,14 +368,6 @@ adapts to unilaterally. Concretely:
     `NativeBroker::on_publish()`'s callback (would change that public signature).
   - **Message Expiry Interval / Maximum Packet Size enforcement** — parsed-and-skipped, no TTL or
     size-limit behavior wired to either.
-  - **Session Expiry Interval TTL enforcement** — the ONE property this codec actually surfaces to
-    a caller (`ParsedProperties::session_expiry_interval`) is parsed and noted in `handle_connect`
-    but not acted on: a v5 session's persistent state still lives exactly as long as any v3.1.1
-    session's does today (in-memory, no independent TTL).
-  - **Server-initiated DISCONNECT with a reason code** — every existing reject path (protocol-
-    version mismatch, auth failure) still just closes the socket after its reject-ack, matching
-    the posture every prior milestone already used; a real v5 DISCONNECT-with-reason-code send
-    path doesn't exist yet.
   Revisit any of these once a real device/integration actually needs it — same "don't build
   ahead of demand" posture M7's own predecessor entry held, now narrowed to what's left.
 - **M8.1/M8.2 — Kafka and Pulsar bridges.** M8 ships `RabbitMqBridgeSink` (rabbitmq-c, AMQP 0-9-1)
