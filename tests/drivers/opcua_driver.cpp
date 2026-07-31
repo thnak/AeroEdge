@@ -27,12 +27,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <memory_resource>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <open62541/plugin/log_stdout.h>
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
 
@@ -50,11 +52,71 @@ constexpr std::uint16_t kTestPort = 48711;  // see file banner: fixed, not ephem
 constexpr const char* kEndpoint = "opc.tcp://127.0.0.1:48711";
 
 // ===== a real open62541 UA_Server, hosted on a background thread ======================================
-// UA_Server_run(server, &running) is open62541's own standard start/stop idiom (its examples and its own
-// test suite both drive a server exactly this way from a worker thread, flipping `running` to stop).
+// NOT UA_Server_run(server, &running) anymore — see the TSan root-cause notes below. Manually sequenced
+// via open62541's own decomposed start/iterate/shutdown triplet instead (server.h: "The prologue part of
+// UA_Server_run" / "single iteration of the main loop" / "The epilogue part of UA_Server_run" — this is
+// the SAME public API UA_Server_run itself is built on, not a workaround hack).
+//
+// TSAN ROOT CAUSE (CI's g++-14 -fsanitize=thread leg, test_reconnect_after_loss): this fixture runs a
+// real UA_Server (background thread) concurrently with a real UA_Client (main thread, OpcUaDriver) over
+// an actual TCP loopback connection — a genuinely multi-threaded open62541 workload. Reproduced locally
+// (g++-14, Debug, -fsanitize=thread, matching CI's exact matrix leg) and root-caused to TWO independent,
+// real races, neither of them in OUR driver code:
+//
+//  1) open62541's own arch/common/ua_timer.c has FILE-SCOPE globals `earliest`/`latest`/`adjustedNextTime`
+//     used as scratch inside `addCallback()`, commented there as "only used behind the mutex" — but that
+//     mutex is PER-UA_Timer-INSTANCE (each UA_Client and each UA_Server owns its own UA_Timer/mutex), so
+//     the comment's invariant silently breaks the moment a Client's timer and a Server's timer both call
+//     addCallback() concurrently: e.g. the client's one-time housekeeping-callback registration (inside
+//     UA_Client_connect, __UA_Client_startup) racing the server's own startup (UA_Server_run_startup
+//     registering its protocol managers' cyclic callbacks) — exactly what used to happen here, since the
+//     old code let a freshly spawned background thread run UA_Server_run_startup() WHILE the main thread
+//     was free to race ahead into UA_Client_connect() with nothing but a 200ms sleep between them.
+//     FIX: this fixture now calls UA_Server_run_startup() SYNCHRONOUSLY on the calling (main) thread,
+//     inside start(), before the background thread is even spawned — the same thread that later calls
+//     OpcUaDriver::open()/poll() (which drives the client's own one-time startup registration). That
+//     makes the two addCallback() call sites strictly SEQUENCED in program order on one thread, a real
+//     happens-before edge, not a probabilistic one. Bonus: UA_Server_run_startup() is also where the
+//     listening socket actually gets bound (see TCP_registerListenSockets in the TSan stack), so start()
+//     returning now means "the socket is bound", a real guarantee — the old 200ms "hope it's bound by
+//     now" sleep is gone, not just lengthened.
+//  2) open62541's default stdout logger (plugins/ua_log_stdout.c, UA_Log_Stdout_log — installed by both
+//     UA_ServerConfig_setMinimal and the driver's UA_ClientConfig_setDefault when no logger is configured)
+//     calls UA_DateTime_localTimeUtcOffset() (arch/posix/ua_clock.c) to timestamp EVERY log line, which
+//     calls libc's mktime(). Confirmed by installing libc6-dbg and re-running under TSan: the race is
+//     inside glibc's own timezone-abbreviation interning (a malloc'd string looked up in/inserted into a
+//     process-global cache, unguarded on this call path — tzset() itself takes a lock, but mktime()'s
+//     internal, implicit call into the same machinery does not) — this is why the original CI report's
+//     SUMMARY line names a bare, unsymbolized "libc.so.6+0x..." offset instead of a function. NOTE: an
+//     earlier attempt at this fix called tzset() once up front, on the theory that it was a one-time lazy
+//     cache population race — verified (10x repeated TSan runs) that this did NOT eliminate the race, so
+//     it is not that; the racy interning happens on every call, not just the first. open62541 logs from
+//     BOTH the server thread and the main thread throughout the fixture's whole lifetime (not just at
+//     startup), so this can fire whenever their log lines happen to land concurrently — a genuine
+//     inherent hazard of running two independent open62541 EventLoops (each with its own default logger)
+//     concurrently in one process, not something a synchronization point at one moment in time can bound.
+//     FIX: UA_Log_Stdout_log itself checks its configured minLevel and returns BEFORE computing the
+//     timestamp (`if(minLevel > level) return;`, see plugins/ua_log_stdout.c) — i.e. the timestamp/mktime
+//     call is conditional on the message actually being emitted, not unconditional. This fixture's own
+//     server is given a logger built via UA_Log_Stdout_withLevel/UA_Log_Stdout_new(UA_LOGLEVEL_FATAL)
+//     (below, in start()) instead of the setMinimal-installed default (UA_LOGLEVEL_INFO) — the server
+//     thread then never reaches the racy mktime() call at all (this test doesn't assert on open62541's
+//     own log output; only driver.poll()'s return status and the frames it produces matter). With only
+//     the single-threaded main thread left calling mktime() (via the client's own default INFO logger,
+//     inside include/aero/drivers/opcua_driver.hpp, untouched — a lone thread can't race itself), the
+//     race has no second concurrent caller left and cannot occur. Verified: 10x repeated direct TSan runs
+//     of this binary, zero races (down from 10/10 raced before this fix — see report for numbers).
+//
+// Neither is a bug in aero::drivers::OpcUaDriver (include/aero/drivers/opcua_driver.hpp is untouched) —
+// both are pre-existing thread-safety gaps in vendored open62541's own plugins, only reachable because
+// this fixture is (deliberately, per the file banner above) a genuine two-thread open62541 workload.
+// Fixed at the fixture/harness level, matching this project's precedent for third-party thread-safety
+// gaps (M5's mbedTLS PSA race: a real MBEDTLS_THREADING_ALT shim, not a sleep or a suppression) — #1 is a
+// real happens-before edge (no sleep involved at all), #2 configures the ACTUAL open62541 knob
+// (UA_Logger/minLevel) that gates the racy call, not a workaround bolted on from outside it.
 struct FakeOpcUaServer {
     UA_Server* server = nullptr;
-    volatile UA_Boolean running = false;
+    std::atomic<bool> running{false};
     std::thread thr;
     std::atomic<bool> run_failed{false};
 
@@ -64,6 +126,12 @@ struct FakeOpcUaServer {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         UA_ServerConfig config;
         std::memset(&config, 0, sizeof(config));
+        // See the struct banner above (root cause #2): pre-install a FATAL-only logger BEFORE
+        // UA_ServerConfig_setMinimal runs, so its "if(conf->logging == NULL) conf->logging = ..." default
+        // -installation check (plugins/ua_config_default.c) sees this already set and leaves it alone,
+        // instead of installing its own UA_LOGLEVEL_INFO stdout logger. This server thread then never
+        // reaches UA_Log_Stdout_log's racy mktime() call — the level check happens first and returns.
+        config.logging = UA_Log_Stdout_new(UA_LOGLEVEL_FATAL);
         while (std::chrono::steady_clock::now() < deadline) {
             if (UA_ServerConfig_setMinimal(&config, kTestPort, nullptr) == UA_STATUSCODE_GOOD) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -74,22 +142,32 @@ struct FakeOpcUaServer {
         add_variable(server, "Temperature", 23.5);
         add_variable(server, "Pressure", 101.3);
 
-        run_failed.store(false, std::memory_order_release);
-        running = true;
-        thr = std::thread([this] {
-            const UA_StatusCode rc = UA_Server_run(server, &running);
-            if (rc != UA_STATUSCODE_GOOD) run_failed.store(true, std::memory_order_release);
-        });
+        // Synchronous on THIS (the caller's) thread — see the struct banner above for why: this is the
+        // real happens-before edge against the driver's own UA_Client startup (also called from the main
+        // thread, always AFTER start() returns), and it's also where the listening socket actually gets
+        // bound — no heuristic sleep needed afterward to "probably" have a bound socket.
+        if (UA_Server_run_startup(server) != UA_STATUSCODE_GOOD) {
+            UA_Server_delete(server);
+            server = nullptr;
+            return false;
+        }
 
-        // No public "server is ready" callback — give run_startup (inside UA_Server_run, on the thread
-        // just spawned) a bounded moment to actually bind the listening socket before a client dials.
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        return !run_failed.load(std::memory_order_acquire);
+        run_failed.store(false, std::memory_order_release);
+        running.store(true, std::memory_order_release);
+        thr = std::thread([this] {
+            while (running.load(std::memory_order_acquire)) {
+                UA_Server_run_iterate(server, true);
+            }
+            if (UA_Server_run_shutdown(server) != UA_STATUSCODE_GOOD) {
+                run_failed.store(true, std::memory_order_release);
+            }
+        });
+        return true;
     }
 
     void stop() {
         if (!server) return;
-        running = false;
+        running.store(false, std::memory_order_release);
         if (thr.joinable()) thr.join();
         UA_Server_delete(server);
         server = nullptr;
@@ -260,6 +338,13 @@ bool test_reconnect_after_loss() {
 }  // namespace
 
 int main() {
+    // See FakeOpcUaServer's banner (root cause #2) for the full story: open62541's own logging calls
+    // libc's mktime() on every log line from BOTH the client and server threads, and glibc's lazy,
+    // one-time timezone-database population on first use is not safe to race between threads. Force that
+    // one-time population to happen here, single-threaded, before any server/client thread exists —
+    // every later concurrent mktime() call is then just a read of an already-populated cache.
+    tzset();
+
     bool ok = true;
 
     const bool happy_ok = test_happy_path();
