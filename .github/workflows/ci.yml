@@ -62,18 +62,35 @@ jobs:
       - name: Diagnose open62541 archive (TEMPORARY — investigating M9b CI-only link failure)
         if: always()
         working-directory: AeroEdge
+        shell: bash --noprofile --norc -o pipefail {0}
         run: |
+          set +e
           echo "--- CMAKE_AR/CMAKE_RANLIB from cache ---"
-          grep -i "^CMAKE_AR\|^CMAKE_RANLIB" build/CMakeCache.txt || true
-          echo "--- which ar/llvm-ar on PATH ---"
-          which ar; which llvm-ar-20 2>/dev/null; which llvm-ar 2>/dev/null; true
+          grep -i "^CMAKE_AR\|^CMAKE_RANLIB" build/CMakeCache.txt
+          echo "--- ar/llvm-ar on PATH (each line independent, failures expected/ignored) ---"
+          which ar
+          which llvm-ar-20
+          which llvm-ar
           echo "--- archive file ---"
-          ls -la build/bin/libopen62541.a || true
-          file build/bin/libopen62541.a || true
+          ls -la build/bin/libopen62541.a
+          file build/bin/libopen62541.a
+          echo "--- largest object files that went into it (clang vs gcc size comparison) ---"
+          find build/_deps/open62541-build -name '*.o' -exec ls -la {} \; | sort -k5 -n -r | head -10
           echo "--- ar t (member listing) ---"
-          ar t build/bin/libopen62541.a 2>&1 | head -20 || true
+          ar t build/bin/libopen62541.a 2>&1 | head -30
+          echo "--- first 64 bytes of the archive, hex ---"
+          xxd build/bin/libopen62541.a | head -8
           echo "--- df -h (disk space) ---"
-          df -h /home/runner/work || true
+          df -h /home/runner/work
+          exit 0
+      - name: Upload open62541 archive for offline inspection (TEMPORARY)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libopen62541-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: AeroEdge/build/bin/libopen62541.a
+          if-no-files-found: warn
+          retention-days: 3
       - name: Test
         working-directory: AeroEdge
         run: ctest --test-dir build --output-on-failure
