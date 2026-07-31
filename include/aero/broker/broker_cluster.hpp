@@ -197,16 +197,24 @@ public:
         transport_.add_peer(peer, std::move(host), port);
     }
 
-    // Clean shutdown: defang the forwarder FIRST (so no in-flight PUBLISH on a NativeBroker session thread
-    // can call into a transport/engine mid-teardown), then stop the engine, then the transport. Idempotent
-    // (engine_ nulled after stop; TcpTransport::stop() is itself idempotent).
+    // Clean shutdown, in an order a TSan run actually exercises (a prior ordering — engine before
+    // transport — raced: transport_'s reader thread can still be mid-delivery into dist_router_/engine_,
+    // e.g. schedule_and_wake touching engine_'s Worker array, at the exact moment the main thread
+    // destroys that Engine, a real concurrent use-after-free-shaped race, not a false positive):
+    //   1. Defang the forwarder FIRST — no NEW outbound send from a NativeBroker session thread can start
+    //      touching transport_/engine_ after this.
+    //   2. Stop transport_ SECOND — TcpTransport::stop() synchronously JOINS its accept/reader threads
+    //      (tcp_transport.hpp), so once this call returns, no thread can still be mid-delivery into
+    //      dist_router_ (and so into engine_) — the inbound direction is now provably quiescent too.
+    //   3. Only THEN stop/destroy engine_ — nothing can still be touching it.
+    // Idempotent (engine_ nulled after stop; TcpTransport::stop() is itself idempotent).
     void stop() {
         if (broker_) broker_->set_peer_forwarder(nullptr);
+        transport_.stop();
         if (engine_) {
             engine_->stop();
             engine_.reset();
         }
-        transport_.stop();
     }
 
 private:

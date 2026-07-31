@@ -66,10 +66,13 @@ if(AERO_ENABLE_TLS)
     mbedtls
     GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
     GIT_TAG        v3.6.7  # latest v3.6.x LTS tag at the time this was pinned (checked empirically)
-    # See cmake/patch_mbedtls_toolchain.cmake's banner: neutralizes a real mbedTLS CMake false-positive
-    # (CMAKE_C_SIMULATE_ID=MSVC for Clang's GNU-style driver targeting the MSVC ABI, this project's
-    # Windows toolchain) that otherwise appends cl.exe-only `/W3 /utf-8` flags clang++.exe rejects.
-    PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_mbedtls_toolchain.cmake"
+    # See cmake/patch_mbedtls.cmake's banner: two independent fixes — (1) neutralizes a real mbedTLS
+    # CMake false-positive (CMAKE_C_SIMULATE_ID=MSVC for Clang's GNU-style driver targeting the MSVC
+    # ABI, this project's Windows toolchain) that otherwise appends cl.exe-only `/W3 /utf-8` flags
+    # clang++.exe rejects; (2) disables MBEDTLS_SELF_TEST, whose unused self-test instrumentation
+    # includes an unsynchronized global counter that TSan correctly flags as a real data race under
+    # concurrent TLS handshakes.
+    PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_mbedtls.cmake"
   )
   # Keep mbedTLS's own build lean/quiet, mirroring the QUARK_BUILD_TESTS/BENCH/SAMPLES OFF pattern right
   # below (add_subdirectory(QuarkCpp)) — force the cache vars mbedTLS's CMakeLists reads BEFORE
