@@ -22,6 +22,37 @@ endif()
 # ---- Threads (httplib + Quark worker lanes need pthreads) ------------------
 find_package(Threads REQUIRED)
 
+# ---- Pair the C compiler with CMAKE_CXX_COMPILER, if not already set -------
+# AeroEdge itself is pure C++ (LANGUAGES CXX above) and never triggered CMake's C-language detection
+# before mbedTLS (below): mbedTLS's own root CMakeLists.txt calls `project(MbedTLS C)`, so the FIRST
+# time C is ever probed in this build is inside that FetchContent_MakeAvailable call, lazily. Left to
+# its own devices, CMake probes whatever `cc` resolves to on PATH — on a system where that's GCC while
+# CMAKE_CXX_COMPILER is Clang (e.g. this project's CI matrix, which builds several legs with clang++-N
+# and passes Clang-only flags like `--gcc-install-dir=...` through CMAKE_CXX_FLAGS/CMAKE_EXE_LINKER_FLAGS
+# — the LATTER is language-agnostic and so also reaches the C-compiler-ABI probe), the probe can fail
+# outright (GCC's `cc` doesn't understand a Clang driver flag) or silently mix toolchains. Deriving a
+# same-family, same-version C compiler from CMAKE_CXX_COMPILER before mbedTLS ever asks for one avoids
+# both — this only fires when the caller didn't already pin CMAKE_C_COMPILER explicitly.
+if(NOT CMAKE_C_COMPILER)
+  get_filename_component(_aero_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  get_filename_component(_aero_cxx_name "${CMAKE_CXX_COMPILER}" NAME)
+  set(_aero_c_name "")
+  if(_aero_cxx_name MATCHES "^clang\\+\\+(.*)$")
+    set(_aero_c_name "clang${CMAKE_MATCH_1}")
+  elseif(_aero_cxx_name MATCHES "^g\\+\\+(.*)$")
+    set(_aero_c_name "gcc${CMAKE_MATCH_1}")
+  endif()
+  if(_aero_c_name)
+    if(_aero_cxx_dir)
+      set(CMAKE_C_COMPILER "${_aero_cxx_dir}/${_aero_c_name}" CACHE STRING
+          "C compiler, paired with CMAKE_CXX_COMPILER" FORCE)
+    else()
+      set(CMAKE_C_COMPILER "${_aero_c_name}" CACHE STRING
+          "C compiler, paired with CMAKE_CXX_COMPILER" FORCE)
+    endif()
+  endif()
+endif()
+
 # ---- TLS (mbedTLS, vendored via CMake FetchContent) -------------------------
 # M5 (TLS+ACL milestone): the native MQTT broker's TLS byte-channel PAL (include/aero/pal/tls.hpp) needs
 # a TLS library. mbedTLS is small, portable C designed for embedded/edge targets (unlike OpenSSL's much
