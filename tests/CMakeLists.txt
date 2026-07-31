@@ -353,3 +353,34 @@ target_compile_definitions(native_broker_security PRIVATE
   AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
 add_test(NAME native_broker_security COMMAND native_broker_security)
 set_tests_properties(native_broker_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M9a: multi-protocol southbound (018) ------------------------------------------------------------
+# ModbusTcpDriver (drivers/modbus_tcp_driver.hpp): a real Modbus-TCP PULL driver (FC03 Read Holding
+# Registers) over aero::pal::dial_tcp (Part 2) + a bounded-backoff reconnect (006 §8, first driver in
+# this tree to actually implement it). A hand-rolled fake Modbus-TCP server (same quark::pal::net +
+# aero::pal::poll primitives every other socket test in this tree uses) proves: (1) happy path — poll()
+# + ModbusDecodeNode (nodes/compute_nodes.hpp, reused not reimplemented) decode the canned register
+# values correctly; (2) an oversized register_count is rejected at open(), never silently truncated
+# (Part 1's Frame::payload_len/kMaxFramePayload budget); (3) connection loss mid-session is recovered by
+# a later poll() reconnecting, never wedging or crashing.
+add_executable(modbus_tcp_driver drivers/modbus_tcp_driver.cpp)
+target_link_libraries(modbus_tcp_driver PRIVATE aero::drivers aero::nodes aero::sdk quark::quark Threads::Threads)
+add_test(NAME modbus_tcp_driver COMMAND modbus_tcp_driver)
+set_tests_properties(modbus_tcp_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M9b: OPC-UA southbound (018) ---------------------------------------------------------------------
+# OpcUaDriver (drivers/opcua_driver.hpp): a real OPC-UA client PULL driver over open62541 (v1 scope: no
+# security, no Subscriptions, poll-configured-NodeIds only). A REAL open62541 UA_Server, hosted
+# in-process on a background thread (open62541's own standard test idiom — no external test infra
+# needed), proves: (1) happy path — poll() + JsonParseNode (nodes/compute_nodes.hpp, reused not
+# reimplemented — this driver serializes flat JSON precisely so JsonParseNode needs zero changes) decode
+# the canned variable-node values correctly; (2) a node_ids list too large for the 128-byte payload
+# budget is rejected at open(), never a silently truncated/corrupted frame; (3) connection loss
+# mid-session (the fake server stopped entirely) is recovered by a later poll() reconnecting once the
+# server comes back, never wedging or crashing. Links aero-thirdparty-opcua directly (not just
+# transitively via aero::drivers) because the test's OWN fake server code calls real UA_Server APIs.
+add_executable(opcua_driver drivers/opcua_driver.cpp)
+target_link_libraries(opcua_driver PRIVATE aero::drivers aero::nodes aero::sdk aero-thirdparty-opcua
+  quark::quark Threads::Threads)
+add_test(NAME opcua_driver COMMAND opcua_driver)
+set_tests_properties(opcua_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

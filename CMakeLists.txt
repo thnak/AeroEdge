@@ -53,6 +53,34 @@ if(NOT CMAKE_C_COMPILER)
   endif()
 endif()
 
+# ---- Pin CMAKE_AR/CMAKE_RANLIB to plain binutils -------------------------
+# M9b (open62541 vendoring) surfaced a gap this same C-compiler-pairing fix (above) didn't cover: CMake's
+# Clang toolchain detection (CMakeFindBinUtils) prefers a co-located `llvm-ar`/`llvm-ranlib` over plain
+# `ar`/`ranlib` WHEN ONE IS FOUND next to the compiler — which is environment-dependent (present on some
+# clang installs, e.g. a from-source apt.llvm.org install, absent on others). A build where AeroEdge's own
+# archives and mbedTLS's get built with one `ar` while a FetchContent'd subproject's own internal probing
+# resolves a DIFFERENT one (or vice versa) risks producing archives one linker invocation can't read
+# ("file format not recognized") — the same class of cross-toolchain mismatch the C-compiler pairing above
+# exists to prevent, just for the archiver instead of the compiler.
+#
+# UNCONDITIONAL, unlike the C-compiler pairing above: `project(AeroEdge LANGUAGES CXX ...)` on line 2 —
+# the very first line of this file — already runs CMake's full CXX toolchain detection, which resolves
+# and CACHEs CMAKE_AR/CMAKE_RANLIB as a side effect (CMakeFindBinUtils, invoked from
+# CMakeDetermineCXXCompiler). By the time ANY later line in this file runs, CMAKE_AR is therefore ALREADY
+# non-empty — an `if(NOT CMAKE_AR)` guard here is always false and silently never fires (this was the
+# first, broken version of this fix: it built and tested clean locally because the local repro's `ar`
+# happened to already resolve to plain binutils, then still failed in CI as "file format not recognized",
+# exactly the failure this block exists to prevent — CI's clang-20 install DOES have a co-located
+# `llvm-ar`/`llvm-ranlib` CMake's auto-detection picked instead). Force it every configure instead.
+find_program(_aero_ar_path NAMES ar)
+if(_aero_ar_path)
+  set(CMAKE_AR "${_aero_ar_path}" CACHE FILEPATH "Archiver, pinned to plain binutils ar" FORCE)
+endif()
+find_program(_aero_ranlib_path NAMES ranlib)
+if(_aero_ranlib_path)
+  set(CMAKE_RANLIB "${_aero_ranlib_path}" CACHE FILEPATH "Archive indexer, pinned to plain binutils ranlib" FORCE)
+endif()
+
 # ---- TLS (mbedTLS, vendored via CMake FetchContent) -------------------------
 # M5 (TLS+ACL milestone): the native MQTT broker's TLS byte-channel PAL (include/aero/pal/tls.hpp) needs
 # a TLS library. mbedTLS is small, portable C designed for embedded/edge targets (unlike OpenSSL's much
@@ -99,6 +127,85 @@ add_library(aero-thirdparty-tls INTERFACE)
 if(AERO_ENABLE_TLS)
   target_link_libraries(aero-thirdparty-tls INTERFACE mbedtls mbedx509 mbedcrypto)
   target_compile_definitions(aero-thirdparty-tls INTERFACE AERO_TLS_ENABLED=1)
+endif()
+
+# ---- OPC-UA (open62541, vendored via CMake FetchContent) -------------------
+# M9b (018 §Multi-protocol southbound): OpcUaDriver (aero/drivers/opcua_driver.hpp) is a pull-style
+# IDriver over open62541 (github.com/open62541/open62541), the standard open-source C99 OPC-UA SDK
+# (Mozilla Public License 2.0). v1 scope is a pure client-poll: connect to one known endpoint, read a
+# configured set of NodeIds — NO security policies (Sign/SignAndEncrypt is filed as backlog, not an
+# oversight), no Subscriptions/MonitoredItems, no browsing/method calls. Fetched (not vendored under
+# third_party/) for the same reason as mbedTLS above: a real C library that needs compiling, not just
+# #include'ing.
+#
+# NOTE: open62541 needs Python 3 at ITS OWN build time (its NodeSet/type code-generation step, see its
+# `find_package(Python3 REQUIRED)`) — the one genuinely new implicit toolchain requirement this adds to
+# the build; nothing else in this repo needs Python. A machine without a real Python 3 on PATH fails to
+# CONFIGURE this dependency (not a link/compile error) — a human needs to install one.
+option(AERO_ENABLE_OPCUA "Build with OPC-UA client support (open62541, fetched via CMake FetchContent)" ON)
+if(AERO_ENABLE_OPCUA)
+  include(FetchContent)
+  FetchContent_Declare(
+    open62541
+    GIT_REPOSITORY https://github.com/open62541/open62541.git
+    GIT_TAG        v1.4.11  # a real tagged v1.4.x LTS release — confirmed present via `git ls-remote
+                             # --tags` against the upstream repo at the time this was pinned
+  )
+  # Keep open62541's own build lean/quiet, mirroring the mbedTLS ENABLE_TESTING/QUARK_BUILD_TESTS
+  # pattern above — force the cache vars ITS CMakeLists.txt reads BEFORE FetchContent_MakeAvailable:
+  #   UA_ENABLE_ENCRYPTION "OFF" — a STRING cache var upstream (not BOOL: "OFF" or a plugin name like
+  #     "MBEDTLS"/"OPENSSL"), already OFF by default but forced explicitly here to document the v1 scope
+  #     decision: NO security policies, no TLS/crypto coupling for this dependency.
+  #   UA_BUILD_EXAMPLES / UA_BUILD_TOOLS / UA_BUILD_UNIT_TESTS OFF — only the client library, never
+  #     open62541's own example servers/clients, shell tools, or unit test suite as build targets (NOTE:
+  #     the real upstream option is UA_BUILD_UNIT_TESTS, not "UA_BUILD_TESTING" — verified against
+  #     open62541's own root CMakeLists.txt).
+  #   UA_ENABLE_DISCOVERY / UA_ENABLE_PUBSUB OFF — this driver dials one known endpoint directly (no LDS
+  #     discovery) and never touches PubSub; both default ON upstream and add real build weight for a
+  #     pure client-poll use case. UA_ENABLE_SUBSCRIPTIONS is left at its upstream default (ON): not
+  #     needed for v1 client-poll usage, but nothing here requires forcing it off either.
+  #   UA_ENABLE_PUBSUB_INFORMATIONMODEL OFF — forced alongside UA_ENABLE_PUBSUB: open62541's own
+  #     CMakeLists.txt hard-errors ("PubSub information model representation cannot be used with disabled
+  #     PubSub function") if this stays at ITS default (ON) while UA_ENABLE_PUBSUB is off — discovered
+  #     empirically configuring this exact build.
+  #   UA_ENABLE_DEBUG_SANITIZER OFF — defaults ON upstream, and when CMAKE_BUILD_TYPE is Debug (true for
+  #     every CI sanitizer leg, address/undefined AND thread) open62541's own CMakeLists.txt unconditionally
+  #     appends "-fsanitize=address -fsanitize=leak -fsanitize=undefined" to CMAKE_C_FLAGS/CMAKE_CXX_FLAGS
+  #     for ITS OWN sources, regardless of AEROEDGE_SANITIZER above — on the thread (TSan) leg this collides
+  #     head-on with this project's own -fsanitize=thread ("invalid argument '-fsanitize=address' not
+  #     allowed with '-fsanitize=thread'", a hard compile error, not a warning). AeroEdge's own top-level
+  #     AEROEDGE_SANITIZER option is this project's single source of truth for which sanitizer a CI leg
+  #     builds under; a vendored dependency silently opting itself into a DIFFERENT one is never correct
+  #     here, so this is forced off unconditionally, not just for the thread leg.
+  set(UA_ENABLE_ENCRYPTION "OFF" CACHE STRING "" FORCE)
+  set(UA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(UA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(UA_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_DISCOVERY OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_PUBSUB OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_PUBSUB_INFORMATIONMODEL OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_DEBUG_SANITIZER OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(open62541)
+endif()
+
+# aero-thirdparty-opcua — INTERFACE seam over open62541 (mirrors aero-thirdparty-tls's shape above). With
+# AERO_ENABLE_OPCUA on, links the real target open62541's own CMakeLists.txt registers — confirmed
+# empirically against v1.4.11's src/CMakeLists.txt: `add_library(open62541 ...)` plus `add_library(
+# open62541::open62541 ALIAS open62541)` — and defines AERO_OPCUA_ENABLED=1 so
+# include/aero/drivers/opcua_driver.hpp can compile its real open62541-backed implementation instead of
+# the "not compiled in" stub. With AERO_ENABLE_OPCUA off this stays a genuine no-op INTERFACE target: no
+# fetch attempted, no network access needed, nothing to link.
+add_library(aero-thirdparty-opcua INTERFACE)
+if(AERO_ENABLE_OPCUA)
+  target_link_libraries(aero-thirdparty-opcua INTERFACE open62541::open62541)
+  target_compile_definitions(aero-thirdparty-opcua INTERFACE AERO_OPCUA_ENABLED=1)
+  if(WIN32)
+    # open62541's Win32 networking layer pulls in <windows.h> transitively; without NOMINMAX its global
+    # min/max macros collide with std::min/std::max used elsewhere in this codebase (e.g.
+    # nodes/compute_nodes.hpp's MinMaxNode) in any translation unit that includes both — discovered
+    # empirically building tests/drivers/opcua_driver.cpp on Windows/clang.
+    target_compile_definitions(aero-thirdparty-opcua INTERFACE NOMINMAX)
+  endif()
 endif()
 
 # ---- Vendored, header-only third-party deps (already fetched under third_party/) -------------
@@ -175,9 +282,13 @@ target_link_libraries(aero-ext INTERFACE aero-core aero-nodes aero-thirdparty-js
 add_library(aero::ext ALIAS aero-ext)
 
 # aero-drivers — built-in driver library: the ingestion producer path over the Quark 024 stream (006).
+# M9b adds aero-thirdparty-opcua: OpcUaDriver (drivers/opcua_driver.hpp) needs the real open62541-backed
+# implementation (AERO_OPCUA_ENABLED + the open62541 lib) transitively wherever this library is linked
+# into a real binary (aero-runtime -> aero-runtime-daemon, and this library's own tests) — same reasoning
+# as aero-broker linking aero-thirdparty-tls for native_broker.hpp's TLS listener (M5).
 add_library(aero-drivers INTERFACE)
 target_include_directories(aero-drivers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-drivers INTERFACE aero-sdk)
+target_link_libraries(aero-drivers INTERFACE aero-sdk aero-thirdparty-opcua)
 add_library(aero::drivers ALIAS aero-drivers)
 
 # aero-transport — inter-actor transport ADAPTERS behind Quark's `Transport` seam (014, X1). The FIFO/

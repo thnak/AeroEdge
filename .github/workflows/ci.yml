@@ -19,9 +19,17 @@ jobs:
           - { compiler: g++-14,     build_type: Release, sanitizer: "",                 stdlib: "" }
           - { compiler: g++-14,     build_type: Debug,   sanitizer: "address,undefined", stdlib: "" }
           - { compiler: g++-14,     build_type: Debug,   sanitizer: "thread",            stdlib: "" }
-          - { compiler: clang++-20, build_type: Release, sanitizer: "",                 stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
-          - { compiler: clang++-20, build_type: Debug,   sanitizer: "address,undefined", stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
-          - { compiler: clang++-20, build_type: Debug,   sanitizer: "thread",            stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14" }
+          # -fuse-ld=lld (M9b): this runner's default BFD ld (GNU binutils, ubuntu-24.04's stock version)
+          # hits a real archive-parsing bug against the open62541 static archive ("error adding symbols:
+          # file format not recognized") — confirmed NOT corruption (a diagnostic step inspecting the
+          # exact same file moments later always showed a perfectly valid ar archive) and NOT transient
+          # (a same-job retry, re-linking the identical already-on-disk archive, failed identically) —
+          # deterministic on this runner's BFD ld, never reproducible on any local machine tried (newer
+          # binutils). LLVM's lld ships alongside clang-20 from the same apt.llvm.org install and sidesteps
+          # the buggy component entirely — the standard fix for this class of BFD ld archive bug.
+          - { compiler: clang++-20, build_type: Release, sanitizer: "",                 stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -fuse-ld=lld" }
+          - { compiler: clang++-20, build_type: Debug,   sanitizer: "address,undefined", stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -fuse-ld=lld" }
+          - { compiler: clang++-20, build_type: Debug,   sanitizer: "thread",            stdlib: "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -fuse-ld=lld" }
     name: ${{ matrix.compiler }} ${{ matrix.sanitizer == '' && 'release' || matrix.sanitizer }}
     steps:
       - uses: actions/checkout@v4

@@ -38,6 +38,8 @@
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
+#include "aero/drivers/modbus_tcp_driver.hpp"
+#include "aero/drivers/opcua_driver.hpp"
 #include "aero/ext/native_loader.hpp"
 #include "aero/mes/mes.hpp"
 #include "aero/mes/outbox.hpp"
@@ -127,6 +129,23 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     driver_reg.register_type("aero.driver.generator", [](const nlohmann::json&) {
         return std::make_unique<aero::drivers::GeneratorDriver>();
     });
+    // M9a (018 §Multi-protocol southbound): a real Modbus-TCP PULL driver. Config is read straight out
+    // of the deploy-time JSON at construction (not routed through DriverConfig's narrow endpoint/
+    // frame_count/rate_hz fields, per this driver's explicit constraint — see modbus_tcp_driver.hpp).
+    driver_reg.register_type("aero.driver.modbus_tcp", [](const nlohmann::json& c) {
+        return std::make_unique<aero::drivers::ModbusTcpDriver>(
+            c.value("host", std::string{}), c.value("port", std::uint16_t{502}),
+            c.value("unit_id", std::uint8_t{1}), c.value("start_address", std::uint16_t{0}),
+            c.value("register_count", std::uint16_t{8}));
+    });
+    // M9b (018 §Multi-protocol southbound): a real OPC-UA client PULL driver (open62541-backed). Config
+    // is read straight out of the deploy-time JSON at construction, same reasoning as
+    // aero.driver.modbus_tcp above (DriverConfig's narrow fields don't fit this driver's shape either).
+    driver_reg.register_type("aero.driver.opcua", [](const nlohmann::json& c) {
+        return std::make_unique<aero::drivers::OpcUaDriver>(
+            c.value("endpoint", std::string{}),
+            c.value("node_ids", std::vector<std::string>{}));
+    });
 }
 
 class Runtime {
@@ -210,6 +229,7 @@ public:
             aero::DriverConfig dcfg;
             dcfg.endpoint = "generator://seq";  // string literal — static storage, view-safe
             dcfg.frame_count = app.driver->config.value("frame_count", std::uint32_t{0});
+            dcfg.rate_hz = app.driver->config.value("rate_hz", std::uint32_t{0});
             if (d->driver->open(dcfg) != aero::DriverStatus::Ok) {
                 d->engine->stop();
                 return std::unexpected("driver.open failed for '" + app.driver->type_id + "'");
@@ -245,7 +265,8 @@ public:
                     while (ch.occupancy() > 0) {
                         quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 64);
                         while (const aero::Frame* f = batch.next()) {
-                            ref.tell(ReceiveFrame{f->raw});  // copy scalar out of the pinned slot
+                            // copy raw + byte payload out of the pinned slot (006 §4)
+                            ref.tell(ReceiveFrame{f->raw, f->payload_len, f->payload});
                             batch.retire();                  // return credit after the tell is enqueued
                         }
                     }
