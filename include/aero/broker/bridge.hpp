@@ -64,6 +64,7 @@
 #include "aero/broker/native_broker.hpp"  // aero::broker::topic_matches (free function only — no
                                            // dependency on NativeBroker's session/socket internals)
 #include "aero/nodes/expr_rule_node.hpp"  // aero::nodes::ExprRuleNode — reused, not reimplemented (008 §6)
+#include "aero/pal/net_dial.hpp"
 #include "aero/pal/poll.hpp"
 #include "aero/sdk/processing_context.hpp"
 #include "aero/transport/mqtt_codec.hpp"  // shared MQTT 3.1.1 wire codec (017 §9 N3)
@@ -240,29 +241,11 @@ private:
 
     static constexpr int kConnectTimeoutMs = 5000;
 
+    // Shared with MqttClientTransport::dial() via aero/pal/net_dial.hpp's dial_tcp() (was duplicated
+    // here verbatim — see that header's banner; same timeout, same per-candidate retry shape).
     static quark::pal::fd_t dial(const std::string& host, std::uint16_t port) {
-        addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        addrinfo* res = nullptr;
-        if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)
-            return quark::pal::invalid_fd;
-
-        quark::pal::fd_t fd = quark::pal::invalid_fd;
-        for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-            if (ai->ai_family != AF_INET) continue;
-            const auto* sin = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-            const std::uint64_t addr_u64 = ::ntohl(sin->sin_addr.s_addr);
-            auto attempt = quark::pal::tcp_connect(addr_u64, port);
-            if (!attempt) continue;
-            fd = *attempt;
-            const auto writable = aero::pal::wait_writable(fd, kConnectTimeoutMs);
-            if (writable && *writable && quark::pal::connect_result(fd)) break;
-            quark::pal::close_fd(fd);
-            fd = quark::pal::invalid_fd;
-        }
-        ::freeaddrinfo(res);
-        return fd;
+        auto r = aero::pal::dial_tcp(host, port, kConnectTimeoutMs);
+        return r ? *r : quark::pal::invalid_fd;
     }
 
     // Blocking CONNECT → CONNACK, exactly once at connect() (same "poll until running_ flips or the

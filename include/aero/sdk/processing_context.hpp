@@ -7,6 +7,8 @@
 // ownership rules are stable.
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -14,10 +16,24 @@
 
 namespace aero {
 
-// The triggering payload. Phase-1: a decoded scalar. Real frames are byte spans viewing the Quark
-// 024 stream slot / a shard payload arena, valid only for the flow's duration (006 §4).
+// Upper bound on a Frame's byte payload (006 §4). Fixed-size, no heap: a Frame flows through a Quark
+// 024 StreamActivation ring slot AND (as runtime::ReceiveFrame, runtime/flow_actor.hpp) an actor
+// mailbox `tell()`. The ring slot has no size cap, but the mailbox does: `tell()` sends through
+// quark::detail::MessagePool, whose inline cell is a HARD, non-configurable 192 bytes
+// (quark/detail/message_pool.hpp kMaxPayload — "oversized messages are a compile error at the send
+// site"). ReceiveFrame carries raw (8B) + payload_len (2B) + this array, so the array itself must stay
+// <= ~182B to keep the whole struct under 192B; 128 is a round number comfortably inside that budget
+// (leaves headroom, still 64 Modbus holding registers — ample for a single poll response, 006 §6.1).
+inline constexpr std::size_t kMaxFramePayload = 128;
+
+// The triggering payload: a scalar (raw) plus an optional byte payload for byte-oriented Source nodes
+// (ModbusDecodeNode, JsonParseNode — nodes/compute_nodes.hpp). Real frames are byte spans viewing the
+// Quark 024 stream slot / a shard payload arena, valid only for the flow's duration (006 §4). Kept
+// trivially copyable (fixed array, no heap) so it stays cheap to copy through the stream ring + mailbox.
 struct Frame {
     std::int64_t raw = 0;
+    std::uint16_t payload_len = 0;
+    std::array<std::byte, kMaxFramePayload> payload{};
 };
 
 // A named signal in the working set. `name` points at static storage (a node's literal).
@@ -72,7 +88,11 @@ struct ProcessingContext {
     // Reset for reuse on the next Command: clear buffers but KEEP capacity (amortized 0-alloc).
     void reset(const Frame* f) noexcept {
         frame = f;
-        payload.clear();
+        if (f != nullptr) {
+            payload.assign(reinterpret_cast<const char*>(f->payload.data()), f->payload_len);
+        } else {
+            payload.clear();
+        }
         tags.clear();
         output.clear();
         events.clear();

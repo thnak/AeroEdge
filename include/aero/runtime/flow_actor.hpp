@@ -8,6 +8,8 @@
 // so no per-Application actor subclass is ever generated (009 §2: topology is data, logic is compiled).
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 #include "aero/core/edge_actor.hpp"
@@ -20,8 +22,12 @@ namespace aero::runtime {
 
 // Command: one inbound frame to run through the bound flow. The driver bridge converts each streamed
 // frame into a ReceiveFrame tell (mailbox FIFO + Sequential → deterministic in-order execution, I2).
+// Carries the same raw/payload_len/payload shape as aero::Frame (006 §4) — ReceiveFrame is the mailbox
+// copy of a stream-slot Frame, so FlowActor::handle rebuilds the Frame from these fields verbatim.
 struct ReceiveFrame {
     std::int64_t raw = 0;
+    std::uint16_t payload_len = 0;
+    std::array<std::byte, aero::kMaxFramePayload> payload{};
 };
 
 // Command: hot-reload the bound flow (009 §4). Carries a pointer to a new CompiledFlow that the
@@ -55,7 +61,7 @@ struct FlowActor : aero::EdgeActorBase<FlowActor, quark::Sequential> {
     using protocol = quark::Protocol<ReceiveFrame, ReloadFlow, quark::Ask<GetStatus, FlowStatus>>;
 
     void handle(const ReceiveFrame& cmd) noexcept {
-        process_frame(aero::Frame{cmd.raw});
+        process_frame(aero::Frame{cmd.raw, cmd.payload_len, cmd.payload});
         output_sum_ += last_output();  // tally after commit — the last committed output for this frame
     }
 
