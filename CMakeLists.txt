@@ -53,7 +53,7 @@ if(NOT CMAKE_C_COMPILER)
   endif()
 endif()
 
-# ---- Pin CMAKE_AR/CMAKE_RANLIB to plain binutils, if not already set -------
+# ---- Pin CMAKE_AR/CMAKE_RANLIB to plain binutils -------------------------
 # M9b (open62541 vendoring) surfaced a gap this same C-compiler-pairing fix (above) didn't cover: CMake's
 # Clang toolchain detection (CMakeFindBinUtils) prefers a co-located `llvm-ar`/`llvm-ranlib` over plain
 # `ar`/`ranlib` WHEN ONE IS FOUND next to the compiler — which is environment-dependent (present on some
@@ -61,20 +61,24 @@ endif()
 # archives and mbedTLS's get built with one `ar` while a FetchContent'd subproject's own internal probing
 # resolves a DIFFERENT one (or vice versa) risks producing archives one linker invocation can't read
 # ("file format not recognized") — the same class of cross-toolchain mismatch the C-compiler pairing above
-# exists to prevent, just for the archiver instead of the compiler. Force plain `ar`/`ranlib` (the
-# universally-understood, GNU-ld-compatible baseline every toolchain here already reads fine) unless the
-# caller pinned CMAKE_AR/CMAKE_RANLIB explicitly.
-if(NOT CMAKE_AR)
-  find_program(_aero_ar_path NAMES ar)
-  if(_aero_ar_path)
-    set(CMAKE_AR "${_aero_ar_path}" CACHE FILEPATH "Archiver, pinned to plain binutils ar" FORCE)
-  endif()
+# exists to prevent, just for the archiver instead of the compiler.
+#
+# UNCONDITIONAL, unlike the C-compiler pairing above: `project(AeroEdge LANGUAGES CXX ...)` on line 2 —
+# the very first line of this file — already runs CMake's full CXX toolchain detection, which resolves
+# and CACHEs CMAKE_AR/CMAKE_RANLIB as a side effect (CMakeFindBinUtils, invoked from
+# CMakeDetermineCXXCompiler). By the time ANY later line in this file runs, CMAKE_AR is therefore ALREADY
+# non-empty — an `if(NOT CMAKE_AR)` guard here is always false and silently never fires (this was the
+# first, broken version of this fix: it built and tested clean locally because the local repro's `ar`
+# happened to already resolve to plain binutils, then still failed in CI as "file format not recognized",
+# exactly the failure this block exists to prevent — CI's clang-20 install DOES have a co-located
+# `llvm-ar`/`llvm-ranlib` CMake's auto-detection picked instead). Force it every configure instead.
+find_program(_aero_ar_path NAMES ar)
+if(_aero_ar_path)
+  set(CMAKE_AR "${_aero_ar_path}" CACHE FILEPATH "Archiver, pinned to plain binutils ar" FORCE)
 endif()
-if(NOT CMAKE_RANLIB)
-  find_program(_aero_ranlib_path NAMES ranlib)
-  if(_aero_ranlib_path)
-    set(CMAKE_RANLIB "${_aero_ranlib_path}" CACHE FILEPATH "Archive indexer, pinned to plain binutils ranlib" FORCE)
-  endif()
+find_program(_aero_ranlib_path NAMES ranlib)
+if(_aero_ranlib_path)
+  set(CMAKE_RANLIB "${_aero_ranlib_path}" CACHE FILEPATH "Archive indexer, pinned to plain binutils ranlib" FORCE)
 endif()
 
 # ---- TLS (mbedTLS, vendored via CMake FetchContent) -------------------------
