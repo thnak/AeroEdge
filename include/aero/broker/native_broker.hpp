@@ -38,6 +38,11 @@
 // PORTABILITY / REUSE: built on quark::pal::net + aero::pal::poll (this session's PAL work) and the
 // MQTT wire codec shared with `MqttClientTransport` (mqtt_codec.hpp, 017 §9 N3) — no new socket or
 // framing code, only the server-side session state machine and topic routing are new.
+//
+// M5 (TLS+ACL milestone): adds an optional TLS listener (aero/pal/tls.hpp, mbedTLS-backed) alongside the
+// plaintext one, and an optional CONNECT-time Authenticator + per-topic Authorizer (aero/broker/acl.hpp).
+// Both are OFF by default (Config::tls unset, Config::authenticate/authorizer unset) — a Config that sets
+// neither behaves EXACTLY as Phase 1/Milestone 1 did, no exceptions. See Config's own field comments.
 #pragma once
 
 #include <atomic>
@@ -49,11 +54,13 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "pal/net.hpp"  // quark::pal::* — fd_t, tcp_listen/accept_one/recv_some/send_some/...
@@ -62,7 +69,11 @@
 #include <arpa/inet.h>  // inet_pton (Windows: transitively via pal/net.hpp's ws2tcpip.h)
 #endif
 
+#include "aero/broker/acl.hpp"          // Authorizer/Authenticator/AclAction/TopicAclAuthorizer (M5)
+#include "aero/broker/topic_match.hpp"  // topic_matches() — shared with acl.hpp (017 N3 precedent)
 #include "aero/pal/poll.hpp"
+#include "aero/pal/tls.hpp"              // TlsServerContext/TlsSession (M5)
+#include "aero/transport/io_channel.hpp"  // PlainChannel/TlsChannel — Session's channel seam (M5)
 #include "aero/transport/mqtt_codec.hpp"
 
 namespace aero::broker {
@@ -71,37 +82,26 @@ struct Config {
     std::string bind_host = "0.0.0.0";  // interface to listen on
     std::uint16_t listen_port = 1883;   // MQTT's conventional plaintext port; 0 => ephemeral
     int backlog = 64;
-};
 
-// MQTT topic-filter matching (3.1.1 §4.7): `+` matches exactly one level, `#` matches the rest of the
-// topic (including zero further levels) and must be the filter's last level to have any effect beyond
-// literal comparison. Pure function, independently testable.
-[[nodiscard]] inline bool topic_matches(std::string_view filter, std::string_view topic) noexcept {
-    auto split = [](std::string_view s) {
-        std::vector<std::string_view> parts;
-        std::size_t start = 0;
-        for (;;) {
-            const auto pos = s.find('/', start);
-            if (pos == std::string_view::npos) {
-                parts.push_back(s.substr(start));
-                break;
-            }
-            parts.push_back(s.substr(start, pos - start));
-            start = pos + 1;
-        }
-        return parts;
-    };
-    const auto f = split(filter);
-    const auto t = split(topic);
-    std::size_t i = 0;
-    for (; i < f.size(); ++i) {
-        if (f[i] == "#") return true;         // matches everything remaining, including zero levels
-        if (i >= t.size()) return false;      // filter has more levels than topic, and it's not '#'
-        if (f[i] == "+") continue;            // matches exactly this one level
-        if (f[i] != t[i]) return false;
-    }
-    return i == t.size();  // no '#' consumed the tail => topic must end exactly where the filter does
-}
+    // M5: unset (default) => no TLS listener at all — start()/stop() behave exactly as before this
+    // milestone. Set it to bind a SECOND listener on `tls_port` that speaks TLS (mbedTLS handshake via
+    // aero::pal::tls::TlsServerContext) before MQTT framing begins; `ca_file` inside ServerConfig, if
+    // non-empty, additionally requires + verifies a client certificate (mTLS). The plaintext listener on
+    // `listen_port` keeps running unchanged alongside it — this is additive, not a replacement.
+    std::optional<aero::pal::tls::ServerConfig> tls;
+    std::uint16_t tls_port = 8883;  // MQTT's conventional TLS port; only relevant when `tls` is set
+
+    // M5: unset (default) => every CONNECT is accepted with no credential check, exactly as before this
+    // milestone (Session::principal stays "anonymous"). Set it to gate CONNECT on username/password —
+    // nullopt from the callback rejects the CONNECT (CONNACK rc=0x04) BEFORE any session state is
+    // touched; a returned string becomes the session's `principal`, consulted by `authorizer` below.
+    Authenticator authenticate;
+
+    // M5: unset (default) => every PUBLISH/SUBSCRIBE is allowed, exactly as before this milestone. Set it
+    // (e.g. a TopicAclAuthorizer) to gate PUBLISH/SUBSCRIBE per (principal, topic, action) — see
+    // handle_subscribe/handle_publish/handle_pubrel below for exactly where/how it's consulted.
+    std::shared_ptr<Authorizer> authorizer;
+};
 
 class NativeBroker {
 public:
@@ -125,21 +125,54 @@ public:
 
         if (auto p = quark::pal::local_port(listen_fd_)) resolved_port_ = *p;
 
+        // M5: a second, TLS-speaking listener — additive to the plaintext one above, never a replacement.
+        // Fail-closed to match the plaintext listener's own posture: if cfg_.tls is set but the TLS
+        // context or the second listener can't be stood up, start() fails outright (no half-started
+        // broker with a silently-missing TLS port).
+        if (cfg_.tls) {
+            auto ctx = aero::pal::tls::TlsServerContext::create(*cfg_.tls);
+            if (!ctx) {
+                quark::pal::close_fd(listen_fd_);
+                listen_fd_ = quark::pal::invalid_fd;
+                return std::unexpected("native broker: tls context create failed: " + ctx.error());
+            }
+            tls_ctx_ = std::make_unique<aero::pal::tls::TlsServerContext>(std::move(*ctx));
+
+            auto lfd_tls = quark::pal::tcp_listen(addr_u64, cfg_.tls_port, cfg_.backlog);
+            if (!lfd_tls) {
+                quark::pal::close_fd(listen_fd_);
+                listen_fd_ = quark::pal::invalid_fd;
+                tls_ctx_.reset();
+                return std::unexpected("native broker: tls tcp_listen failed: " + lfd_tls.error().message());
+            }
+            listen_fd_tls_ = *lfd_tls;
+            if (auto p = quark::pal::local_port(listen_fd_tls_)) resolved_port_tls_ = *p;
+        }
+
         running_.store(true, std::memory_order_release);
         accept_thread_ = std::thread([this] { accept_loop(); });
+        if (cfg_.tls) accept_thread_tls_ = std::thread([this] { accept_loop_tls(); });
         return {};
     }
 
-    // Stop the accept loop, close every session + the listener, join every thread. Idempotent.
+    // Stop the accept loop(s), close every session + the listener(s), join every thread. Idempotent.
     // ORDER MATTERS (TSan-clean, mirrors tcp_transport.hpp): flip running_ false, join the accept
-    // thread FIRST (it exits within one poll timeout and stops spawning new sessions), then close the
-    // listener, then join every session thread (each notices running_ within its own poll timeout).
+    // thread(s) FIRST (each exits within one poll timeout and stops spawning new sessions), then close
+    // the listener(s), then join every session thread (each notices running_ within its own poll
+    // timeout). The TLS accept thread/listener follow the exact same ordering as the plaintext ones —
+    // when cfg_.tls was never set, accept_thread_tls_ was never started (not joinable) and
+    // listen_fd_tls_ stays invalid_fd, so every TLS-specific step below is a harmless no-op.
     void stop() {
         if (!running_.exchange(false, std::memory_order_acq_rel)) return;
         if (accept_thread_.joinable()) accept_thread_.join();
+        if (accept_thread_tls_.joinable()) accept_thread_tls_.join();
         if (listen_fd_ != quark::pal::invalid_fd) {
             quark::pal::close_fd(listen_fd_);
             listen_fd_ = quark::pal::invalid_fd;
+        }
+        if (listen_fd_tls_ != quark::pal::invalid_fd) {
+            quark::pal::close_fd(listen_fd_tls_);
+            listen_fd_tls_ = quark::pal::invalid_fd;
         }
         {
             std::lock_guard<std::mutex> g(sessions_mu_);
@@ -148,9 +181,15 @@ public:
             session_threads_.clear();
             sessions_.clear();
         }
+        tls_ctx_.reset();
     }
 
     [[nodiscard]] std::uint16_t listen_port() const noexcept { return resolved_port_; }
+
+    // M5: the TLS listener's resolved port (0 until start() with cfg_.tls set has run; meaningful when
+    // cfg_.tls_port == 0, i.e. "pick an ephemeral port", the way listen_port() already works for the
+    // plaintext listener).
+    [[nodiscard]] std::uint16_t listen_port_tls() const noexcept { return resolved_port_tls_; }
 
     // Phase 1's entire ingestion seam (017 §"Phase 1 scope"): fires for every PUBLISH this broker
     // instance handles (whether or not any subscriber is present), from whichever session's reader
@@ -203,18 +242,36 @@ private:
         bool retain = false;
     };
 
-    // One Session per accepted connection. io_mu_ serializes every write to `fd` — a PUBLISH fanned
+    // One Session per accepted connection. io_mu_ serializes every write to `channel` — a PUBLISH fanned
     // out to this session from ANOTHER session's reader thread must not interleave on the wire with
     // this session's own SUBACK/PINGRESP/PUBACK writes.
     //
     // Everything below `subs`/`subs_mu` (client_id, keep_alive_s, clean_session, last_activity, the Will
-    // fields, qos2_inflight) is touched ONLY by this session's own reader thread (session_loop runs one
-    // thread per Session, and MQTT packets on one connection are inherently serialized) — no lock needed.
-    // `kicked` is the one exception: a DIFFERENT session's thread (a session-takeover CONNECT, 3.1.4)
-    // sets it, so it alone is atomic.
+    // fields, qos2_inflight, principal) is touched ONLY by this session's own reader thread (session_loop
+    // runs one thread per Session, and MQTT packets on one connection are inherently serialized) — no
+    // lock needed. `kicked` is the one exception: a DIFFERENT session's thread (a session-takeover
+    // CONNECT, 3.1.4) sets it, so it alone is atomic.
+    //
+    // M5: `channel` is EITHER a PlainChannel OR a TlsChannel, decided once at accept time (accept_loop()
+    // vs accept_loop_tls()) and never changed after — a std::variant is the idiomatic shape for "exactly
+    // one of these, chosen once" (io_channel.hpp's own banner anticipated this exact use). `tls_owner`
+    // heap-owns the TlsSession when this is a TLS session (null for plaintext) so its address stays
+    // stable across any Session moves — TlsChannel only ever holds a non-owning observer pointer into it
+    // (mirrors tls.hpp's own heap-ownership-for-address-stability reasoning, see that file's banner).
+    // `fd` is kept alongside the channel (not folded away) because session_loop's keep-alive poll
+    // (aero::pal::wait_readable(s->fd, 200)) and teardown's close_fd() both need the raw OS fd regardless
+    // of channel kind — TLS still rides a real socket underneath.
     struct Session {
-        explicit Session(quark::pal::fd_t f) : fd(f) {}
+        explicit Session(quark::pal::fd_t f) : fd(f), channel(aero::transport::PlainChannel{f}) {}
+        Session(quark::pal::fd_t f, aero::pal::tls::TlsSession tls_session)
+            : fd(f),
+              tls_owner(std::make_unique<aero::pal::tls::TlsSession>(std::move(tls_session))),
+              channel(aero::transport::TlsChannel{tls_owner.get()}) {}
+
         quark::pal::fd_t fd;
+        std::unique_ptr<aero::pal::tls::TlsSession> tls_owner;  // non-null only for a TLS session
+        std::variant<aero::transport::PlainChannel, aero::transport::TlsChannel> channel;
+
         std::mutex io_mu;
         std::mutex subs_mu;
         std::vector<Subscription> subs;
@@ -231,11 +288,14 @@ private:
         std::uint8_t will_qos = 0;
         bool will_retain = false;
 
+        std::string principal = "anonymous";  // M5: set from Config::authenticate's return, else default
+
         std::unordered_map<std::uint16_t, PendingQos2> qos2_inflight;
 
         bool send_packet(std::byte type_flags, const std::vector<std::byte>& body) {
             std::lock_guard<std::mutex> g(io_mu);
-            return aero::transport::mqtt::write_packet(fd, type_flags, body);
+            return std::visit(
+                [&](auto& ch) { return aero::transport::mqtt::write_packet(ch, type_flags, body); }, channel);
         }
     };
 
@@ -275,6 +335,29 @@ private:
         }
     }
 
+    // M5: mirrors accept_loop() exactly except for the one real difference — a TLS handshake
+    // (tls_ctx_->accept()) must complete BEFORE the Session is constructed/registered and session_loop
+    // spawned, since session_loop assumes MQTT framing can start immediately. A handshake failure/timeout
+    // just closes the fd and keeps accepting (matches accept_loop()'s own tolerant "not this one, try the
+    // next" posture on a failed accept_one) — it must never crash or wedge this loop.
+    void accept_loop_tls() {
+        while (running_.load(std::memory_order_acquire)) {
+            const auto ready = aero::pal::wait_readable(listen_fd_tls_, 200);
+            if (!ready || !*ready) continue;  // timeout/err → re-check running_
+            auto cfd = quark::pal::accept_one(listen_fd_tls_);
+            if (!cfd) continue;
+            auto handshake = tls_ctx_->accept(*cfd);
+            if (!handshake) {
+                quark::pal::close_fd(*cfd);
+                continue;  // handshake failed/timed out — not this connection's fault to wedge the loop
+            }
+            auto session = std::make_shared<Session>(*cfd, std::move(*handshake));
+            std::lock_guard<std::mutex> g(sessions_mu_);
+            sessions_.push_back(session);
+            session_threads_.emplace_back([this, session] { session_loop(session); });
+        }
+    }
+
     // 0 == no keep-alive timeout at all (3.1.1 §3.1.2.10, spec-legal). Otherwise the server "MAY"
     // disconnect after 1.5x the keep-alive interval of silence — we do, deterministically.
     [[nodiscard]] static bool keep_alive_expired(const Session& s) noexcept {
@@ -301,7 +384,8 @@ private:
                 continue;
             }
 
-            auto pkt = aero::transport::mqtt::read_packet(s->fd, running_);
+            auto pkt = std::visit(
+                [&](auto& ch) { return aero::transport::mqtt::read_packet(ch, running_); }, s->channel);
             if (!pkt) break;  // peer closed / error / running flipped false
             s->last_activity = std::chrono::steady_clock::now();  // ANY inbound packet refreshes it
             const std::uint8_t type = pkt->type_flags & 0xF0;
@@ -417,14 +501,16 @@ private:
                                 b.begin() + static_cast<std::ptrdiff_t>(pos + wm_len));
             pos += wm_len;
         }
-        // Username/password (if present) are only skipped over, never consulted — v1 has no
-        // authentication (Phase 1 scope banner) — but they still have to be parsed past so `pos` would be
-        // correctly aligned for anything that follows (defensive; nothing currently does).
+        // Username/password (if present): M5 materializes them (previously only skipped over — Phase 1
+        // had no authentication at all) so Config::authenticate below can consult them. Still parsed past
+        // unconditionally either way so `pos` stays correctly aligned for anything that follows.
+        std::string username, password;
         if (connect_flags & 0x80) {  // username flag
             if (pos + 2 > b.size()) return false;
             const std::uint16_t ulen = read_u16(pos);
             pos += 2;
             if (pos + ulen > b.size()) return false;
+            username.assign(reinterpret_cast<const char*>(b.data() + pos), ulen);
             pos += ulen;
         }
         if (connect_flags & 0x40) {  // password flag
@@ -432,7 +518,27 @@ private:
             const std::uint16_t plen = read_u16(pos);
             pos += 2;
             if (pos + plen > b.size()) return false;
+            password.assign(reinterpret_cast<const char*>(b.data() + pos), plen);
             pos += plen;
+        }
+
+        // M5 auth gate: this MUST be the first thing after parsing that can cause an early return — a
+        // rejected CONNECT must leave ZERO trace in broker state (no client_id, no has_will, no
+        // client_sessions_/stored_sessions_ entry). Everything below this point mutates one of those, so
+        // nothing below may run before this check. Unset Config::authenticate ⇒ unchanged Phase-1
+        // behavior (every CONNECT accepted, principal stays "anonymous").
+        if (cfg_.authenticate) {
+            auto principal = cfg_.authenticate(username, password);
+            if (!principal) {
+                // 3.2.2.3: CONNACK body is {session_present_byte, return_code_byte}; rc=0x04 = "bad
+                // username or password". session_present is always 0 here — nothing was ever restored.
+                // Best-effort send (write failure doesn't change the outcome: the connection closes
+                // either way) then close, WITHOUT touching client_id/has_will/client_sessions_/
+                // stored_sessions_ — s->client_id etc. are still their pre-CONNECT defaults.
+                (void)s->send_packet(std::byte{0x20}, {std::byte{0x00}, std::byte{0x04}});
+                return false;
+            }
+            s->principal = std::move(*principal);
         }
 
         s->client_id = client_id;
@@ -509,8 +615,19 @@ private:
             const std::uint8_t requested_qos = std::to_integer<std::uint8_t>(b[pos]);
             pos += 1;
             const std::uint8_t qos = requested_qos > 1 ? 1 : requested_qos;  // v1 ceiling: QoS 1
-            added.push_back(Subscription{filter, qos});
-            granted.push_back(static_cast<std::byte>(qos));
+
+            // M5 ACL gate: unset Config::authorizer ⇒ unchanged Phase-1 behavior (everything granted). A
+            // denied filter still gets a SUBACK byte (3.9.3 requires one per filter) but it's 0x80
+            // (failure) and the filter is NOT added to `added` — so it never enters s.subs and can never
+            // match in route_publish()/the retained-replay loop below.
+            const bool allowed =
+                !cfg_.authorizer || cfg_.authorizer->allow(s.principal, filter, AclAction::Subscribe);
+            if (allowed) {
+                added.push_back(Subscription{filter, qos});
+                granted.push_back(static_cast<std::byte>(qos));
+            } else {
+                granted.push_back(std::byte{0x80});  // SUBACK failure (3.9.3)
+            }
         }
         {
             // Copy, not move — `added` is still read below for the retained-message replay.
@@ -555,7 +672,21 @@ private:
 
         std::vector<std::byte> payload(b.begin() + static_cast<std::ptrdiff_t>(pos), b.end());
 
+        // M5 ACL gate: unset Config::authorizer ⇒ unchanged Phase-1 behavior (everything allowed). On
+        // denial: deliver_publish() (retain/on_publish_/route_publish) is never called, and for QoS 1/2
+        // no ack is sent at all (silent drop — the publisher gets no confirmation, which IS the signal;
+        // there is nothing to ack for QoS 0 either way).
+        const bool allowed = !cfg_.authorizer || cfg_.authorizer->allow(s.principal, topic, AclAction::Publish);
+
         if (qos == 2) {
+            // DOCUMENTED CHOICE: QoS 2's authorization check happens HERE, at PUBLISH/PUBREC time, not
+            // deferred to the PUBREL-time actual-delivery step in handle_pubrel below — an unauthorized
+            // QoS-2 publisher doesn't even get a PUBREC, matching the QoS-1 silent-drop treatment exactly
+            // (both "ack the client would use to know it can move on" are withheld at the earliest wire
+            // point that knows the verdict). A denied publish is simply never stashed in qos2_inflight, so
+            // handle_pubrel's later "unknown packet_id" tolerance (a harmless ack-only no-op, see its own
+            // comment) is what a stray PUBREL for it hits — deliver_publish() still never runs.
+            if (!allowed) return true;  // no PUBREC — connection stays open, handshake just never proceeds
             // Exactly-once (4.3.3): stash until PUBREL confirms receipt, then — and ONLY then — retain/
             // ingest/route it. Re-inserting under the same packet_id on a retransmitted PUBLISH (the
             // sender's PUBREC was lost) is a harmless overwrite with identical content, not a double
@@ -569,8 +700,9 @@ private:
         // QoS 0/1: act BEFORE acking — a publisher that has received its PUBACK must be able to assume a
         // subsequent SUBSCRIBE/retained-replay from anyone will already see this value/delivery (no
         // ack-before-visible race).
-        deliver_publish(topic, payload, qos, retain);
+        if (allowed) deliver_publish(topic, payload, qos, retain);
         if (qos == 1) {
+            if (!allowed) return true;  // silent drop: no PUBACK
             std::vector<std::byte> ack;
             aero::transport::mqtt::put_u16_be(ack, packet_id);
             if (!s.send_packet(std::byte{0x40}, ack)) return false;  // PUBACK
@@ -581,7 +713,10 @@ private:
     // PUBREL (4.3.3 step 3): the sender has now durably committed to this packet_id, so this is where a
     // QoS-2 PUBLISH FINALLY gets acted on — the one thing that distinguishes QoS 2 from QoS 1 (which acts
     // immediately). PUBCOMP is sent unconditionally, even for an unknown packet_id (a retried PUBREL after
-    // we already completed it and forgot it) — the sender's handshake must terminate either way.
+    // we already completed it and forgot it) — the sender's handshake must terminate either way. M5: no
+    // separate ACL check here — an unauthorized QoS-2 publish was already refused a PUBREC in
+    // handle_publish (see its "DOCUMENTED CHOICE" comment) and so was never stashed here; this path only
+    // ever delivers something that already passed the gate.
     bool handle_pubrel(Session& s, const aero::transport::mqtt::Packet& pkt) {
         const std::vector<std::byte>& b = pkt.body;
         if (b.size() < 2) return false;
@@ -685,6 +820,14 @@ private:
     std::atomic<bool> running_{false};
 
     std::thread accept_thread_;
+
+    // M5: the TLS listener/context — all stay at their default (invalid_fd / 0 / null / not-joinable)
+    // and every TLS-specific step in start()/stop()/accept_loop_tls() is a no-op when cfg_.tls is unset.
+    quark::pal::fd_t listen_fd_tls_ = quark::pal::invalid_fd;
+    std::uint16_t resolved_port_tls_ = 0;
+    std::thread accept_thread_tls_;
+    std::unique_ptr<aero::pal::tls::TlsServerContext> tls_ctx_;
+
     std::mutex sessions_mu_;
     std::vector<std::shared_ptr<Session>> sessions_;
     std::vector<std::thread> session_threads_;

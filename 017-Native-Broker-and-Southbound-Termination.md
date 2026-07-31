@@ -18,7 +18,7 @@
 | M2 | `Runtime::configure_broker()`, `GET /broker/status`, CLI flags — `aero-broker` now linked into `aero-runtime` | **Shipped** |
 | M3 | Bridge seam (`IBridgeSink`: MQTT-to-MQTT, HTTP webhook) + rule engine reusing `ExprRuleNode` (008 §6) | **Shipped** |
 | M4 | Studio dashboard page for the broker | **Shipped** |
-| M5 | TLS + Quark 020 per-topic authorization/ACL | Backlog |
+| M5 | TLS + per-topic ACL for the native MQTT broker | **Shipped** — southbound (device-facing) TLS + ACL; cluster-link TLS deferred, M5.1 |
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | Backlog |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | Backlog |
@@ -191,8 +191,8 @@ principled exclusions the way v0.1 framed the whole breadth:
 | Bridging (MQTT-to-MQTT, HTTP webhook) | **shipped** | M3, `IBridgeSink`/`MqttBridgeSink`/`HttpWebhookBridgeSink` |
 | Rule engine (topic filter + expression gate → sink) | **shipped**, reuses `ExprRuleNode` | M3, not a new DSL |
 | Dashboard | **shipped** | M4, `studio/src/pages/BrokerPage.tsx` |
-| TLS | backlog | M5 — C5 (014) still applies; v1-and-beyond is plaintext/trusted-network until this lands |
-| Per-topic ACL / authorization | backlog | M5, via Quark 020 principal, not a bespoke ACL engine |
+| TLS | **shipped** | M5, `aero/pal/tls.hpp` (mbedTLS-backed `TlsServerContext`/`TlsSession`) — server-auth and optional mTLS (client-cert-required) southbound listener |
+| Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
 | MQTT 5 | backlog | M7 — 3.1.1 covers the device population seen so far |
 | Kafka/Pulsar/RabbitMQ bridges | backlog | M8 — needs new third-party deps, native-extension-shaped (008) |
@@ -222,13 +222,31 @@ adapts to unilaterally. Concretely:
 
 ## 8. Security
 
-- **C5 (014) applies unchanged**: southbound connections should be TLS where the link isn't
-  physically trusted loopback/plant-local; device certs or PSK, not a shared broker password.
-- **Authorization is Quark 020 principal propagation**, not a broker-native ACL table — a
-  device's MQTT session maps to a Principal, and topic-level publish/subscribe rights are
-  checked the same way any other actor-to-actor authorization is (mirrors 014 §5's "broker is
-  untrusted for authz" stance, now applied to *this* broker too: it terminates transport
-  security, it does not become a second source of truth for authorization).
+- **C5 (014), southbound leg — shipped, M5**: a second, TLS-speaking listener
+  (`aero::pal::tls::TlsServerContext`/`TlsSession`, `aero/pal/tls.hpp`, mbedTLS-backed) runs
+  alongside the plaintext one, additive not a replacement — `NativeBroker::Config::tls` (unset by
+  default: no behavior change for a Config that doesn't opt in). Server-authenticated TLS is the
+  common case (the device verifies the broker); setting `ServerConfig::ca_file` additionally
+  requires and verifies a client certificate (mutual TLS) — a client presenting none, or one that
+  doesn't chain to `ca_file`, is rejected at the handshake, never silently downgraded to
+  plaintext-equivalent trust. **C5's cluster-link leg remains open** — see M5.1 in Open Questions.
+- **CONNECT-time authentication — shipped, M5**: `NativeBroker::Config::authenticate`
+  (`aero::broker::Authenticator`, `aero/broker/acl.hpp`) is a pluggable
+  `(username, password) -> optional<principal>` callback consulted before any other CONNECT-time
+  session-state mutation; `nullopt` rejects the CONNECT (CONNACK rc=0x04) with zero broker-state
+  side effects, a returned principal becomes the session's identity for `authorizer` below. Unset
+  by default — every CONNECT accepted, principal `"anonymous"`, matching pre-M5 behavior exactly.
+- **Per-topic authorization — shipped, M5, but NOT literal Quark 020 principal/Authorizer reuse**:
+  `NativeBroker::Config::authorizer` (`aero::broker::Authorizer`, concretely `TopicAclAuthorizer`
+  or a custom implementation) gates PUBLISH/SUBSCRIBE per `(principal, topic, action)` at the
+  CONNECT/SUBSCRIBE/PUBLISH boundary, before any topic state (retained store, session subscription
+  list, `route_publish` fan-out) is touched — a denied request has zero side effects. This is a
+  DELIBERATELY INDEPENDENT, purpose-built seam styled after Quark 020's boundary-enforcement/
+  default-deny pattern (same shape: a virtual `allow()` interface + an ordered-rule-table
+  implementation + an explicit default posture), not a reuse of `quark::Authorizer`/
+  `quark::Principal` themselves — see the N6 correction below for why, and
+  `aero/broker/acl.hpp`'s own banner comment for the canonical version of this reasoning (both
+  places are meant to say the same thing).
 
 ## 9. Invariants (normative)
 
@@ -251,7 +269,19 @@ adapts to unilaterally. Concretely:
 - **N5** — MES reporting rides 012 unchanged (M1–M3); the broker never talks to an MES
   directly.
 - **N6** — authorization is Quark 020 principal propagation; the broker holds no independent
-  ACL store.
+  ACL store. **CORRECTION (M5)**: the shipped ACL (`aero/broker/acl.hpp`) is a broker-LOCAL
+  `Authorizer` seam styled after Quark 020's boundary-enforcement/default-deny pattern — NOT a
+  literal reuse of `quark::Principal`/`quark::Authorizer`. Reason: Quark's `Authorizer::allow` is
+  keyed on `(Principal, ActorId, TypeKey)` — actor-addressing types that exist because Quark
+  routes messages between actors. An MQTT broker has no `ActorId`/`TypeKey` on its hot path: what
+  it routes on is topic STRINGS with `+`/`#` wildcard semantics (§4.7 of the MQTT spec), which
+  don't map onto Quark's addressing model at all. Bolting topic strings onto `ActorId`/`TypeKey`
+  would either lose wildcard matching or force a fake actor-space just to satisfy a type signature
+  that doesn't fit the problem — so this is a deliberately independent, purpose-built seam (same
+  shape as Quark 020's — a boundary-enforcement virtual interface, a concrete ordered-rule-table
+  implementation, an explicit default posture — just not the same classes). This paragraph and
+  `aero/broker/acl.hpp`'s own banner comment are meant to state the same reasoning consistently;
+  treat that file as canonical if the two ever drift.
 - **N7** — QoS ≥ 1 delivery from device → AeroEdge is at-least-once with dedup at the
   consuming actor (mirrors 014's C3 posture for inter-actor MQTT); QoS 0 is an explicit,
   opt-in, lossy choice per topic.
@@ -301,3 +331,9 @@ adapts to unilaterally. Concretely:
 - **Southbound OPC-UA/Modbus termination** — this spec is MQTT-only; whether the same
   "AeroEdge terminates the protocol locally instead of requiring external infra" posture
   extends to OPC-UA/Modbus (AeroMes descoped those too) is a separate, later spec.
+- **M5.1 — cluster-link TLS** — M5 ships TLS for the southbound (device-facing) leg only
+  (`aero/pal/tls.hpp`'s `TlsServerContext`, wired into `NativeBroker`). The broker's inter-node
+  link, if/when cross-node topic routing ships (M6, `DistributedRouter`, §4), is a separate leg
+  C5 (014) also covers and is NOT yet TLS-secured — deferred, blocked on Quark 020 shipping a
+  real (non-mock) `Aead` cipher for its own `SecureTransport` seam. This is upstream QuarkCpp
+  work, not something this project builds itself; revisit once that lands.

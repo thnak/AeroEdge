@@ -206,6 +206,14 @@ target_link_libraries(broker_cluster PRIVATE aero::broker)
 add_test(NAME broker_cluster COMMAND broker_cluster)
 set_tests_properties(broker_cluster PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# M5 TLS+ACL milestone gate: acl.hpp — the broker-local per-topic Authorizer seam (Allow/Deny-all
+# triviality, TopicAclAuthorizer's Closed/Open default posture, exact + wildcard principal/topic
+# matching, first-match-wins ordering, Publish/Subscribe action independence). Pure logic, no sockets.
+add_executable(acl broker/acl.cpp)
+target_link_libraries(acl PRIVATE aero::broker)
+add_test(NAME acl COMMAND acl)
+set_tests_properties(acl PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # uv drives the Python-hosted backends (amqtt broker / grpcio server) the REAL MQTT & gRPC gates need.
 # Absent uv, those tests SKIP (exit 0 with a SKIP line) rather than fail — the backend is external infra.
 find_program(AERO_UV_BIN uv)
@@ -307,3 +315,32 @@ add_executable(breadth_nodes nodes/breadth_nodes.cpp)
 target_link_libraries(breadth_nodes PRIVATE aero::nodes aero::runtime)
 add_test(NAME breadth_nodes COMMAND breadth_nodes)
 set_tests_properties(breadth_nodes PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M5: TLS+ACL milestone — non-blocking TLS byte-channel PAL (include/aero/pal/tls.hpp) -----------
+# `TlsServerContext`/`TlsSession` proven over a REAL loopback TCP socket against mbedTLS's own CLIENT
+# APIs (tls.hpp itself is server-only — AeroEdge's broker is always the TLS server): a genuine non-
+# blocking handshake completes and data round-trips through recv_some/send_some (server-auth-only TLS),
+# mTLS accepts a client cert signed by the configured ca_file, and mTLS REJECTS a connection with no
+# client cert when one is required. Also smoke-checks io_channel.hpp's PlainChannel/TlsChannel surface.
+# Uses the pre-generated, checked-in TEST-ONLY certs under pal/certs/ (never used in production).
+add_executable(tls_channel pal/tls_channel.cpp)
+target_link_libraries(tls_channel PRIVATE aero::sdk Threads::Threads aero-thirdparty-tls)
+target_compile_definitions(tls_channel PRIVATE
+  AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
+add_test(NAME tls_channel COMMAND tls_channel)
+set_tests_properties(tls_channel PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# M5 TLS+ACL milestone INTEGRATION gate: NativeBroker itself wired to TLS (aero/pal/tls.hpp) + the ACL
+# seam (aero/broker/acl.hpp) — as opposed to tls_channel (TLS PAL in isolation) and acl (ACL policy logic
+# in isolation), this proves the WIRING: a real NativeBroker with cfg.tls/cfg.authenticate/cfg.authorizer
+# set, driven by real MQTT clients over real sockets (one TLS-capable, hand-rolled over mbedTLS's
+# client-role APIs, mirroring tls_channel.cpp's own TestTlsClient; one plaintext, mirroring
+# native_broker.cpp's TestClient). Reuses tests/pal/certs/ directly (same AERO_TLS_TEST_CERTS_DIR
+# compile definition as tls_channel, rather than duplicating cert files) and links aero-thirdparty-tls
+# for the same reason tls_channel does (real mbedTLS client-role calls in the test's own TLS client code).
+add_executable(native_broker_security broker/native_broker_security.cpp)
+target_link_libraries(native_broker_security PRIVATE aero::broker aero-thirdparty-tls)
+target_compile_definitions(native_broker_security PRIVATE
+  AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
+add_test(NAME native_broker_security COMMAND native_broker_security)
+set_tests_properties(native_broker_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
