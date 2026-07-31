@@ -101,6 +101,75 @@ if(AERO_ENABLE_TLS)
   target_compile_definitions(aero-thirdparty-tls INTERFACE AERO_TLS_ENABLED=1)
 endif()
 
+# ---- OPC-UA (open62541, vendored via CMake FetchContent) -------------------
+# M9b (018 §Multi-protocol southbound): OpcUaDriver (aero/drivers/opcua_driver.hpp) is a pull-style
+# IDriver over open62541 (github.com/open62541/open62541), the standard open-source C99 OPC-UA SDK
+# (Mozilla Public License 2.0). v1 scope is a pure client-poll: connect to one known endpoint, read a
+# configured set of NodeIds — NO security policies (Sign/SignAndEncrypt is filed as backlog, not an
+# oversight), no Subscriptions/MonitoredItems, no browsing/method calls. Fetched (not vendored under
+# third_party/) for the same reason as mbedTLS above: a real C library that needs compiling, not just
+# #include'ing.
+#
+# NOTE: open62541 needs Python 3 at ITS OWN build time (its NodeSet/type code-generation step, see its
+# `find_package(Python3 REQUIRED)`) — the one genuinely new implicit toolchain requirement this adds to
+# the build; nothing else in this repo needs Python. A machine without a real Python 3 on PATH fails to
+# CONFIGURE this dependency (not a link/compile error) — a human needs to install one.
+option(AERO_ENABLE_OPCUA "Build with OPC-UA client support (open62541, fetched via CMake FetchContent)" ON)
+if(AERO_ENABLE_OPCUA)
+  include(FetchContent)
+  FetchContent_Declare(
+    open62541
+    GIT_REPOSITORY https://github.com/open62541/open62541.git
+    GIT_TAG        v1.4.11  # a real tagged v1.4.x LTS release — confirmed present via `git ls-remote
+                             # --tags` against the upstream repo at the time this was pinned
+  )
+  # Keep open62541's own build lean/quiet, mirroring the mbedTLS ENABLE_TESTING/QUARK_BUILD_TESTS
+  # pattern above — force the cache vars ITS CMakeLists.txt reads BEFORE FetchContent_MakeAvailable:
+  #   UA_ENABLE_ENCRYPTION "OFF" — a STRING cache var upstream (not BOOL: "OFF" or a plugin name like
+  #     "MBEDTLS"/"OPENSSL"), already OFF by default but forced explicitly here to document the v1 scope
+  #     decision: NO security policies, no TLS/crypto coupling for this dependency.
+  #   UA_BUILD_EXAMPLES / UA_BUILD_TOOLS / UA_BUILD_UNIT_TESTS OFF — only the client library, never
+  #     open62541's own example servers/clients, shell tools, or unit test suite as build targets (NOTE:
+  #     the real upstream option is UA_BUILD_UNIT_TESTS, not "UA_BUILD_TESTING" — verified against
+  #     open62541's own root CMakeLists.txt).
+  #   UA_ENABLE_DISCOVERY / UA_ENABLE_PUBSUB OFF — this driver dials one known endpoint directly (no LDS
+  #     discovery) and never touches PubSub; both default ON upstream and add real build weight for a
+  #     pure client-poll use case. UA_ENABLE_SUBSCRIPTIONS is left at its upstream default (ON): not
+  #     needed for v1 client-poll usage, but nothing here requires forcing it off either.
+  #   UA_ENABLE_PUBSUB_INFORMATIONMODEL OFF — forced alongside UA_ENABLE_PUBSUB: open62541's own
+  #     CMakeLists.txt hard-errors ("PubSub information model representation cannot be used with disabled
+  #     PubSub function") if this stays at ITS default (ON) while UA_ENABLE_PUBSUB is off — discovered
+  #     empirically configuring this exact build.
+  set(UA_ENABLE_ENCRYPTION "OFF" CACHE STRING "" FORCE)
+  set(UA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(UA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(UA_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_DISCOVERY OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_PUBSUB OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_PUBSUB_INFORMATIONMODEL OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(open62541)
+endif()
+
+# aero-thirdparty-opcua — INTERFACE seam over open62541 (mirrors aero-thirdparty-tls's shape above). With
+# AERO_ENABLE_OPCUA on, links the real target open62541's own CMakeLists.txt registers — confirmed
+# empirically against v1.4.11's src/CMakeLists.txt: `add_library(open62541 ...)` plus `add_library(
+# open62541::open62541 ALIAS open62541)` — and defines AERO_OPCUA_ENABLED=1 so
+# include/aero/drivers/opcua_driver.hpp can compile its real open62541-backed implementation instead of
+# the "not compiled in" stub. With AERO_ENABLE_OPCUA off this stays a genuine no-op INTERFACE target: no
+# fetch attempted, no network access needed, nothing to link.
+add_library(aero-thirdparty-opcua INTERFACE)
+if(AERO_ENABLE_OPCUA)
+  target_link_libraries(aero-thirdparty-opcua INTERFACE open62541::open62541)
+  target_compile_definitions(aero-thirdparty-opcua INTERFACE AERO_OPCUA_ENABLED=1)
+  if(WIN32)
+    # open62541's Win32 networking layer pulls in <windows.h> transitively; without NOMINMAX its global
+    # min/max macros collide with std::min/std::max used elsewhere in this codebase (e.g.
+    # nodes/compute_nodes.hpp's MinMaxNode) in any translation unit that includes both — discovered
+    # empirically building tests/drivers/opcua_driver.cpp on Windows/clang.
+    target_compile_definitions(aero-thirdparty-opcua INTERFACE NOMINMAX)
+  endif()
+endif()
+
 # ---- Vendored, header-only third-party deps (already fetched under third_party/) -------------
 # Wired as INTERFACE targets so the one-way layering (R1) can fence the heavy httplib to aero-api /
 # aero-cli only; nlohmann::json may be used more broadly (schema/core), never httplib.
@@ -175,9 +244,13 @@ target_link_libraries(aero-ext INTERFACE aero-core aero-nodes aero-thirdparty-js
 add_library(aero::ext ALIAS aero-ext)
 
 # aero-drivers — built-in driver library: the ingestion producer path over the Quark 024 stream (006).
+# M9b adds aero-thirdparty-opcua: OpcUaDriver (drivers/opcua_driver.hpp) needs the real open62541-backed
+# implementation (AERO_OPCUA_ENABLED + the open62541 lib) transitively wherever this library is linked
+# into a real binary (aero-runtime -> aero-runtime-daemon, and this library's own tests) — same reasoning
+# as aero-broker linking aero-thirdparty-tls for native_broker.hpp's TLS listener (M5).
 add_library(aero-drivers INTERFACE)
 target_include_directories(aero-drivers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-drivers INTERFACE aero-sdk)
+target_link_libraries(aero-drivers INTERFACE aero-sdk aero-thirdparty-opcua)
 add_library(aero::drivers ALIAS aero-drivers)
 
 # aero-transport — inter-actor transport ADAPTERS behind Quark's `Transport` seam (014, X1). The FIFO/
