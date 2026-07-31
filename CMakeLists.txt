@@ -22,6 +22,51 @@ endif()
 # ---- Threads (httplib + Quark worker lanes need pthreads) ------------------
 find_package(Threads REQUIRED)
 
+# ---- TLS (mbedTLS, vendored via CMake FetchContent) -------------------------
+# M5 (TLS+ACL milestone): the native MQTT broker's TLS byte-channel PAL (include/aero/pal/tls.hpp) needs
+# a TLS library. mbedTLS is small, portable C designed for embedded/edge targets (unlike OpenSSL's much
+# heavier footprint) — a better fit for this project than the alternatives. Fetched at configure time
+# (not vendored as source under third_party/, unlike header-only httplib/nlohmann-json) because mbedTLS
+# is a real C library that needs compiling, not just #include'ing.
+option(AERO_ENABLE_TLS "Build with TLS support (mbedTLS, fetched via CMake FetchContent)" ON)
+if(AERO_ENABLE_TLS)
+  include(FetchContent)
+  FetchContent_Declare(
+    mbedtls
+    GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
+    GIT_TAG        v3.6.7  # latest v3.6.x LTS tag at the time this was pinned (checked empirically)
+    # See cmake/patch_mbedtls_toolchain.cmake's banner: neutralizes a real mbedTLS CMake false-positive
+    # (CMAKE_C_SIMULATE_ID=MSVC for Clang's GNU-style driver targeting the MSVC ABI, this project's
+    # Windows toolchain) that otherwise appends cl.exe-only `/W3 /utf-8` flags clang++.exe rejects.
+    PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_mbedtls_toolchain.cmake"
+  )
+  # Keep mbedTLS's own build lean/quiet, mirroring the QUARK_BUILD_TESTS/BENCH/SAMPLES OFF pattern right
+  # below (add_subdirectory(QuarkCpp)) — force the cache vars mbedTLS's CMakeLists reads BEFORE
+  # FetchContent_MakeAvailable pulls it in and configures it:
+  #   ENABLE_TESTING / ENABLE_PROGRAMS OFF  — we only want the library, not mbedTLS's own test suite or
+  #     example programs (ssl_client2, ssl_server2, ...), which would otherwise get added as build targets.
+  #   MBEDTLS_FATAL_WARNINGS OFF — mbedTLS builds -Werror by default, tuned for ITS OWN CI compiler
+  #     versions; on a compiler/flag combination it didn't anticipate that can fail the build over a
+  #     warning that isn't actually AeroEdge's problem to fix in vendored code.
+  set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+  set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(mbedtls)
+endif()
+
+# aero-thirdparty-tls — INTERFACE seam over mbedTLS (mirrors aero-thirdparty-httplib's shape below). With
+# AERO_ENABLE_TLS on, links the real mbedTLS static targets — confirmed empirically against v3.6.7's
+# library/CMakeLists.txt: it names them exactly `mbedtls`/`mbedx509`/`mbedcrypto` (also aliased as
+# `MbedTLS::<name>`, but the bare names are what add_subdirectory/FetchContent actually registers) — and
+# defines AERO_TLS_ENABLED=1 so include/aero/pal/tls.hpp can compile its real mbedTLS-backed
+# implementation instead of the "not compiled in" stub. With AERO_ENABLE_TLS off this stays a genuine
+# no-op INTERFACE target: no fetch attempted, no network access needed, nothing to link.
+add_library(aero-thirdparty-tls INTERFACE)
+if(AERO_ENABLE_TLS)
+  target_link_libraries(aero-thirdparty-tls INTERFACE mbedtls mbedx509 mbedcrypto)
+  target_compile_definitions(aero-thirdparty-tls INTERFACE AERO_TLS_ENABLED=1)
+endif()
+
 # ---- Vendored, header-only third-party deps (already fetched under third_party/) -------------
 # Wired as INTERFACE targets so the one-way layering (R1) can fence the heavy httplib to aero-api /
 # aero-cli only; nlohmann::json may be used more broadly (schema/core), never httplib.
@@ -121,10 +166,14 @@ add_library(aero::transport ALIAS aero-transport)
 # bridge.hpp (017 §6, revised scope) adds bridging (MQTT + HTTP webhook sinks) and a rule engine over
 # `on_publish()`, reusing aero-nodes' ExprRuleNode (008 §6) for the rule/expression side and httplib
 # (RestMesAdapter's own pattern, mes/rest_mes_adapter.hpp) for the HTTP sink — hence the added deps.
+# M5 (TLS+ACL milestone) adds aero-thirdparty-tls: native_broker.hpp's TLS listener (aero/pal/tls.hpp)
+# needs the real mbedTLS-backed implementation (AERO_TLS_ENABLED + the mbedtls libs), not the "not
+# compiled in" stub, whenever this library is actually linked into a binary.
 add_library(aero-broker INTERFACE)
 target_include_directories(aero-broker INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-broker INTERFACE
-  aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json quark::quark Threads::Threads)
+  aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json aero-thirdparty-tls
+  quark::quark Threads::Threads)
 add_library(aero::broker ALIAS aero-broker)
 
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration
