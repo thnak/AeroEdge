@@ -48,6 +48,7 @@
 #include <netdb.h>  // getaddrinfo/freeaddrinfo (Windows: transitively via pal/net.hpp's ws2tcpip.h)
 #endif
 
+#include "aero/pal/net_dial.hpp"
 #include "aero/pal/poll.hpp"
 #include "aero/transport/frame_codec.hpp"
 #include "aero/transport/mqtt_codec.hpp"  // shared MQTT 3.1.1 wire codec (017 §9 N3)
@@ -159,32 +160,13 @@ private:
     }
 
     // Non-blocking connect (Quark's `tcp_connect` contract) bounded by kConnectTimeoutMs per candidate —
-    // see tcp_transport.hpp's dial() banner for the full rationale.
+    // see aero/pal/net_dial.hpp's dial_tcp() for the shared implementation (was duplicated here verbatim
+    // until factored out; same timeout, same per-candidate retry shape, behavior-preserving).
     static constexpr int kConnectTimeoutMs = 5000;
 
     static quark::pal::fd_t dial(const std::string& host, std::uint16_t port) {
-        addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        addrinfo* res = nullptr;
-        if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)
-            return quark::pal::invalid_fd;
-
-        quark::pal::fd_t fd = quark::pal::invalid_fd;
-        for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-            if (ai->ai_family != AF_INET) continue;
-            const auto* sin = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-            const std::uint64_t addr_u64 = ::ntohl(sin->sin_addr.s_addr);
-            auto attempt = quark::pal::tcp_connect(addr_u64, port);
-            if (!attempt) continue;
-            fd = *attempt;
-            const auto writable = aero::pal::wait_writable(fd, kConnectTimeoutMs);
-            if (writable && *writable && quark::pal::connect_result(fd)) break;  // connected
-            quark::pal::close_fd(fd);
-            fd = quark::pal::invalid_fd;
-        }
-        ::freeaddrinfo(res);
-        return fd;
+        auto r = aero::pal::dial_tcp(host, port, kConnectTimeoutMs);
+        return r ? *r : quark::pal::invalid_fd;
     }
 
     std::expected<void, std::string> mqtt_connect() {
