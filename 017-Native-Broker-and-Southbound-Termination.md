@@ -22,7 +22,7 @@
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties (Topic Alias, Shared Subs, Request/Response, Enhanced Auth) deferred, M7.1 |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | Backlog |
-| M9 | Multi-protocol southbound (OPC-UA/Modbus) — likely its own spec (018?) | Backlog |
+| M9 | Multi-protocol southbound (OPC-UA/Modbus) | **Superseded by spec 018** — its own spec, as this row anticipated |
 
 ## 1. Why
 
@@ -354,9 +354,9 @@ adapts to unilaterally. Concretely:
   ahead of demand" posture M7's own predecessor entry held, now narrowed to what's left.
 - **Shared secrets / device provisioning** — how a device gets its TLS identity/PSK in the
   first place (fleet-level concern, may tie to 011 OTA's existing device identity story).
-- **Southbound OPC-UA/Modbus termination** — this spec is MQTT-only; whether the same
-  "AeroEdge terminates the protocol locally instead of requiring external infra" posture
-  extends to OPC-UA/Modbus (AeroMes descoped those too) is a separate, later spec.
+- **Southbound OPC-UA/Modbus termination** — this spec is MQTT-only; the same "AeroEdge
+  terminates the protocol locally instead of requiring external infra" posture now extends to
+  OPC-UA/Modbus via **spec 018** (M9), as this entry anticipated.
 - **M5.1 — cluster-link TLS** — M5 ships TLS for the southbound (device-facing) leg only
   (`aero/pal/tls.hpp`'s `TlsServerContext`, wired into `NativeBroker`). The broker's inter-node
   link, if/when cross-node topic routing ships (M6, `DistributedRouter`, §4), is a separate leg
