@@ -367,3 +367,20 @@ add_executable(modbus_tcp_driver drivers/modbus_tcp_driver.cpp)
 target_link_libraries(modbus_tcp_driver PRIVATE aero::drivers aero::nodes aero::sdk quark::quark Threads::Threads)
 add_test(NAME modbus_tcp_driver COMMAND modbus_tcp_driver)
 set_tests_properties(modbus_tcp_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M9b: OPC-UA southbound (018) ---------------------------------------------------------------------
+# OpcUaDriver (drivers/opcua_driver.hpp): a real OPC-UA client PULL driver over open62541 (v1 scope: no
+# security, no Subscriptions, poll-configured-NodeIds only). A REAL open62541 UA_Server, hosted
+# in-process on a background thread (open62541's own standard test idiom — no external test infra
+# needed), proves: (1) happy path — poll() + JsonParseNode (nodes/compute_nodes.hpp, reused not
+# reimplemented — this driver serializes flat JSON precisely so JsonParseNode needs zero changes) decode
+# the canned variable-node values correctly; (2) a node_ids list too large for the 128-byte payload
+# budget is rejected at open(), never a silently truncated/corrupted frame; (3) connection loss
+# mid-session (the fake server stopped entirely) is recovered by a later poll() reconnecting once the
+# server comes back, never wedging or crashing. Links aero-thirdparty-opcua directly (not just
+# transitively via aero::drivers) because the test's OWN fake server code calls real UA_Server APIs.
+add_executable(opcua_driver drivers/opcua_driver.cpp)
+target_link_libraries(opcua_driver PRIVATE aero::drivers aero::nodes aero::sdk aero-thirdparty-opcua
+  quark::quark Threads::Threads)
+add_test(NAME opcua_driver COMMAND opcua_driver)
+set_tests_properties(opcua_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

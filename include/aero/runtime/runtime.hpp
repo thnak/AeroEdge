@@ -39,6 +39,7 @@
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
 #include "aero/drivers/modbus_tcp_driver.hpp"
+#include "aero/drivers/opcua_driver.hpp"
 #include "aero/ext/native_loader.hpp"
 #include "aero/mes/mes.hpp"
 #include "aero/mes/outbox.hpp"
@@ -136,6 +137,14 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
             c.value("host", std::string{}), c.value("port", std::uint16_t{502}),
             c.value("unit_id", std::uint8_t{1}), c.value("start_address", std::uint16_t{0}),
             c.value("register_count", std::uint16_t{8}));
+    });
+    // M9b (018 §Multi-protocol southbound): a real OPC-UA client PULL driver (open62541-backed). Config
+    // is read straight out of the deploy-time JSON at construction, same reasoning as
+    // aero.driver.modbus_tcp above (DriverConfig's narrow fields don't fit this driver's shape either).
+    driver_reg.register_type("aero.driver.opcua", [](const nlohmann::json& c) {
+        return std::make_unique<aero::drivers::OpcUaDriver>(
+            c.value("endpoint", std::string{}),
+            c.value("node_ids", std::vector<std::string>{}));
     });
 }
 
