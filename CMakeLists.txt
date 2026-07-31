@@ -168,6 +168,15 @@ if(AERO_ENABLE_OPCUA)
   #     CMakeLists.txt hard-errors ("PubSub information model representation cannot be used with disabled
   #     PubSub function") if this stays at ITS default (ON) while UA_ENABLE_PUBSUB is off — discovered
   #     empirically configuring this exact build.
+  #   UA_ENABLE_DEBUG_SANITIZER OFF — defaults ON upstream, and when CMAKE_BUILD_TYPE is Debug (true for
+  #     every CI sanitizer leg, address/undefined AND thread) open62541's own CMakeLists.txt unconditionally
+  #     appends "-fsanitize=address -fsanitize=leak -fsanitize=undefined" to CMAKE_C_FLAGS/CMAKE_CXX_FLAGS
+  #     for ITS OWN sources, regardless of AEROEDGE_SANITIZER above — on the thread (TSan) leg this collides
+  #     head-on with this project's own -fsanitize=thread ("invalid argument '-fsanitize=address' not
+  #     allowed with '-fsanitize=thread'", a hard compile error, not a warning). AeroEdge's own top-level
+  #     AEROEDGE_SANITIZER option is this project's single source of truth for which sanitizer a CI leg
+  #     builds under; a vendored dependency silently opting itself into a DIFFERENT one is never correct
+  #     here, so this is forced off unconditionally, not just for the thread leg.
   set(UA_ENABLE_ENCRYPTION "OFF" CACHE STRING "" FORCE)
   set(UA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(UA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -175,6 +184,7 @@ if(AERO_ENABLE_OPCUA)
   set(UA_ENABLE_DISCOVERY OFF CACHE BOOL "" FORCE)
   set(UA_ENABLE_PUBSUB OFF CACHE BOOL "" FORCE)
   set(UA_ENABLE_PUBSUB_INFORMATIONMODEL OFF CACHE BOOL "" FORCE)
+  set(UA_ENABLE_DEBUG_SANITIZER OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(open62541)
 endif()
 

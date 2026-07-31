@@ -58,39 +58,19 @@ jobs:
           -DQUARK_DIR=${{ github.workspace }}/QuarkCpp
       - name: Build
         working-directory: AeroEdge
-        run: cmake --build build -j
-      - name: Diagnose open62541 archive (TEMPORARY — investigating M9b CI-only link failure)
-        if: always()
-        working-directory: AeroEdge
-        shell: bash --noprofile --norc -o pipefail {0}
-        run: |
-          set +e
-          echo "--- CMAKE_AR/CMAKE_RANLIB from cache ---"
-          grep -i "^CMAKE_AR\|^CMAKE_RANLIB" build/CMakeCache.txt
-          echo "--- ar/llvm-ar on PATH (each line independent, failures expected/ignored) ---"
-          which ar
-          which llvm-ar-20
-          which llvm-ar
-          echo "--- archive file ---"
-          ls -la build/bin/libopen62541.a
-          file build/bin/libopen62541.a
-          echo "--- largest object files that went into it (clang vs gcc size comparison) ---"
-          find build/_deps/open62541-build -name '*.o' -exec ls -la {} \; | sort -k5 -n -r | head -10
-          echo "--- ar t (member listing) ---"
-          ar t build/bin/libopen62541.a 2>&1 | head -30
-          echo "--- first 64 bytes of the archive, hex ---"
-          xxd build/bin/libopen62541.a | head -8
-          echo "--- df -h (disk space) ---"
-          df -h /home/runner/work
-          exit 0
-      - name: Upload open62541 archive for offline inspection (TEMPORARY)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: libopen62541-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: AeroEdge/build/bin/libopen62541.a
-          if-no-files-found: warn
-          retention-days: 3
+        # M9b (open62541 vendoring) surfaced a transient, environment-level failure specific to
+        # clang++-20 on GitHub's hosted runners: the linker occasionally reports
+        # "bin/libopen62541.a: error adding symbols: file format not recognized" for an archive that a
+        # post-build diagnostic (file / ar t / hexdump of the exact same file, moments later) always
+        # shows is a completely valid, uncorrupted ar archive — confirmed across multiple CI runs, never
+        # reproducible on any local machine tried (WSL/native, matching compiler/flags/parallelism). Not
+        # an archiver-tool mismatch (CMAKE_AR is pinned to plain /usr/bin/ar, confirmed via the same
+        # diagnostic) and not disk exhaustion (confirmed >80G free at failure time) — a genuine transient
+        # file-visibility race between the archive-creation step and the final link step on this runner's
+        # storage, specific to how clang++-20 invokes the linker. Retry once: ninja is incremental, so a
+        # retry only re-attempts the failed link (every object stays cached), and if the file is simply
+        # not-yet-visible on the first attempt it reliably is by the second.
+        run: cmake --build build -j || (echo "::warning::Build failed, retrying once (see this step's comment)" && cmake --build build -j)
       - name: Test
         working-directory: AeroEdge
         run: ctest --test-dir build --output-on-failure
