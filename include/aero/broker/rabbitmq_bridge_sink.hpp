@@ -132,7 +132,11 @@ public:
     // failure (broken connection, detected via `amqp_basic_publish`'s own return code — the standard
     // rabbitmq-c signal for a write-level failure) marks this sink disconnected so every subsequent
     // publish() fails fast too, never attempting I/O against a connection already known to be dead.
-    bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos) override {
+    // 017 M7.2 PR B: `props` is accepted but UNUSED for now — a real AMQP-native mapping exists
+    // (correlation_data -> amqp_basic_properties_t::correlation_id, response_topic -> reply_to,
+    // user_properties -> headers table) but wiring it up is good follow-on work, not this PR.
+    bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                const PublishProperties& /*props*/) override {
         std::lock_guard<std::mutex> g(mu_);
         if (!connected_ || !conn_) return false;
 
@@ -200,7 +204,7 @@ class RabbitMqBridgeSink final : public IBridgeSink {
 public:
     bool connect(const BridgeConfig& /*cfg*/) override { return false; }
     bool publish(std::string_view /*topic*/, std::span<const std::byte> /*payload*/,
-                 std::uint8_t /*qos*/) override {
+                 std::uint8_t /*qos*/, const PublishProperties& /*props*/) override {
         return false;
     }
     void close() {}  // matches the real implementation's public surface (never anything to close here)

@@ -104,6 +104,20 @@ struct Config {
     std::shared_ptr<Authorizer> authorizer;
 };
 
+// 017 M7.2 PR B: the subset of MQTT 5 PUBLISH properties exposed on the PUBLIC on_publish() callback —
+// Response Topic/Correlation Data/User Properties, the request/response pattern (§3.3.2.3.5-§3.3.2.3.7).
+// A DELIBERATELY SEPARATE type from the private PublishExtras (below, inside NativeBroker): PublishExtras
+// also bundles expiry_deadline, a steady_clock::time_point that is monotonic and meaningless outside
+// publish_to()'s choke point — exposing it on a public callback would leak an implementation detail and
+// force PublishExtras itself to become public. A small conversion at the two firing sites
+// (to_publish_properties() below) keeps the public API surface independent of internal delivery-path
+// bookkeeping.
+struct PublishProperties {
+    std::optional<std::string> response_topic;
+    std::optional<std::vector<std::byte>> correlation_data;
+    std::vector<std::pair<std::string, std::string>> user_properties;
+};
+
 class NativeBroker {
 public:
     explicit NativeBroker(Config cfg) : cfg_(std::move(cfg)) {}
@@ -196,8 +210,11 @@ public:
     // instance handles (whether or not any subscriber is present), from whichever session's reader
     // thread received it. Callers needing thread-safe hand-off to a flow/actor must marshal it
     // themselves — mirrors how IDriver::run()'s producer thread hands frames to a bridge thread today.
+    // 017 M7.2 PR B: gained a 4th parameter, `props` (Response Topic/Correlation Data/User Properties) —
+    // always populated when the originating PUBLISH carried them (v4 sessions and relayed PUBLISHes via
+    // deliver_remote_publish() below just see a default-constructed, all-empty PublishProperties).
     void on_publish(std::function<void(std::string_view topic, std::span<const std::byte> payload,
-                                       std::uint8_t qos)> cb) {
+                                       std::uint8_t qos, const PublishProperties& props)> cb) {
         on_publish_ = std::move(cb);
     }
 
@@ -224,7 +241,10 @@ public:
     // relay-delivered PUBLISH is never re-broadcast onward).
     void deliver_remote_publish(std::string_view topic, std::span<const std::byte> payload,
                                 std::uint8_t qos) {
-        if (on_publish_) on_publish_(topic, payload, qos);
+        // 017 M7.2 PR B: relayed PUBLISHes never carry Response Topic/Correlation Data/User Properties
+        // yet — same documented v1 cross-node gap PR A already left for Message Expiry (see this
+        // function's own banner above); a future cross-node-relay PR would thread real extras through.
+        if (on_publish_) on_publish_(topic, payload, qos, PublishProperties{});
         route_publish(std::string(topic), std::vector<std::byte>(payload.begin(), payload.end()), qos);
     }
 
@@ -234,17 +254,26 @@ private:
         std::uint8_t qos = 0;  // granted QoS (v1: min(requested, 1))
     };
 
-    // 017 M7.2 PR A: carries the subset of MQTT 5 PUBLISH properties this broker acts on end-to-end, from
-    // ingestion (handle_publish/Will-parse) through to the outbound wire (publish_to). This PR populates
-    // only expiry_deadline; response_topic/correlation_data/user_properties are always empty until a
-    // future PR B — shaped now so that PR doesn't need a second pass touching every call site below.
+    // 017 M7.2: carries the subset of MQTT 5 PUBLISH properties this broker acts on end-to-end, from
+    // ingestion (handle_publish/Will-parse) through to the outbound wire (publish_to). PR A populated only
+    // expiry_deadline; PR B (this milestone) populates response_topic/correlation_data/user_properties too
+    // — shaped from the start so PR B didn't need a second pass touching every call site below.
     struct PublishExtras {
         std::optional<std::chrono::steady_clock::time_point> expiry_deadline;  // absolute deadline,
             // computed ONCE at ingestion time — never re-derived from a re-sent "original interval".
-        std::optional<std::string> response_topic;                // future PR B
-        std::optional<std::vector<std::byte>> correlation_data;    // future PR B
-        std::vector<std::pair<std::string, std::string>> user_properties;  // future PR B
+        std::optional<std::string> response_topic;                // 017 M7.2 PR B
+        std::optional<std::vector<std::byte>> correlation_data;    // 017 M7.2 PR B
+        std::vector<std::pair<std::string, std::string>> user_properties;  // 017 M7.2 PR B
     };
+
+    // 017 M7.2 PR B: converts the private, delivery-path-internal PublishExtras into the public
+    // PublishProperties shape fired on on_publish() — drops expiry_deadline (meaningless outside
+    // publish_to()'s choke point, see PublishProperties's own comment). Called at the two on_publish_
+    // firing sites (deliver_publish below; deliver_remote_publish above fires PublishProperties{}
+    // directly since a relayed PUBLISH's PublishExtras is always default anyway).
+    static PublishProperties to_publish_properties(const PublishExtras& e) {
+        return PublishProperties{e.response_topic, e.correlation_data, e.user_properties};
+    }
 
     // A PUBLISH(QoS 2) that has been PUBREC'd but not yet PUBREL'd — 4.3.3's whole point is that the
     // message is NOT acted on (retained/routed/ingested) until PUBREL confirms, so we have to hold onto
@@ -603,17 +632,30 @@ private:
         if (will_flag) {
             // M7 v5: a SEPARATE Will Properties block, positioned immediately before Will Topic (MQTT 5
             // §3.1.3.2) — distinct from the CONNECT-level Properties block already consumed above. Most
-            // properties in it (Will Delay Interval/Payload Format/etc.) still aren't acted on in v1/M7.2
-            // PR A; malformed -> treated exactly like any other malformed CONNECT field. M7.2 PR A: Message
+            // properties in it (Will Delay Interval/Payload Format/etc.) still aren't acted on in v1/M7.2;
+            // malformed -> treated exactly like any other malformed CONNECT field. M7.2 PR A: Message
             // Expiry Interval (0x02) IS now captured into will_extras so a Will PUBLISH's TTL isn't
             // silently dropped while regular PUBLISHes honor it (see Session::will_extras's own comment —
             // this file documents Will/regular PUBLISH as one shared delivery path so they can't drift).
+            // M7.2 PR B: Response Topic/Correlation Data/User Properties are captured the same way, for
+            // the same reason — a Will's request/response fields must not silently drop while regular
+            // PUBLISHes honor them.
             if (is_v5) {
                 auto will_props = aero::transport::mqtt::read_properties(b, pos);
                 if (!will_props) return false;
                 if (will_props->message_expiry_interval)
                     will_extras.expiry_deadline = std::chrono::steady_clock::now() +
                                                   std::chrono::seconds(*will_props->message_expiry_interval);
+                will_extras.response_topic = will_props->response_topic;
+                will_extras.correlation_data = will_props->correlation_data;
+                will_extras.user_properties = will_props->user_properties;
+                // Same Topic Name Invalid rule as regular PUBLISH's Response Topic (§3.3.2.3.5). No
+                // CONNACK/session exists yet at this point in CONNECT parsing to carry a reason code, so
+                // this is a silent connection drop — matches the sibling `if (!will_props) return false;`
+                // a few lines above.
+                if (will_extras.response_topic &&
+                    aero::broker::topic_name_has_wildcard(*will_extras.response_topic))
+                    return false;
             }
             if (pos + 2 > b.size()) return false;
             const std::uint16_t wt_len = read_u16(pos);
@@ -847,9 +889,9 @@ private:
         // payload. `pos` MUST land exactly past them before the payload slice below runs, or the
         // properties bytes would leak into (or truncate) the delivered payload. Malformed -> treated like
         // any other malformed PUBLISH (return false). M7.1: Topic Alias (0x23) is now captured. M7.2 PR A:
-        // Message Expiry Interval (0x02) is now captured too, turned into an absolute deadline below
-        // (everything else in the block is still discarded — Response Topic/Correlation Data/User
-        // Properties remain out of scope for this PR, see PublishExtras's own comment).
+        // Message Expiry Interval (0x02) is now captured too, turned into an absolute deadline below. M7.2
+        // PR B: Response Topic (0x08), Correlation Data (0x09), and User Properties (0x26) are captured
+        // too, threaded onto `extras` for deliver_publish()'s on_publish_/publish_to() call sites.
         std::optional<std::uint16_t> topic_alias;
         PublishExtras extras;
         if (s.protocol_version == 5) {
@@ -859,6 +901,18 @@ private:
             if (props->message_expiry_interval)
                 extras.expiry_deadline =
                     std::chrono::steady_clock::now() + std::chrono::seconds(*props->message_expiry_interval);
+            extras.response_topic = props->response_topic;
+            extras.correlation_data = props->correlation_data;
+            extras.user_properties = props->user_properties;
+            // Response Topic must be a valid Topic Name — no wildcards (MQTT 5 §3.3.2.3.5). This is a
+            // semantic/protocol-error check, not a decode-shape one, so it belongs here rather than in
+            // mqtt_codec.hpp — mirrors how Topic Alias's 0-or-too-large check already lives in
+            // handle_publish(), not in the codec. 0x90 is the spec's dedicated Topic Name Invalid reason
+            // code (also used by CONNACK/PUBACK/PUBREC/SUBACK for the same condition).
+            if (extras.response_topic && aero::broker::topic_name_has_wildcard(*extras.response_topic)) {
+                send_disconnect(s, 0x90);  // Topic Name Invalid
+                return false;
+            }
         }
 
         std::vector<std::byte> payload(b.begin() + static_cast<std::ptrdiff_t>(pos), b.end());
@@ -969,7 +1023,7 @@ private:
             else
                 retained_[topic] = RetainedMessage{payload, extras};  // M7.2 PR A: carry extras along
         }
-        if (on_publish_) on_publish_(topic, payload, qos);
+        if (on_publish_) on_publish_(topic, payload, qos, to_publish_properties(extras));
         route_publish(topic, payload, qos, extras);
         // M6 (017 §4): AFTER local delivery, so a peer's relayed copy can never arrive before this node's
         // own subscribers see it. No-op single-node default (peer_forwarder_ unset) — see set_peer_forwarder().
@@ -1055,9 +1109,12 @@ private:
                 // remaining > 0 here — choke point 1 above already returned on <= 0.
                 pw.put_u32(0x02, static_cast<std::uint32_t>(remaining));
             }
-            // A future PR B adds here: put_str(0x08, response_topic), put_binary(0x09, correlation_data),
-            // a put_str_pair(0x26, ...) loop for user_properties — extras is already shaped for all three
-            // (PublishExtras's own comment), this PR just never populates them.
+            // 017 M7.2 PR B: Response Topic / Correlation Data / User Properties, each independently
+            // optional — User Property is repeatable (§3.3.2.3.7), so every entry in the vector gets its
+            // own record, duplicates and all.
+            if (extras.response_topic) pw.put_str(0x08, *extras.response_topic);
+            if (extras.correlation_data) pw.put_binary(0x09, *extras.correlation_data);
+            for (const auto& [k, v] : extras.user_properties) pw.put_str_pair(0x26, k, v);
             std::vector<std::byte> props;
             pw.write(props);  // valid Properties block even when pw is empty (one 0x00 byte) — the §3.3.1 fix
             vh.insert(vh.end(), props.begin(), props.end());
@@ -1120,7 +1177,8 @@ private:
     std::unordered_map<std::string, StoredSession> stored_sessions_;
 
     std::atomic<std::uint16_t> packet_id_{1};
-    std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t)> on_publish_;
+    std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t,
+                       const PublishProperties&)> on_publish_;
 
     // M6 (017 §4): unset by default (single-node — 100% of Phase 1 through M3 behavior unchanged). Set by
     // BrokerCluster via set_peer_forwarder() to broadcast every locally-originated PUBLISH to peer nodes.

@@ -14,8 +14,10 @@
 //
 // WIRING (deliberately NOT this header's job): `BrokerRuleEngine::handle_publish` has EXACTLY the
 // signature `NativeBroker::on_publish()` expects. Whoever owns the broker instance wires
-// `broker.on_publish([&](auto t, auto p, auto q){ engine.handle_publish(t, p, q); });` — this header
-// never touches `NativeBroker`'s socket/session internals.
+// `broker.on_publish([&](auto t, auto p, auto q, const auto& props){ engine.handle_publish(t, p, q,
+// props); });` — this header never touches `NativeBroker`'s socket/session internals. (017 M7.2 PR B:
+// the 4th parameter, `props`, was added when on_publish()/IBridgeSink::publish() both grew a
+// PublishProperties parameter — see those declarations' own comments.)
 //
 // Kafka/Pulsar bridges are OUT of scope here — those need new third-party client deps, separate future
 // milestones (M8.1/M8.2, see 017 §6 Status). RabbitMQ shipped in M8 (`RabbitMqBridgeSink`,
@@ -171,7 +173,11 @@ public:
     // Republish one broker PUBLISH downstream. Called from `BrokerRuleEngine::handle_publish` on
     // whatever thread `NativeBroker::on_publish()` fires from (a session's reader thread, 017 Phase 1)
     // — implementations must tolerate that thread and must never throw or block indefinitely.
-    virtual bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos) = 0;
+    // 017 M7.2 PR B: gained a 4th parameter, `props` (Response Topic/Correlation Data/User Properties) —
+    // no default argument: defaults on a pure virtual don't affect dynamic dispatch, and every call site
+    // (BrokerRuleEngine::handle_publish, below) has a real PublishProperties value to pass.
+    virtual bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                        const PublishProperties& props) = 0;
 };
 
 // ---- MqttBridgeSink: republish to ANOTHER MQTT broker -----------------------------------------------
@@ -205,7 +211,14 @@ public:
         return true;
     }
 
-    bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos) override {
+    // 017 M7.2 PR B: `props` is accepted but UNUSED — this sink is hardcoded to protocol level 0x04
+    // (MQTT 3.1.1, mqtt_connect() below) which has no Properties concept at all to carry Response
+    // Topic/Correlation Data/User Properties on. Upgrading this sink to speak MQTT 5 is out of scope for
+    // this PR (see the file banner's "DESIGN CALL" for why this sink is a small, self-contained client
+    // rather than layered on MqttClientTransport — the same reasoning applies to not silently growing it
+    // a v5 mode as a side effect of this PR).
+    bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                const PublishProperties& /*props*/) override {
         std::lock_guard<std::mutex> g(mu_);
         if (fd_ == quark::pal::invalid_fd) return false;
 
@@ -303,7 +316,8 @@ public:
         return true;
     }
 
-    bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos) override {
+    bool publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                const PublishProperties& props) override {
         std::lock_guard<std::mutex> lock(mtx_);
         if (!cli_) return false;
 
@@ -317,6 +331,20 @@ public:
         } else {
             body["payload"] = bridge_detail::base64_encode(payload);
             body["payload_encoding"] = "base64";
+        }
+
+        // 017 M7.2 PR B: Response Topic/Correlation Data/User Properties, added to the outgoing JSON body
+        // when present. Correlation Data is base64-encoded — it's opaque binary by definition, no
+        // ambiguity requiring a paired `*_encoding` field the way `payload` needs one (payload can
+        // legitimately BE readable UTF-8 text; correlation data never claims to be). User Properties is a
+        // JSON ARRAY of {key, value} objects, not an object keyed by name — MQTT 5 permits duplicate keys
+        // and a JSON object would silently collapse them.
+        if (props.response_topic) body["response_topic"] = *props.response_topic;
+        if (props.correlation_data)
+            body["correlation_data"] = bridge_detail::base64_encode(*props.correlation_data);
+        if (!props.user_properties.empty()) {
+            auto& arr = body["user_properties"] = nlohmann::json::array();
+            for (const auto& [k, v] : props.user_properties) arr.push_back({{"key", k}, {"value", v}});
         }
 
         httplib::Headers headers;
@@ -384,15 +412,17 @@ public:
     }
 
     // EXACTLY `NativeBroker::on_publish()`'s callback signature (017 Phase 1) — wire this method
-    // directly: `broker.on_publish([&](auto t, auto p, auto q){ engine.handle_publish(t, p, q); });`.
-    // Never throws: a malformed/non-JSON payload only makes payload-derived tags read 0.0 (above), never
-    // aborts the publish path a device is relying on.
-    void handle_publish(std::string_view topic, std::span<const std::byte> payload,
-                        std::uint8_t qos) noexcept {
+    // directly: `broker.on_publish([&](auto t, auto p, auto q, const auto& props){ engine.handle_publish(t,
+    // p, q, props); });`. Never throws: a malformed/non-JSON payload only makes payload-derived tags read
+    // 0.0 (above), never aborts the publish path a device is relying on. 017 M7.2 PR B: `props` is
+    // forwarded to `IBridgeSink::publish()` unchanged — this engine doesn't itself act on Response
+    // Topic/Correlation Data/User Properties, it's purely a pass-through to whichever sink a rule targets.
+    void handle_publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                        const PublishProperties& props) noexcept {
         for (auto& rule : rules_) {
             if (!topic_matches(rule.topic_filter, topic)) continue;
             if (rule.expr && !fires(*rule.expr, payload, qos)) continue;
-            if (rule.sink) (void)rule.sink->publish(topic, payload, qos);
+            if (rule.sink) (void)rule.sink->publish(topic, payload, qos, props);
         }
     }
 

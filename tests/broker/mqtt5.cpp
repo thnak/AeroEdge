@@ -56,8 +56,12 @@
 // its own "M7.2 (PR A)" section below: the publish_to() v5-Properties fix itself (folded into every
 // existing v5 wait_publish() call surviving unmodified — see that function's comment), Message Expiry
 // Interval delivered-when-fresh / dropped-when-stale, Maximum Packet Size enforcement, and Will Message
-// Expiry honored. Response Topic, Correlation Data, and User Properties are explicitly OUT of scope for
-// this PR (see native_broker.hpp's PublishExtras banner) — not tested here, deferred to a future PR B.
+// Expiry honored.
+//
+// 017 M7.2 PR B (Response Topic + Correlation Data + User Properties, end-to-end) is tested in its own
+// "017 M7.2 PR B coverage" section below: both fields surviving PUBLISH -> subscriber, User Properties
+// (including a duplicate key) surviving in order, a retained replay carrying both fields, Response Topic
+// wildcard rejection (DISCONNECT reason 0x90), and a Will carrying Response Topic + a User Property.
 // Deterministic, exit-code-gated (0 = pass); bounded polling; clean shutdown.
 #include <atomic>
 #include <chrono>
@@ -101,6 +105,19 @@ void put_prop_str_pair(std::vector<std::byte>& recs, std::uint8_t id, const std:
     recs.push_back(static_cast<std::byte>(id));
     mqtt::put_str(recs, k);
     mqtt::put_str(recs, v);
+}
+// 017 M7.2 PR B: Response Topic (0x08) is wire-encoded as a plain UTF-8 String — same shape as e.g.
+// Content Type, just a length-prefixed string record.
+void put_prop_str(std::vector<std::byte>& recs, std::uint8_t id, const std::string& v) {
+    recs.push_back(static_cast<std::byte>(id));
+    mqtt::put_str(recs, v);
+}
+// 017 M7.2 PR B: Correlation Data (0x09) is wire-encoded as length-prefixed Binary Data — deliberately
+// takes raw bytes (not a std::string) so a test can embed a NUL byte and prove binary safety end-to-end.
+void put_prop_binary(std::vector<std::byte>& recs, std::uint8_t id, const std::vector<std::byte>& v) {
+    recs.push_back(static_cast<std::byte>(id));
+    mqtt::put_u16_be(recs, static_cast<std::uint16_t>(v.size()));
+    recs.insert(recs.end(), v.begin(), v.end());
 }
 void put_prop_varint(std::vector<std::byte>& recs, std::uint8_t id, std::uint32_t v) {
     recs.push_back(static_cast<std::byte>(id));
@@ -359,6 +376,11 @@ bool test_properties_codec() {
     put_prop_u16(records, 0x23, 42);                        // Topic Alias (M7.1)
     put_prop_u32(records, 0x02, 30);                        // Message Expiry Interval (M7.2 PR A)
     put_prop_u32(records, 0x27, 65536);                     // Maximum Packet Size (M7.2 PR A)
+    put_prop_str(records, 0x08, "reply/to/topic");           // Response Topic (M7.2 PR B)
+    // Correlation Data (M7.2 PR B) — embeds a NUL byte to prove binary safety (vector<byte>, not a
+    // C-string that would silently truncate at the first \0).
+    const std::vector<std::byte> corr_data{std::byte{'a'}, std::byte{0x00}, std::byte{'b'}};
+    put_prop_binary(records, 0x09, corr_data);
 
     std::vector<std::byte> body;
     mqtt::put_remaining_length(body, static_cast<std::uint32_t>(records.size()));
@@ -376,6 +398,18 @@ bool test_properties_codec() {
           *parsed->message_expiry_interval == 30u;
     ok &= parsed.has_value() && parsed->maximum_packet_size.has_value() &&
           *parsed->maximum_packet_size == 65536u;
+    // 017 M7.2 PR B: the two User Properties (0x26) are asserted now — the pre-existing block above
+    // wrote them but never checked them; User Property is repeatable (§3.3.2.3.7), so both must survive
+    // in order, not just be de-duplicated/overwritten.
+    ok &= parsed.has_value() && parsed->user_properties.size() == 2;
+    if (parsed.has_value() && parsed->user_properties.size() == 2) {
+        ok &= parsed->user_properties[0].first == "k1" && parsed->user_properties[0].second == "v1";
+        ok &= parsed->user_properties[1].first == "k2" && parsed->user_properties[1].second == "v2";
+    }
+    ok &= parsed.has_value() && parsed->response_topic.has_value() &&
+          *parsed->response_topic == "reply/to/topic";
+    ok &= parsed.has_value() && parsed->correlation_data.has_value() &&
+          *parsed->correlation_data == corr_data;
     ok &= pos == body.size() - 2;  // stopped exactly at the sentinel, not before or past it
     ok &= pos < body.size() && std::to_integer<std::uint8_t>(body[pos]) == 0xAB;
 
@@ -763,8 +797,8 @@ bool test_topic_alias_inbound() {
 // ===== 017 M7.2 PR A coverage: outbound Properties infra (publish_to() now writes a real v5 Properties
 //       block — fixing the previously-latent §3.3.1 "at least an empty Properties field" bug, see this
 //       file's banner), Message Expiry Interval TTL enforcement, and Maximum Packet Size enforcement.
-//       Response Topic/Correlation Data/User Properties are explicitly OUT of scope — see
-//       native_broker.hpp's PublishExtras banner — and are not exercised here. ========================
+//       Response Topic/Correlation Data/User Properties are covered separately, in the "017 M7.2 PR B
+//       coverage" section further below. ==============================================================
 
 // (M7.2-1) A retained PUBLISH with Message Expiry Interval=5s, replayed to a SUBSCRIBE that arrives
 // shortly afterward (not stale), is delivered with a REMAINING (not original) Message Expiry — proves
@@ -920,6 +954,206 @@ bool test_will_message_expiry_honored() {
     return ok;
 }
 
+// ===== 017 M7.2 PR B coverage: Response Topic + Correlation Data + User Properties, end-to-end from
+//       inbound PUBLISH through delivery to a subscriber (via NativeBroker::PublishExtras, threaded
+//       through deliver_publish/publish_to — see native_broker.hpp's PublishExtras/PublishProperties
+//       comments) and through retained replay / Will delivery, which share the same delivery path. =====
+
+// (M7.2b-1) Both Response Topic and Correlation Data (the latter carrying an embedded NUL, proving
+// binary safety end-to-end — not just at the codec unit level, see test_properties_codec) survive a
+// PUBLISH -> subscriber round trip.
+bool test_response_topic_and_correlation_data_roundtrip() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient sub, pub;
+    ok &= sub.connect_raw(port, "m72b-rtcd-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72b/rtcd", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    ok &= pub.connect_raw(port, "m72b-rtcd-pub", 0x05).ok;
+    std::vector<std::byte> pub_props;
+    put_prop_str(pub_props, 0x08, "m72b/reply-here");
+    const std::vector<std::byte> corr_data{std::byte{0x01}, std::byte{0x00}, std::byte{0x02}};
+    put_prop_binary(pub_props, 0x09, corr_data);
+    ok &= pub.publish_v5("m72b/rtcd", "payload-with-props", /*qos=*/1, /*retain=*/false, /*is_v5=*/true,
+                         pub_props);
+
+    auto got = sub.wait_publish_v5_extras();
+    ok &= got.has_value() && got->topic == "m72b/rtcd" && got->payload == "payload-with-props";
+    ok &= got.has_value() && got->props.response_topic.has_value() &&
+          *got->props.response_topic == "m72b/reply-here";
+    ok &= got.has_value() && got->props.correlation_data.has_value() &&
+          *got->props.correlation_data == corr_data;
+
+    pub.close();
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.2b-2) 3+ User Properties, including a DUPLICATE key with a different value, all survive in order —
+// proves read_properties()/publish_to() both treat User Property as repeatable (§3.3.2.3.7), not
+// overwritten on a later occurrence of the same key.
+bool test_user_properties_roundtrip() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient sub, pub;
+    ok &= sub.connect_raw(port, "m72b-up-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72b/up", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    ok &= pub.connect_raw(port, "m72b-up-pub", 0x05).ok;
+    std::vector<std::byte> pub_props;
+    put_prop_str_pair(pub_props, 0x26, "device", "plc-1");
+    put_prop_str_pair(pub_props, 0x26, "unit", "celsius");
+    put_prop_str_pair(pub_props, 0x26, "device", "plc-1-secondary");  // duplicate key, different value
+    ok &= pub.publish_v5("m72b/up", "payload", /*qos=*/1, /*retain=*/false, /*is_v5=*/true, pub_props);
+
+    auto got = sub.wait_publish_v5_extras();
+    ok &= got.has_value() && got->topic == "m72b/up";
+    ok &= got.has_value() && got->props.user_properties.size() == 3;
+    if (got.has_value() && got->props.user_properties.size() == 3) {
+        ok &= got->props.user_properties[0].first == "device" &&
+              got->props.user_properties[0].second == "plc-1";
+        ok &= got->props.user_properties[1].first == "unit" &&
+              got->props.user_properties[1].second == "celsius";
+        ok &= got->props.user_properties[2].first == "device" &&
+              got->props.user_properties[2].second == "plc-1-secondary";
+    }
+
+    pub.close();
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.2b-3) A retained PUBLISH carrying both Response Topic and Correlation Data, replayed to a LATER
+// SUBSCRIBE, still carries both — exercises RetainedMessage::extras (threaded by PR A, populated by this
+// PR): proves publish_to()'s retained-replay path writes the same Properties block a live fan-out would.
+bool test_response_topic_survives_retained_replay() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "m72b-retained-pub", 0x05).ok;
+    std::vector<std::byte> pub_props;
+    put_prop_str(pub_props, 0x08, "m72b/retained-reply");
+    const std::vector<std::byte> corr_data{std::byte{0xAA}, std::byte{0xBB}};
+    put_prop_binary(pub_props, 0x09, corr_data);
+    ok &= pub.publish_v5("m72b/retained", "sticky-payload", /*qos=*/1, /*retain=*/true, /*is_v5=*/true,
+                         pub_props);
+    pub.close();
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "m72b-retained-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72b/retained", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    auto got = sub.wait_publish_v5_extras();
+    ok &= got.has_value() && got->topic == "m72b/retained" && got->payload == "sticky-payload";
+    ok &= got.has_value() && got->props.response_topic.has_value() &&
+          *got->props.response_topic == "m72b/retained-reply";
+    ok &= got.has_value() && got->props.correlation_data.has_value() &&
+          *got->props.correlation_data == corr_data;
+
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.2b-4) A Response Topic containing a wildcard ('+') is a protocol error (§3.3.2.3.5 — a Response
+// Topic must be a valid Topic Name, never a Topic Filter) — the broker sends DISCONNECT reason 0x90
+// (Topic Name Invalid) and the PUBLISH is never delivered to a subscriber that would otherwise have
+// matched it.
+bool test_response_topic_wildcard_rejected() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "m72b-wc-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72b/wc", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "m72b-wc-pub", 0x05).ok;
+    std::vector<std::byte> pub_props;
+    put_prop_str(pub_props, 0x08, "m72b/+/invalid");  // wildcard — illegal in a Response Topic
+    // qos=0: publish_v5() only blocks on a PUBACK for qos>0, and the broker never gets that far here
+    // (handle_publish rejects before acting on the PUBLISH at all) — a qos>0 wait would just time out.
+    ok &= pub.publish_v5("m72b/wc", "should-not-arrive", /*qos=*/0, /*retain=*/false, /*is_v5=*/true,
+                         pub_props);
+
+    auto disc = pub.wait_for_packet(0xE0, 2000);
+    ok &= disc.has_value() && disc->size() >= 1 && std::to_integer<std::uint8_t>((*disc)[0]) == 0x90;
+
+    auto got = sub.wait_publish(500);
+    ok &= !got.has_value();  // never delivered
+
+    pub.close();
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
+// (M7.2b-5) Mirrors test_will_message_expiry_honored's pattern: a v5 Will carries Response Topic + a
+// User Property (Design §3's Will Properties extension — Session::will_extras now captures these the
+// same way it already captured Message Expiry Interval in PR A). An abrupt disconnect fires the Will;
+// a later subscriber sees both fields survive — proving the Will/regular-PUBLISH shared delivery path
+// invariant this file documents extends to PR B's new fields too.
+bool test_will_response_topic_and_user_properties_honored() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    std::vector<std::byte> will_props;
+    put_prop_str(will_props, 0x08, "m72b/will-reply");
+    put_prop_str_pair(will_props, 0x26, "reason", "abrupt-disconnect");
+
+    {
+        V5TestClient dying;
+        auto ack = dying.connect_raw(port, "m72b-will-dying", /*protocol_level=*/0x05,
+                                     /*connect_props_records=*/{}, /*clean_session=*/true,
+                                     /*keep_alive_s=*/60, /*has_will=*/true, /*will_topic=*/"m72b/will",
+                                     /*will_message=*/"will-payload", /*will_qos=*/1,
+                                     /*will_retain=*/true, will_props);
+        ok &= ack.ok;
+        dying.close();  // abrupt end — fires the Will (3.1.2.5), stored retained so the LATER subscriber
+                        // below (which connects after the Will has already fired) still receives it —
+                        // mirrors test_will_message_expiry_honored's own will_retain=true for the same
+                        // reason.
+    }
+
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "m72b-will-sub", 0x05).ok;
+    auto suback = sub.subscribe_v5("m72b/will", /*qos=*/1, /*is_v5=*/true);
+    ok &= suback.has_value();
+
+    auto got = sub.wait_publish_v5_extras();
+    ok &= got.has_value() && got->topic == "m72b/will" && got->payload == "will-payload";
+    ok &= got.has_value() && got->props.response_topic.has_value() &&
+          *got->props.response_topic == "m72b/will-reply";
+    ok &= got.has_value() && got->props.user_properties.size() == 1;
+    if (got.has_value() && got->props.user_properties.size() == 1) {
+        ok &= got->props.user_properties[0].first == "reason" &&
+              got->props.user_properties[0].second == "abrupt-disconnect";
+    }
+
+    sub.close();
+    broker.stop();
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -945,6 +1179,13 @@ int main() {
         {"test_message_expiry_dropped_when_stale", test_message_expiry_dropped_when_stale},
         {"test_max_packet_size_enforced", test_max_packet_size_enforced},
         {"test_will_message_expiry_honored", test_will_message_expiry_honored},
+        {"test_response_topic_and_correlation_data_roundtrip",
+         test_response_topic_and_correlation_data_roundtrip},
+        {"test_user_properties_roundtrip", test_user_properties_roundtrip},
+        {"test_response_topic_survives_retained_replay", test_response_topic_survives_retained_replay},
+        {"test_response_topic_wildcard_rejected", test_response_topic_wildcard_rejected},
+        {"test_will_response_topic_and_user_properties_honored",
+         test_will_response_topic_and_user_properties_honored},
     };
     bool ok = true;
     for (const auto& t : tests) {
