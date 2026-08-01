@@ -141,27 +141,29 @@ inline std::optional<PropWireType> property_wire_type(std::uint32_t id) noexcept
 
 // The properties this codec's callers currently need out of a Properties block: Session Expiry Interval
 // (017 M7.1 — TTL enforcement lives in NativeBroker, this codec just surfaces the parsed value), Topic
-// Alias (017 M7.1 — inbound PUBLISH alias resolution, also NativeBroker-side), and, as of 017 M7.2 PR A,
-// Message Expiry Interval + Maximum Packet Size (017 M7.2 PR A — PUBLISH TTL and per-session outbound
-// size cap, both enforced in NativeBroker). response_topic/correlation_data/user_properties are shaped
-// here already but stay unpopulated until a future PR B — read_properties() below does NOT store into
-// them yet (see its own comment); every other recognized property is recognized only so it can be
-// skipped (never stored anywhere).
+// Alias (017 M7.1 — inbound PUBLISH alias resolution, also NativeBroker-side), Message Expiry Interval +
+// Maximum Packet Size (017 M7.2 PR A — PUBLISH TTL and per-session outbound size cap, both enforced in
+// NativeBroker), and, as of 017 M7.2 PR B, Response Topic + Correlation Data + User Properties (the MQTT 5
+// request/response pattern, §3.3.2.3.5-§3.3.2.3.7 — semantic validation such as Response Topic's
+// no-wildcards rule lives in NativeBroker, this codec only stores the raw values). Every other recognized
+// property is recognized only so it can be skipped (never stored anywhere).
 struct ParsedProperties {
     std::optional<std::uint32_t> session_expiry_interval;
     std::optional<std::uint16_t> topic_alias;
     std::optional<std::uint32_t> message_expiry_interval;   // 017 M7.2 PR A — 0x02
     std::optional<std::uint32_t> maximum_packet_size;        // 017 M7.2 PR A — 0x27
-    std::optional<std::string> response_topic;                // future PR B — 0x08, always nullopt for now
-    std::optional<std::vector<std::byte>> correlation_data;    // future PR B — 0x09, always nullopt for now
-    std::vector<std::pair<std::string, std::string>> user_properties;  // future PR B — 0x26, always empty
+    std::optional<std::string> response_topic;                // 017 M7.2 PR B — 0x08
+    std::optional<std::vector<std::byte>> correlation_data;    // 017 M7.2 PR B — 0x09
+    std::vector<std::pair<std::string, std::string>> user_properties;  // 017 M7.2 PR B — 0x26, repeatable
 };
 
 // Reads a Property Length varint, then walks exactly that many bytes as a sequence of
 // `{property_id (varint), value}` TLV records, using property_wire_type() to know each value's length.
-// Stores session_expiry_interval (0x11), message_expiry_interval (0x02), and maximum_packet_size (0x27)
-// when their IDs appear; every other recognized ID (including 0x08/0x09/0x26, left for a future PR B) is
-// just skipped past.
+// Stores session_expiry_interval (0x11), message_expiry_interval (0x02), maximum_packet_size (0x27),
+// response_topic (0x08), correlation_data (0x09), and user_properties (0x26, repeatable — every
+// occurrence is appended, not overwritten: duplicate keys with different values are legal per
+// §3.3.2.3.7 and a subscriber needs to see every instance) when their IDs appear; every other recognized
+// ID is just skipped past.
 // `nullopt` on: a malformed Property Length varint, a truncated record, an ID not in the type table
 // above (this codec has no way to know its length, so it fails closed rather than guessing), or a
 // records total that doesn't exactly fill the declared Property Length. Advances `pos` to just past the
@@ -224,10 +226,18 @@ inline std::optional<ParsedProperties> read_properties(const std::vector<std::by
                     (std::to_integer<std::uint8_t>(body[pos]) << 8) | std::to_integer<std::uint8_t>(body[pos + 1]));
                 pos += 2;
                 if (pos + len > end) return std::nullopt;
+                if (*id == 0x08) {  // Response Topic (017 M7.2 PR B)
+                    result.response_topic = std::string(
+                        reinterpret_cast<const char*>(body.data() + pos), len);
+                } else if (*id == 0x09) {  // Correlation Data (017 M7.2 PR B)
+                    result.correlation_data.emplace(body.begin() + static_cast<std::ptrdiff_t>(pos),
+                                                     body.begin() + static_cast<std::ptrdiff_t>(pos + len));
+                }
                 pos += len;
                 break;
             }
             case PropWireType::Utf8StringPair: {
+                std::string key, value;
                 for (int k = 0; k < 2; ++k) {
                     if (pos + 2 > end) return std::nullopt;
                     const std::uint16_t len = static_cast<std::uint16_t>(
@@ -235,7 +245,17 @@ inline std::optional<ParsedProperties> read_properties(const std::vector<std::by
                         std::to_integer<std::uint8_t>(body[pos + 1]));
                     pos += 2;
                     if (pos + len > end) return std::nullopt;
+                    if (*id == 0x26) {  // User Property (017 M7.2 PR B, repeatable)
+                        (k == 0 ? key : value)
+                            .assign(reinterpret_cast<const char*>(body.data() + pos), len);
+                    }
                     pos += len;
+                }
+                if (*id == 0x26) {
+                    // emplace_back, not assignment: User Property is explicitly repeatable
+                    // (§3.3.2.3.7) — duplicate keys with different values are legal and must all
+                    // survive so a subscriber sees every instance.
+                    result.user_properties.emplace_back(std::move(key), std::move(value));
                 }
                 break;
             }
@@ -261,13 +281,12 @@ inline void put_topic_alias_max_properties(std::vector<std::byte>& out, std::uin
 
 // A general outbound Properties writer — previously deferred (see this file's now-stale prior banner
 // above put_empty_properties, which used to say "nothing calls for one yet") because nothing needed to
-// combine more than one fixed property per packet. 017 M7.2 PR A's PUBLISH properties (Message Expiry,
-// and a future PR B's Response Topic/Correlation Data/User Properties) are each independently optional
-// and must combine onto ONE Properties block on NativeBroker::publish_to() — that needs a builder, not
-// more fixed-shape put_..._properties() functions. Only put_u32/put_str are exercised by PR A (Message
-// Expiry is the only property PR A ever writes); put_binary/put_str_pair are added now anyway since this
-// class's whole job is to also be PR B's writer, and a half-built builder just invites a second edit pass
-// later for no benefit.
+// combine more than one fixed property per packet. 017 M7.2's PUBLISH properties (Message Expiry from
+// PR A; Response Topic/Correlation Data/User Properties from PR B) are each independently optional and
+// must combine onto ONE Properties block on NativeBroker::publish_to() — that needs a builder, not more
+// fixed-shape put_..._properties() functions. put_u32/put_str were exercised starting with PR A (Message
+// Expiry); put_binary/put_str_pair, added in the same pass anyway to avoid a half-built builder, are now
+// exercised too, by PR B.
 class PropertyWriter {
 public:
     void put_u32(std::uint8_t id, std::uint32_t v) {

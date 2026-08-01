@@ -31,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -123,6 +124,59 @@ public:
         std::vector<std::byte> vh;
         mqtt::put_str(vh, topic);
         if (qos > 0) mqtt::put_u16_be(vh, next_id());
+        for (char c : payload) vh.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(c)));
+        std::uint8_t flags = static_cast<std::uint8_t>(qos << 1);
+        if (retain) flags |= 0x01;
+        if (!mqtt::write_packet(fd_, static_cast<std::byte>(0x30 | flags), vh)) return false;
+        return qos == 0 || wait_for(0x40, 2000).has_value();
+    }
+
+    // 017 M7.2 PR B: a v5 CONNECT (protocol level 5) with an empty CONNECT Properties block — this test
+    // file's TestClient is otherwise v4-only (connect() above hardcodes level 4); this minimal v5 path
+    // exists solely so main()'s on_publish() test can prove the new 4th PublishProperties parameter is
+    // populated correctly, which requires a PUBLISH able to carry Properties at all.
+    [[nodiscard]] bool connect_v5(std::uint16_t port, const std::string& client_id) {
+        auto fd = quark::pal::tcp_connect(quark::pal::ipv4_loopback, port);
+        if (!fd) return false;
+        fd_ = *fd;
+        const auto writable = aero::pal::wait_writable(fd_, 2000);
+        if (!writable || !*writable || !quark::pal::connect_result(fd_)) return false;
+
+        running_.store(true, std::memory_order_release);
+        peer_closed_.store(false, std::memory_order_release);
+        reader_ = std::thread([this] { reader_loop(); });
+
+        std::vector<std::byte> vh;
+        mqtt::put_str(vh, "MQTT");
+        vh.push_back(std::byte{0x05});  // protocol level 5 == MQTT 5
+        vh.push_back(std::byte{0x02});  // connect flags: clean session, no will/user/pass
+        mqtt::put_u16_be(vh, /*keep_alive_s=*/60);
+        mqtt::put_empty_properties(vh);  // CONNECT Properties — empty is legal (§3.1.2.11)
+        mqtt::put_str(vh, client_id);
+        if (!mqtt::write_packet(fd_, std::byte{0x10}, vh)) return false;
+
+        auto ack = wait_for(0x20, 2000);
+        if (!ack.has_value() || ack->body.size() < 2) return false;
+        session_present_ = (std::to_integer<std::uint8_t>(ack->body[0]) & 0x01) != 0;
+        return std::to_integer<std::uint8_t>(ack->body[1]) == 0;
+    }
+
+    // 017 M7.2 PR B: a v5 PUBLISH carrying Response Topic (0x08), Correlation Data (0x09), and User
+    // Properties (0x26) — the wire-level counterpart of NativeBroker::PublishExtras/PublishProperties.
+    [[nodiscard]] bool publish_v5_with_props(
+        const std::string& topic, const std::string& payload, std::uint8_t qos, bool retain,
+        const std::string& response_topic, const std::vector<std::byte>& correlation_data,
+        const std::vector<std::pair<std::string, std::string>>& user_properties) {
+        std::vector<std::byte> vh;
+        mqtt::put_str(vh, topic);
+        if (qos > 0) mqtt::put_u16_be(vh, next_id());
+        mqtt::PropertyWriter pw;
+        pw.put_str(0x08, response_topic);
+        pw.put_binary(0x09, correlation_data);
+        for (const auto& [k, v] : user_properties) pw.put_str_pair(0x26, k, v);
+        std::vector<std::byte> props;
+        pw.write(props);
+        vh.insert(vh.end(), props.begin(), props.end());
         for (char c : payload) vh.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(c)));
         std::uint8_t flags = static_cast<std::uint8_t>(qos << 1);
         if (retain) flags |= 0x01;
@@ -446,10 +500,17 @@ int main() {
 
     std::mutex cb_mu;
     std::vector<std::pair<std::string, std::string>> callback_hits;
-    broker.on_publish([&](std::string_view topic, std::span<const std::byte> payload, std::uint8_t) {
+    // 017 M7.2 PR B: on_publish() gained a 4th parameter, `props` — captured here (by topic) so the (5b)
+    // block below can assert it was populated correctly for a PUBLISH that actually carried Response
+    // Topic/Correlation Data/User Properties, while every other (v4) PUBLISH in this test still sees an
+    // empty PublishProperties (proving the mechanical fallout didn't regress the v4 path).
+    std::unordered_map<std::string, aero::broker::PublishProperties> callback_props;
+    broker.on_publish([&](std::string_view topic, std::span<const std::byte> payload, std::uint8_t,
+                          const aero::broker::PublishProperties& props) {
         std::lock_guard<std::mutex> g(cb_mu);
         callback_hits.emplace_back(std::string(topic),
                                    std::string(reinterpret_cast<const char*>(payload.data()), payload.size()));
+        callback_props[std::string(topic)] = props;
     });
 
     auto started = broker.start();
@@ -500,6 +561,18 @@ int main() {
     auto gotR = sub_retained.wait_publish();
     ok &= gotR.has_value() && gotR->first == "status/line1" && gotR->second == "up";
 
+    // (5b) 017 M7.2 PR B: on_publish()'s new 4th parameter (PublishProperties) is populated correctly for
+    // a v5 PUBLISH carrying Response Topic/Correlation Data/User Properties — this file's job is "does the
+    // public C++ API surface work" (mqtt5.cpp separately owns wire-level codec/protocol correctness).
+    TestClient pub_v5;
+    ok &= pub_v5.connect_v5(port, "pub-v5");
+    const std::vector<std::byte> corr_data{std::byte{0xAB}, std::byte{0x00}, std::byte{0xCD}};  // embeds
+                                                                                                  // a NUL
+    ok &= pub_v5.publish_v5_with_props("props/topic", "v5-payload", /*qos=*/1, /*retain=*/false,
+                                       "reply/to/me", corr_data,
+                                       {{"k1", "v1"}, {"k2", "v2"}});
+    pub_v5.close();
+
     sub_a.close();
     pub_b.close();
     sub_hash.close();
@@ -509,7 +582,25 @@ int main() {
     // (5) the on_publish() ingestion seam saw every PUBLISH this broker instance handled.
     {
         std::lock_guard<std::mutex> g(cb_mu);
-        ok &= callback_hits.size() == 6;  // temp, pressure, extra/temp, line1/temp(qos0), humidity, status
+        ok &= callback_hits.size() == 7;  // temp, pressure, extra/temp, line1/temp(qos0), humidity, status,
+                                          // props/topic (v5)
+        const auto pit = callback_props.find("props/topic");
+        ok &= pit != callback_props.end();
+        if (pit != callback_props.end()) {
+            const auto& props = pit->second;
+            ok &= props.response_topic.has_value() && *props.response_topic == "reply/to/me";
+            ok &= props.correlation_data.has_value() && *props.correlation_data == corr_data;
+            ok &= props.user_properties.size() == 2;
+            ok &= props.user_properties.size() >= 1 && props.user_properties[0].first == "k1" &&
+                  props.user_properties[0].second == "v1";
+            ok &= props.user_properties.size() >= 2 && props.user_properties[1].first == "k2" &&
+                  props.user_properties[1].second == "v2";
+        }
+        // Every OTHER (v4) PUBLISH in this test must still see an empty PublishProperties — the mechanical
+        // signature change must not leak stale/cross-talk data across unrelated PUBLISHes.
+        const auto vit = callback_props.find("status/line1");
+        ok &= vit != callback_props.end() && !vit->second.response_topic.has_value() &&
+              !vit->second.correlation_data.has_value() && vit->second.user_properties.empty();
         bool saw_status_up = false;
         for (auto& [t, p] : callback_hits)
             if (t == "status/line1" && p == "up") saw_status_up = true;

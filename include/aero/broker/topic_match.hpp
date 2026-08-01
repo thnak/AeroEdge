@@ -43,4 +43,11 @@ namespace aero::broker {
     return i == t.size();  // no '#' consumed the tail => topic must end exactly where the filter does
 }
 
+// A Topic Name (unlike a Topic Filter) must never contain a wildcard character — required for
+// Response Topic (§3.3.2.3.5) and any other place a Properties field claims to be a publishable
+// Topic Name rather than a subscribable Topic Filter.
+[[nodiscard]] inline bool topic_name_has_wildcard(std::string_view topic) noexcept {
+    return topic.find('+') != std::string_view::npos || topic.find('#') != std::string_view::npos;
+}
+
 }  // namespace aero::broker

@@ -44,6 +44,7 @@
 #include "pal/net.hpp"
 
 using aero::broker::BridgeConfig;
+using aero::broker::PublishProperties;
 using aero::broker::RabbitMqBridgeSink;
 
 namespace {
@@ -409,7 +410,7 @@ bool test_connect_and_publish() {
     for (std::size_t i = 0; i < payload_str.size(); ++i)
         payload[i] = static_cast<std::byte>(static_cast<std::uint8_t>(payload_str[i]));
 
-    ok &= sink.publish("sensor/line1/temp", payload, /*qos=*/1);
+    ok &= sink.publish("sensor/line1/temp", payload, /*qos=*/1, PublishProperties{});
     ok &= server.wait_publish();
 
     {
@@ -427,7 +428,7 @@ bool test_connect_and_publish() {
 
     // qos == 0 -> non-persistent(1).
     std::vector<std::byte> payload0{std::byte{'x'}};
-    ok &= sink.publish("sensor/line1/other", payload0, /*qos=*/0);
+    ok &= sink.publish("sensor/line1/other", payload0, /*qos=*/0, PublishProperties{});
 
     sink.close();
     server.stop();
@@ -495,7 +496,7 @@ bool test_publish_after_connection_killed() {
     const auto poll_deadline = poll_start + std::chrono::seconds(4);
     while (std::chrono::steady_clock::now() < poll_deadline) {
         const auto call_start = std::chrono::steady_clock::now();
-        const bool published = sink.publish("sensor/line1/temp", payload, /*qos=*/1);
+        const bool published = sink.publish("sensor/line1/temp", payload, /*qos=*/1, PublishProperties{});
         const auto call_elapsed = std::chrono::steady_clock::now() - call_start;
         ok &= call_elapsed < std::chrono::seconds(4);  // each individual call, never hung
         if (!published) { saw_failure = true; break; }
@@ -507,7 +508,7 @@ bool test_publish_after_connection_killed() {
     // Once failing, a further publish() must also fail fast (fail-fast posture, no reconnect loop)
     // without attempting any new I/O — still bounded/prompt.
     const auto start2 = std::chrono::steady_clock::now();
-    const bool published2 = sink.publish("sensor/line1/temp", payload, /*qos=*/1);
+    const bool published2 = sink.publish("sensor/line1/temp", payload, /*qos=*/1, PublishProperties{});
     const auto elapsed2 = std::chrono::steady_clock::now() - start2;
     ok &= !published2;
     ok &= elapsed2 < std::chrono::milliseconds(500);  // fail-fast: no I/O attempted at all
