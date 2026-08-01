@@ -20,7 +20,9 @@
 | M4 | Studio dashboard page for the broker | **Shipped** |
 | M5 | TLS + per-topic ACL for the native MQTT broker | **Shipped** — southbound (device-facing) TLS + ACL; cluster-link TLS deferred, M5.1 |
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
-| M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties (Topic Alias, Shared Subs, Request/Response, Enhanced Auth) deferred, M7.1 |
+| M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties deferred, M7.1/M7.2 |
+| M7.1 | MQTT 5 feature properties v1 slice | **Shipped** — Session Expiry Interval TTL, server DISCONNECT reason codes, inbound Topic Alias |
+| M7.2 | MQTT 5 PUBLISH Properties: Message Expiry Interval, Maximum Packet Size, Response Topic, Correlation Data, User Properties | **Shipped** — PR A (Message Expiry + Max Packet Size + shared Properties infra), PR B (Response Topic + Correlation Data + User Properties, end-to-end incl. `on_publish()`/`IBridgeSink::publish()` signature changes); outbound Topic Alias, Shared Subscriptions, Enhanced/SASL Auth deferred |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | **Shipped** — RabbitMQ only; Kafka/Pulsar deferred, M8.1/M8.2 |
 | M9 | Multi-protocol southbound (OPC-UA/Modbus) | **Superseded by spec 018** — its own spec, as this row anticipated |
 
@@ -354,20 +356,29 @@ adapts to unilaterally. Concretely:
     unestablished alias, gets `0xE0`/`0x94` (Topic Alias invalid) instead of being silently
     dropped or misrouted.
 
-  **Still deferred** — none of it is acted on yet even though the bytes are correctly
-  parsed-and-skipped or not yet parsed at all:
+  **M7.2 — PUBLISH Properties, shipped in two PRs:**
+  - **PR A** — shared outbound `PropertyWriter`/`PublishExtras` infra; **Message Expiry Interval**
+    (0x02, TTL enforced against `steady_clock` at the `publish_to()` choke point — expired messages
+    are dropped instead of delivered, both live and retained-replay paths); **Maximum Packet Size**
+    (0x27, per-session outbound cap enforced the same way, CONNACK-advertised).
+  - **PR B** — **Response Topic** (0x08, §3.3.2.3.5, rejected if it contains a wildcard —
+    DISCONNECT 0x90 "Topic Name Invalid"), **Correlation Data** (0x09, §3.3.2.3.6, opaque bytes),
+    **User Properties** (0x26, §3.3.2.3.7, repeatable — duplicate keys preserved) — all three
+    round-tripped end-to-end through a new public `PublishProperties` struct (deliberately separate
+    from the internal `PublishExtras`, which also carries the private `expiry_deadline`) threaded
+    through `NativeBroker::on_publish()`'s callback (signature break, 4th param) and
+    `IBridgeSink::publish()` (signature break, 4th param; `HttpWebhookBridgeSink` surfaces all
+    three in its JSON body, `MqttBridgeSink`/`RabbitMqBridgeSink` accept-but-ignore since neither
+    wire protocol has an equivalent concept today). Also closes a pre-existing gap: Will Properties
+    now capture the same three fields (Will and regular PUBLISH share one delivery path).
+
+  **Still deferred:**
   - **Topic Alias** (compression, i.e. the *outbound* broker→subscriber direction) — the broker
     never assigns/uses an alias of its own when delivering a PUBLISH; `publish_to()`'s wire shape
-    is unchanged.
+    is unchanged. (Inbound/client→broker Topic Alias shipped in M7.1.)
   - **Shared Subscriptions** (`$share/...`) — no special-cased SUBSCRIBE filter handling.
-  - **Request/Response pattern** — Response Topic (0x08) and Correlation Data (0x09) are parsed-
-    and-skipped, never actually round-tripped to a responder.
   - **Enhanced/SASL Authentication** — the `0xF0` AUTH packet is not implemented; Authentication
     Method/Data (0x15/0x16) are parsed-and-skipped on CONNECT.
-  - **User Properties end-to-end** — parsed-and-skipped everywhere; not surfaced through
-    `NativeBroker::on_publish()`'s callback (would change that public signature).
-  - **Message Expiry Interval / Maximum Packet Size enforcement** — parsed-and-skipped, no TTL or
-    size-limit behavior wired to either.
   Revisit any of these once a real device/integration actually needs it — same "don't build
   ahead of demand" posture M7's own predecessor entry held, now narrowed to what's left.
 - **M8.1/M8.2 — Kafka and Pulsar bridges.** M8 ships `RabbitMqBridgeSink` (rabbitmq-c, AMQP 0-9-1)
