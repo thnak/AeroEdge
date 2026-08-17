@@ -42,6 +42,7 @@
 #include "aero/drivers/modbus_rtu_driver.hpp"
 #include "aero/drivers/modbus_tcp_driver.hpp"
 #include "aero/drivers/opcua_driver.hpp"
+#include "aero/drivers/opcua_subscription_driver.hpp"
 #include "aero/ext/native_loader.hpp"
 #include "aero/mes/mes.hpp"
 #include "aero/mes/outbox.hpp"
@@ -162,6 +163,13 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
             c.value("endpoint", std::string{}),
             c.value("node_ids", std::vector<std::string>{}),
             c.value("browse_root", std::string{}));
+    });
+    // M9.3 (018 §8): OPC-UA Subscriptions/MonitoredItems — the PUSH counterpart to aero.driver.opcua
+    // above, a SEPARATE type_id/class (opcua_subscription_driver.hpp's own banner explains why: push vs
+    // pull is a different IDriver invocation contract, not a mode flag on one driver).
+    driver_reg.register_type("aero.driver.opcua_subscribe", [](const nlohmann::json& c) {
+        return std::make_unique<aero::drivers::OpcUaSubscriptionDriver>(
+            c.value("endpoint", std::string{}), c.value("node_ids", std::vector<std::string>{}));
     });
     // M9.1 PR H (018 §8): Modbus RTU/serial counterpart to aero.driver.modbus_tcp above — same
     // "register_type" selector and defaults, plus serial-specific fields (port name, baud, parity,

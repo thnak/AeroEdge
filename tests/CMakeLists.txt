@@ -414,6 +414,19 @@ target_link_libraries(opcua_driver PRIVATE aero::drivers aero::nodes aero::sdk a
 add_test(NAME opcua_driver COMMAND opcua_driver)
 set_tests_properties(opcua_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# ---- M9.3: OPC-UA Subscriptions/MonitoredItems (018 §8) ------------------------------------------------
+# OpcUaSubscriptionDriver (drivers/opcua_subscription_driver.hpp): the PUSH counterpart to OpcUaDriver, a
+# real open62541 UA_Server (own fixed port 48712, distinct from opcua_driver's 48711) with a background
+# "updater" thread bumping a Counter variable proves: (1) run() connects, subscribes, and delivers
+# multiple DISTINCT DataChange notifications, decoded correctly by the same JsonParseNode poll mode uses;
+# (2) a malformed NodeId is rejected at open() with no network I/O (this driver never dials in open());
+# (3) connection loss mid-subscription is survived and reconnected (bounded backoff, 006 §8).
+add_executable(opcua_subscription_driver drivers/opcua_subscription_driver.cpp)
+target_link_libraries(opcua_subscription_driver PRIVATE aero::drivers aero::nodes aero::sdk
+  aero-thirdparty-opcua quark::quark Threads::Threads)
+add_test(NAME opcua_subscription_driver COMMAND opcua_subscription_driver)
+set_tests_properties(opcua_subscription_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # ---- M9.1 PR H: Modbus RTU / serial southbound (018 §8) -----------------------------------------------
 # ModbusRtuDriver (drivers/modbus_rtu_driver.hpp): the serial counterpart to ModbusTcpDriver, over a new
 # aero::pal::serial PAL (this tree's first serial I/O of any kind). No portable hardware-free way to fake

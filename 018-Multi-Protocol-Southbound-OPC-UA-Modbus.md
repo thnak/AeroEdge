@@ -23,6 +23,7 @@
 | M9.1 PR G | `OpcUaDriver` — address-space browse mode (`UA_Client_Service_browse`, `browse_root` config) | **Shipped** |
 | M9.1 PR H | `ModbusRtuDriver` + `aero::pal::serial` — Modbus RTU/serial transport (FC01/02/03/04/06/16) | **Shipped** |
 | M9.2 | `Runtime` poll-timer wiring (006 §6.1) — makes `ModbusTcpDriver`/`ModbusRtuDriver`/`OpcUaDriver` actually deployable via a real Application, not just unit-testable | **Shipped** |
+| M9.3 | `OpcUaSubscriptionDriver` — OPC-UA Subscriptions/MonitoredItems, the PUSH counterpart to `OpcUaDriver` | **Shipped** |
 
 ## 1. Why
 
@@ -246,11 +247,36 @@ decode node ships for this shape — v1 puts the raw JSON array straight into th
 a caller/flow to consume directly (`JsonParseNode`, the scalar path's own decoder, does not
 understand this shape).
 
+**M9.3** shipped `OpcUaSubscriptionDriver` (`opcua_subscription_driver.hpp`, type_id
+`aero.driver.opcua_subscribe`) — OPC-UA Subscriptions/MonitoredItems, closing the "Subscriptions"
+half of the deferral above. A SEPARATE class/type_id from `OpcUaDriver`, not a mode flag on it:
+push vs pull is a different `IDriver` invocation contract (`run()` vs `poll()`,
+`DriverDescriptor::poll_driven`, M9.2), and `DriverDescriptor` is `static constexpr` per-CLASS, not
+per-instance — every driver in this tree already commits to exactly one invocation model
+(`GeneratorDriver` push-only, `ModbusTcpDriver`/`ModbusRtuDriver`/`OpcUaDriver` pull-only), and this
+follows that precedent. `run()` connects, creates ONE Subscription (open62541 defaults — 500ms
+publishing interval) with one MonitoredItem (data-change, `UA_ATTRIBUTEID_VALUE`) per configured
+NodeId, then pumps `UA_Client_run_iterate()` until stopped; open62541's client has no internal
+thread, so the data-change callback fires synchronously on `run()`'s own thread — safe to push into
+the bound sink directly, no cross-thread handoff. Each Frame carries exactly ONE
+`{"nodeId": value}` entry (one per notification), NOT a batched multi-NodeId object like poll
+mode's own payload — so subscription mode has no analogue to poll mode's "~3 NodeIds per poll"
+batching cap (§3); the only per-Frame constraint is that ONE NodeId-string+value pair fits under
+128 bytes, checked per-entry at `open()`. No write()/method-call surface in v1 (a deployment
+needing both notifications and writes to the same endpoint runs an `OpcUaDriver` instance
+alongside this one). Reconnect (006 §8) rebuilds the Subscription/MonitoredItems from scratch on
+any connection loss — open62541 does not resurrect a Subscription across a fresh session — and
+leans on open62541's own `connectivityCheckInterval` (set to 2s, shortened from its 5s-timeout
+defaults) for an active liveness check inside `run_iterate()`, rather than passively waiting on
+channel/session state alone (a peer that vanishes without a clean TCP FIN can leave that looking
+nominally healthy for a long time).
+
 **Explicitly deferred** (M9.1, §8): security policies (Sign/SignAndEncrypt, certificate-based
-client auth), Subscriptions/MonitoredItems (OPC-UA's native push mechanism — v1 is pure poll,
-matching the pull-driver shape 006 §6 already defines and keeping parity with the Modbus driver),
-and — within browsing itself — continuation-point paging beyond the first `kMaxBrowseResults`
-children, and reading nested subtrees (v1 is exactly one browse level per `poll()` call).
+client auth), and — within browsing itself — continuation-point paging beyond the first
+`kMaxBrowseResults` children, and reading nested subtrees (v1 is exactly one browse level per
+`poll()` call). Within Subscriptions (M9.3): Events (only DataChange notifications), server-
+requested-parameter renegotiation (accepts whatever the server revises), and resubscribing to an
+EXISTING subscription id after a reconnect (v1 always creates a fresh one).
 
 ## 6. Capability table
 
@@ -266,10 +292,11 @@ children, and reading nested subtrees (v1 is exactly one browse level per `poll(
 | OPC-UA: scalar write to a configured NodeId | **shipped** | M9.1 PR E, `OpcUaDriver::write()` |
 | OPC-UA: single-argument method call | **shipped** | M9.1 PR F, `OpcUaDriver::write()` |
 | OPC-UA: address-space browse (one root, one level, capped result count) | **shipped** | M9.1 PR G, `OpcUaDriver` browse mode |
-| OPC-UA: security policies, Subscriptions, browse paging/nested subtrees | backlog | M9.1 |
+| OPC-UA: Subscriptions/MonitoredItems (data-change push) | **shipped** | M9.3, `OpcUaSubscriptionDriver` |
+| OPC-UA: security policies, browse paging/nested subtrees, Subscription Events | backlog | M9.1/M9.3 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |
-| Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | both drivers |
+| Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | all drivers |
 | `Runtime::deploy()` actually drives PULL drivers (006 §6.1 timer/poll wiring) | **shipped** | M9.2, `Deployment::poller` |
 
 ## 7. Security
@@ -283,16 +310,22 @@ posture matching how these protocols are actually deployed today (a trusted OT n
 not a claim that either driver is safe to dial across an untrusted network — revisit if a
 deployment needs that.
 
-## 8. Open questions (M9.1/M9.2)
+## 8. Open questions (M9.1/M9.2/M9.3)
 
 - **OPC-UA security policies + cert-based auth.** Sign/SignAndEncrypt, client certificates —
   deferred because it would couple this driver's crypto needs to (or duplicate) 017 M5's mbedTLS
   vendoring, and no current deployment target needs it yet. Revisit alongside 017 §10's M5.1
   (cluster-link TLS) if/when either becomes a real requirement.
-- **OPC-UA Subscriptions/MonitoredItems.** The OPC-UA-native push equivalent of MQTT's
-  subscribe-and-get-notified — would let `OpcUaDriver` become a push (`run()`) driver instead of
-  poll, lower latency and lower request volume than v1's poll loop. Revisit once poll-interval
-  latency is a measured problem, not preemptively.
+- **OPC-UA Subscriptions v1 limits (M9.3).** `OpcUaSubscriptionDriver` ships DataChange
+  notifications only (no Events), open62541's default subscription parameters (no per-deployment
+  tuning of publishing interval/queue size yet), and always creates a FRESH Subscription on
+  reconnect rather than resubscribing to an existing id (open62541 doesn't resurrect one across a
+  new session anyway, so there's nothing to resume). Also: this driver's own test found that
+  detecting a peer that vanishes WITHOUT a clean TCP FIN can be very slow via passive channel/
+  session-state checks alone (30+ seconds observed) — `connectivityCheckInterval` (2s) mitigates
+  this for real network failures, but a test harness that tears a UA_Server down via
+  `UA_Server_delete()` mid-session (not a real-world "cable unplugged" scenario) may not exercise
+  it reliably; revisit if a real deployment shows slow reconnect after a genuine network drop.
 - **M9.2 poll-timer v1 limits.** `Deployment::poller`'s cadence is a plain `sleep`-based loop
   (20ms wake-up granularity to check `stop_flag`), not a real Quark timer/scheduler primitive
   (006 §6.1's original diagram sketched "Quark timer (011)" — 011 doesn't exist as a reusable
