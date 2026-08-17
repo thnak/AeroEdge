@@ -417,3 +417,9 @@ if(AEROEDGE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+# ---- Benchmarks (manual, not ctest gates) -----------------------------------
+option(AEROEDGE_BUILD_BENCH "Build AeroEdge benchmarks (manual load-test tools, not ctest gates)" OFF)
+if(AEROEDGE_BUILD_BENCH)
+  add_subdirectory(bench)
+endif()

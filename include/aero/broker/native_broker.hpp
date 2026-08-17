@@ -45,6 +45,7 @@
 // neither behaves EXACTLY as Phase 1/Milestone 1 did, no exceptions. See Config's own field comments.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -368,6 +369,7 @@ private:
             return std::visit(
                 [&](auto& ch) { return aero::transport::mqtt::write_packet(ch, type_flags, body); }, channel);
         }
+
     };
 
     // A QoS ≥1 message that arrived for a client-id while it had no live connection (persistent session,
@@ -490,7 +492,7 @@ private:
             if (type == 0x10) {          // CONNECT
                 if (!handle_connect(s, *pkt)) break;
             } else if (type == 0x80) {   // SUBSCRIBE
-                if (!handle_subscribe(*s, *pkt)) break;
+                if (!handle_subscribe(s, *pkt)) break;
             } else if (type == 0x30) {   // PUBLISH
                 if (!handle_publish(*s, *pkt)) break;
             } else if (type == 0x60) {   // PUBREL (4.3.3 step 3; low nibble MUST be 0x2, not checked —
@@ -772,6 +774,11 @@ private:
             }
         }
         if (!restored_subs.empty()) {
+            // Topic index (post-benchmark addition, see route_publish()'s own banner): index BEFORE the
+            // move below consumes restored_subs — this is the OTHER place (besides handle_subscribe) a
+            // session's subs can grow, since a persistent-session reconnect restores its prior filters
+            // wholesale without going through SUBSCRIBE again.
+            for (const Subscription& sub : restored_subs) index_subscription(s, sub.filter);
             std::lock_guard<std::mutex> g(s->subs_mu);
             s->subs = std::move(restored_subs);
         }
@@ -793,7 +800,7 @@ private:
         return true;
     }
 
-    bool handle_subscribe(Session& s, const aero::transport::mqtt::Packet& pkt) {
+    bool handle_subscribe(const std::shared_ptr<Session>& s, const aero::transport::mqtt::Packet& pkt) {
         const std::vector<std::byte>& b = pkt.body;
         if (b.size() < 2) return false;
         const std::uint16_t packet_id =
@@ -804,7 +811,7 @@ private:
         // Discarded — Subscription Identifier/User Property aren't acted on in v1 — but must still be
         // walked past correctly or the filter loop below would misparse the first filter's length as
         // properties bytes. Malformed -> treated like any other malformed SUBSCRIBE (return false).
-        if (s.protocol_version == 5) {
+        if (s->protocol_version == 5) {
             auto props = aero::transport::mqtt::read_properties(b, pos);
             if (!props) return false;
         }
@@ -827,29 +834,37 @@ private:
             // (failure) and the filter is NOT added to `added` — so it never enters s.subs and can never
             // match in route_publish()/the retained-replay loop below.
             const bool allowed =
-                !cfg_.authorizer || cfg_.authorizer->allow(s.principal, filter, AclAction::Subscribe);
+                !cfg_.authorizer || cfg_.authorizer->allow(s->principal, filter, AclAction::Subscribe);
             if (allowed) {
                 added.push_back(Subscription{filter, qos});
                 granted.push_back(static_cast<std::byte>(qos));
             } else {
                 // 3.9.3 (v4): 0x80 SUBACK failure. MQTT 5 §3.9.3: 0x87 Not Authorized is the v5-specific
                 // reason code for the same denial — v4 sessions keep 0x80 unchanged.
-                granted.push_back(s.protocol_version == 5 ? std::byte{0x87} : std::byte{0x80});
+                granted.push_back(s->protocol_version == 5 ? std::byte{0x87} : std::byte{0x80});
             }
         }
         {
             // Copy, not move — `added` is still read below for the retained-message replay.
-            std::lock_guard<std::mutex> g(s.subs_mu);
-            for (const Subscription& sub : added) s.subs.push_back(sub);
+            std::lock_guard<std::mutex> g(s->subs_mu);
+            for (const Subscription& sub : added) s->subs.push_back(sub);
         }
+        // Topic index (post-benchmark addition, see route_publish()'s own banner): mirrors `added` into
+        // exact_topic_index_/wildcard_subscribers_ so route_publish() never has to scan this session for a
+        // topic none of its filters could possibly match. Done AFTER releasing subs_mu (index_subscription
+        // takes its own topic_index_mu_ — never nest the two, matches this file's existing per-resource
+        // lock discipline) and BEFORE the SUBACK is sent, so the index is never behind what the client was
+        // just told is subscribed.
+        for (const Subscription& sub : added) index_subscription(s, sub.filter);
+
         // SUBACK variable header (MQTT 5 §3.9.2): Packet Identifier, then Properties, THEN the payload's
         // reason-code list — verified against the spec rather than assumed (Properties precede the
         // reason codes, mirroring PUBACK/PUBREC's own Packet-Id-then-Properties shape elsewhere in v5).
         std::vector<std::byte> vh;
         aero::transport::mqtt::put_u16_be(vh, packet_id);
-        if (s.protocol_version == 5) aero::transport::mqtt::put_empty_properties(vh);
+        if (s->protocol_version == 5) aero::transport::mqtt::put_empty_properties(vh);
         vh.insert(vh.end(), granted.begin(), granted.end());
-        if (!s.send_packet(std::byte{0x90}, vh)) return false;  // SUBACK
+        if (!s->send_packet(std::byte{0x90}, vh)) return false;  // SUBACK
 
         // Retained-message replay (3.1.1 §3.8.4): a new matching SUBSCRIBE gets the retained payload
         // immediately, at the subscription's granted QoS. M7.2 PR A: msg.extras carries the retained
@@ -859,7 +874,7 @@ private:
         for (const Subscription& sub : added) {
             for (const auto& [topic, msg] : retained_) {
                 if (topic_matches(sub.filter, topic)) {
-                    if (!publish_to(s, topic, msg.payload, sub.qos, /*retain=*/true, msg.extras)) return false;
+                    if (!publish_to(*s, topic, msg.payload, sub.qos, /*retain=*/true, msg.extras)) return false;
                 }
             }
         }
@@ -1031,21 +1046,25 @@ private:
     }
 
     // Fan out to every connected session with a matching subscription, at min(publish qos, granted
-    // qos) — a snapshot copy of sessions_ is taken under the lock so the actual socket writes (which
-    // may block briefly on backpressure) never happen while holding sessions_mu_. Also queues into any
-    // OFFLINE persistent (clean_session=0) session whose stored subscriptions match — QoS ≥1 only, since
-    // there is nothing to durably queue a QoS-0 "at most once" message as. M7.2 PR A: `extras` (Message
-    // Expiry, primarily) is threaded through to both the live fan-out (publish_to's own choke point
-    // re-checks it at actual send time) and the offline queue (QueuedMessage::extras, re-checked when
-    // flushed on reconnect).
+    // qos). Also queues into any OFFLINE persistent (clean_session=0) session whose stored subscriptions
+    // match — QoS ≥1 only, since there is nothing to durably queue a QoS-0 "at most once" message as.
+    // M7.2 PR A: `extras` (Message Expiry, primarily) is threaded through to both the live fan-out
+    // (publish_to's own choke point re-checks it at actual send time) and the offline queue
+    // (QueuedMessage::extras, re-checked when flushed on reconnect).
+    //
+    // Post-benchmark addition (see bench/broker/broker_bench.cpp): this used to snapshot ALL of
+    // sessions_ and scan every one of them for a match, live-fanout throughput measured at ~500-1200ns
+    // PER SESSION regardless of whether it matched — at a few thousand connected-but-unrelated sessions
+    // (e.g. many devices each on their own topic) that scan alone became the dominant per-publish cost.
+    // topic_index_candidates() below narrows the snapshot to sessions that could ACTUALLY match `topic` —
+    // see its own banner (next to topic_index_mu_) for why that's provably safe (no missed matches).
+    // Every candidate is still scanned exactly as before (full subs_mu-locked walk, topic_matches() per
+    // filter), so delivery semantics — including per-session duplicate delivery for overlapping
+    // subscriptions — are byte-for-byte unchanged; only which sessions get scanned at all has changed.
+    //
     void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
                        const PublishExtras& extras = {}) {
-        std::vector<std::shared_ptr<Session>> snapshot;
-        {
-            std::lock_guard<std::mutex> g(sessions_mu_);
-            snapshot = sessions_;
-        }
-        for (const auto& session : snapshot) {
+        for (const auto& session : topic_index_candidates(topic)) {
             std::vector<Subscription> matches;
             {
                 std::lock_guard<std::mutex> g(session->subs_mu);
@@ -1141,8 +1160,91 @@ private:
     }
 
     void remove_session(const std::shared_ptr<Session>& s) {
-        std::lock_guard<std::mutex> g(sessions_mu_);
-        std::erase(sessions_, s);
+        {
+            std::lock_guard<std::mutex> g(sessions_mu_);
+            std::erase(sessions_, s);
+        }
+
+        // Undo every index_subscription(s, ...) call this session's subs ever triggered. Re-derived from
+        // s->subs itself rather than tracked separately: this broker has no UNSUBSCRIBE (see
+        // handle_subscribe's own scope), so a session's subs only ever grow (SUBSCRIBE, or a persistent-
+        // session reconnect's wholesale restore) until the whole session tears down right here — so
+        // s->subs is always exactly "every filter this session was ever indexed under".
+        std::vector<Subscription> subs_copy;
+        {
+            std::lock_guard<std::mutex> g(s->subs_mu);
+            subs_copy = s->subs;
+        }
+        if (subs_copy.empty()) return;
+
+        bool had_wildcard = false;
+        std::lock_guard<std::mutex> g(topic_index_mu_);
+        for (const Subscription& sub : subs_copy) {
+            if (filter_has_wildcard(sub.filter)) {
+                had_wildcard = true;
+                continue;
+            }
+            auto it = exact_topic_index_.find(sub.filter);
+            if (it == exact_topic_index_.end()) continue;
+            std::erase(it->second, s);
+            if (it->second.empty()) exact_topic_index_.erase(it);
+        }
+        if (had_wildcard) std::erase(wildcard_subscribers_, s);
+    }
+
+    // Topic index (post-benchmark addition — see route_publish()'s own banner for why this exists).
+    //
+    // A subscription filter either contains no `+`/`#` (in which case topic_matches() degenerates to
+    // plain string equality — see topic_match.hpp) or it does. That split gives two lookup paths instead
+    // of one linear scan:
+    //   - exact_topic_index_[topic] -> every session with a NON-wildcard filter == topic exactly.
+    //   - wildcard_subscribers_ -> every session with AT LEAST ONE '+'/'#'-containing filter — still
+    //     scanned linearly (MQTT wildcard matching can't be reduced to a hash lookup without a full topic
+    //     trie, deliberately out of scope here; this list is typically far smaller than the total live-
+    //     session count in a real deployment, mirroring acl.hpp's own "cold path, low cardinality"
+    //     reasoning for wildcard-shaped rules).
+    // A session with zero subscriptions (freshly accepted, not yet SUBSCRIBEd) is in neither bucket.
+    //
+    // Invariant this relies on: index entries can only be ADDED (index_subscription(), called from
+    // handle_subscribe/handle_connect's session-restore path) and are only ever removed ALL AT ONCE, when
+    // the owning session tears down (remove_session() above) — because this broker has no UNSUBSCRIBE
+    // (handle_subscribe's own scope note). So an index entry for (filter, session) existing always implies
+    // session->subs still contains that exact filter; the index can never point at a session whose actual
+    // subs no longer back the entry.
+    std::mutex topic_index_mu_;
+    std::unordered_map<std::string, std::vector<std::shared_ptr<Session>>> exact_topic_index_;
+    std::vector<std::shared_ptr<Session>> wildcard_subscribers_;
+
+    [[nodiscard]] static bool filter_has_wildcard(std::string_view filter) noexcept {
+        return filter.find('+') != std::string_view::npos || filter.find('#') != std::string_view::npos;
+    }
+
+    // Called once per newly-added Subscription (handle_subscribe for a fresh SUBSCRIBE, handle_connect for
+    // a persistent-session reconnect's restored subs) — never from route_publish()'s hot path itself, so
+    // index maintenance cost is paid at subscribe time, not publish time.
+    void index_subscription(const std::shared_ptr<Session>& s, const std::string& filter) {
+        std::lock_guard<std::mutex> g(topic_index_mu_);
+        if (filter_has_wildcard(filter))
+            wildcard_subscribers_.push_back(s);
+        else
+            exact_topic_index_[filter].push_back(s);
+    }
+
+    // The deduplicated candidate session set for `topic` — see this group's banner above for why every
+    // session NOT in this set provably has no subscription that could match. Snapshot-then-unlock (same
+    // pattern as the old sessions_mu_ snapshot this replaced): topic_index_mu_ is held only long enough to
+    // copy shared_ptrs, never while route_publish()'s callers do the actual (possibly blocking) socket
+    // writes.
+    [[nodiscard]] std::vector<std::shared_ptr<Session>> topic_index_candidates(const std::string& topic) {
+        std::vector<std::shared_ptr<Session>> out;
+        {
+            std::lock_guard<std::mutex> g(topic_index_mu_);
+            if (auto it = exact_topic_index_.find(topic); it != exact_topic_index_.end()) out = it->second;
+            out.insert(out.end(), wildcard_subscribers_.begin(), wildcard_subscribers_.end());
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
     }
 
     Config cfg_;
