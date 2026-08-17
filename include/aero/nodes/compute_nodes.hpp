@@ -128,6 +128,46 @@ private:
     std::vector<std::string> reg_names_;
 };
 
+// Source: decode a Modbus coil/discrete-input payload (bit-packed, LSB-first per byte — Modbus's own
+// wire order) in ctx.payload into tags named "bit0","bit1",… (018 §8, M9.1's FC01/FC02 counterpart to
+// ModbusDecodeNode's word-based decode; a separate node because bit-packed and word-packed responses
+// need different unpacking, not just a different tag count).
+//
+// A byte-packed response can carry MORE bits than were actually requested (padding fills out the last
+// byte) — with no side channel, this node would have no way to tell real bits from padding. It reads
+// the exact requested count from `ctx.frame->raw`: ModbusTcpDriver stashes the coil/discrete-input
+// count there for bit-packed reads (Frame::raw is otherwise unused by any Modbus decode path). Falls
+// back to decoding every available bit (payload.size()*8, no trimming) when ctx.frame is null (this
+// node built/driven directly in a test, no real Frame behind it) or raw is unset/out of range — the
+// same offline-testable posture ModbusDecodeNode already has.
+class ModbusBitsDecodeNode final : public INode {
+public:
+    NodeResult process(ProcessingContext& ctx) noexcept override {
+        const std::size_t n = ctx.payload.size();
+        const std::size_t max_bits = n * 8;
+        std::size_t bit_count = max_bits;
+        if (ctx.frame != nullptr && ctx.frame->raw > 0 &&
+            static_cast<std::uint64_t>(ctx.frame->raw) <= max_bits) {
+            bit_count = static_cast<std::size_t>(ctx.frame->raw);
+        }
+
+        const auto* p = reinterpret_cast<const unsigned char*>(ctx.payload.data());
+        // bit_names_ — same stable-cache reasoning as ModbusDecodeNode::reg_names_ (Tag::name is a view).
+        bit_names_.reserve(bit_count);
+        for (std::size_t i = 0; i < bit_count; ++i) {
+            const bool bit = ((p[i / 8] >> (i % 8)) & 0x1) != 0;
+            if (i >= bit_names_.size()) bit_names_.push_back("bit" + std::to_string(i));
+            ctx.tags.push_back(Tag{bit_names_[i], bit ? 1.0 : 0.0});
+        }
+        return NodeResult::Continue;
+    }
+    const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
+    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.modbus_bits"};
+
+private:
+    std::vector<std::string> bit_names_;
+};
+
 // Source: parse a JSON object payload (ctx.payload) of {"name": number, …} into working-set tags
 // (005 §2). Uses nlohmann with exceptions OFF so a malformed payload is a clean Error (no throw, no
 // crash) — NOT a 0-alloc node: parsing a wire frame builds a DOM and is inherently allocating, so it

@@ -109,6 +109,10 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     node_reg.register_type("aero.source.modbus", [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::ModbusDecodeNode>();
     });
+    // Modbus coil/discrete-input (bit-packed) DECODE — the FC01/FC02 counterpart, M9.1 PR D.
+    node_reg.register_type("aero.source.modbus_bits", [](const nlohmann::json&) {
+        return std::make_unique<aero::nodes::ModbusBitsDecodeNode>();
+    });
     node_reg.register_type("aero.source.json", [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::JsonParseNode>();
     });
@@ -132,12 +136,17 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // M9a (018 §Multi-protocol southbound): a real Modbus-TCP PULL driver. Config is read straight out
     // of the deploy-time JSON at construction (not routed through DriverConfig's narrow endpoint/
     // frame_count/rate_hz fields, per this driver's explicit constraint — see modbus_tcp_driver.hpp).
-    // "register_type": "holding" (default, FC03) | "input" (FC04) — M9.1 PR B.
+    // "register_type": "holding" (default, FC03) | "input" (FC04) | "coils" (FC01) |
+    // "discrete_inputs" (FC02) — M9.1 PR B/PR D. For "coils"/"discrete_inputs", "register_count" means
+    // coil/discrete-input count, not register count (pair with "aero.source.modbus_bits", not
+    // "aero.source.modbus", downstream).
     driver_reg.register_type("aero.driver.modbus_tcp", [](const nlohmann::json& c) {
-        auto read_fn = aero::drivers::ModbusTcpDriver::ReadFunction::HoldingRegisters;
-        if (c.value("register_type", std::string{"holding"}) == "input") {
-            read_fn = aero::drivers::ModbusTcpDriver::ReadFunction::InputRegisters;
-        }
+        using RF = aero::drivers::ModbusTcpDriver::ReadFunction;
+        auto read_fn = RF::HoldingRegisters;
+        const std::string rt = c.value("register_type", std::string{"holding"});
+        if (rt == "input") read_fn = RF::InputRegisters;
+        else if (rt == "coils") read_fn = RF::Coils;
+        else if (rt == "discrete_inputs") read_fn = RF::DiscreteInputs;
         return std::make_unique<aero::drivers::ModbusTcpDriver>(
             c.value("host", std::string{}), c.value("port", std::uint16_t{502}),
             c.value("unit_id", std::uint8_t{1}), c.value("start_address", std::uint16_t{0}),

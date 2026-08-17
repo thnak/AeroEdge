@@ -17,6 +17,7 @@
 | M9.1 PR A | `ModbusTcpDriver::write()` — FC06 Write Single Register | **Shipped** |
 | M9.1 PR B | `ModbusTcpDriver` — FC04 Read Input Registers (`register_type` config selector) | **Shipped** |
 | M9.1 PR C | `ModbusTcpDriver::write()` — FC16 Write Multiple Registers (`"addr,v1,v2,..."` target form) | **Shipped** |
+| M9.1 PR D | `ModbusTcpDriver` — FC01/FC02 Read Coils/Discrete Inputs + `ModbusBitsDecodeNode` | **Shipped** |
 
 ## 1. Why
 
@@ -136,9 +137,22 @@ address (FC06, `cmd.value` supplies the value, unchanged from PR A) or a comma-s
 implementation limit of 123 registers per call. Same connect/reconnect/backoff and exception
 (0x90) posture as the other write paths.
 
-**Explicitly deferred** (M9.1, §8): coils (FC01) and discrete inputs (FC02) — bit-packed, not
-word-packed — need a decode node of their own, unlike FC03/FC04/FC06/FC16, which all share the
-existing word-oriented path; Modbus RTU/serial transport (TCP only).
+**M9.1 PR D** shipped FC01 (Read Coils) and FC02 (Read Discrete Inputs) — bit-packed, not
+word-packed like FC03/FC04, so they get their own decode node: `ModbusBitsDecodeNode`
+(`aero.source.modbus_bits`) decodes `ctx.payload` into `"bit0","bit1",…` tags, LSB-first per byte
+(Modbus's own packing rule), the FC01/FC02 counterpart to `ModbusDecodeNode`. A byte-packed
+response can carry more bits than were actually requested (padding fills out the last byte); rather
+than guess, `ModbusTcpDriver` stashes the exact requested count in `Frame::raw` for bit-packed
+reads (otherwise unused by any Modbus decode path — see §3's `Frame` shape), and the decode node
+trims to it, falling back to decoding every available bit when there's no `Frame` behind `ctx`
+(e.g. driving the node directly in a test). `ReadFunction` gained `Coils`/`DiscreteInputs`
+alongside `HoldingRegisters`/`InputRegisters`; the deploy-time JSON selects them via
+`"register_type": "coils" | "discrete_inputs"` (paired with `"aero.source.modbus_bits"`
+downstream, not `"aero.source.modbus"`). The open()-time payload-cap check and `do_transaction()`'s
+byte-count math are both now function-of-`ReadFunction` (word: `count*2`; bit: `ceil(count/8)`)
+rather than hardcoded to the word case.
+
+**Explicitly deferred** (M9.1, §8): Modbus RTU/serial transport (TCP only).
 
 ## 5. Scope — M9b: OPC-UA
 
@@ -169,7 +183,8 @@ address-space browsing (v1 reads only configured NodeIds, no discovery), method 
 | Modbus-TCP: Write Single Register (FC06) | **shipped** | M9.1 PR A, `ModbusTcpDriver::write()` |
 | Modbus-TCP: Read Input Registers (FC04) | **shipped** | M9.1 PR B, `ModbusTcpDriver::ReadFunction` |
 | Modbus-TCP: Write Multiple Registers (FC16) | **shipped** | M9.1 PR C, `ModbusTcpDriver::write()` |
-| Modbus-TCP: coils/discrete inputs (FC01/FC02), RTU/serial | backlog | M9.1 |
+| Modbus-TCP: Read Coils / Discrete Inputs (FC01/FC02) | **shipped** | M9.1 PR D, `ModbusBitsDecodeNode` |
+| Modbus-TCP: RTU/serial transport | backlog | M9.1 |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: security policies, Subscriptions, browsing, method calls | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
@@ -197,11 +212,6 @@ deployment needs that.
   subscribe-and-get-notified — would let `OpcUaDriver` become a push (`run()`) driver instead of
   poll, lower latency and lower request volume than v1's poll loop. Revisit once poll-interval
   latency is a measured problem, not preemptively.
-- **Coils (FC01) and discrete inputs (FC02).** Bit-packed, not word-packed like FC03/FC04 (M9.1 PR
-  B) — `ModbusDecodeNode` assumes 16-bit register values, so these need a decode node of their own,
-  not just a new `ReadFunction` value. Reading them would also need to decide how to represent
-  padding bits (a byte-packed response can carry more bits than were actually requested) — an open
-  design question this codebase hasn't hit yet for any other decode node.
 - **Modbus RTU / serial transport.** v1 is TCP-only; RTU needs a serial PAL this codebase doesn't
   have yet.
 - **Multi-frame chunking** for register-maps/NodeId-lists wider than the 128-byte payload cap

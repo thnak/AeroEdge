@@ -99,11 +99,15 @@ struct FakeModbusServer {
     std::atomic<bool> running{false};
     std::thread thr;
     std::vector<std::uint16_t> registers;  // canned holding-register bank
+    std::vector<bool> coils;               // canned coil/discrete-input bank (shared by FC01/FC02)
 
     bool start() {
         registers.resize(200);
         for (std::size_t i = 0; i < registers.size(); ++i)
             registers[i] = static_cast<std::uint16_t>(0xA000 + i);
+
+        coils.resize(200);
+        for (std::size_t i = 0; i < coils.size(); ++i) coils[i] = (i % 3 == 0);
 
         auto l = quark::pal::tcp_listen(quark::pal::ipv4_loopback, /*port*/ 0);
         if (!l) return false;
@@ -149,6 +153,8 @@ struct FakeModbusServer {
         const std::uint8_t fc = std::to_integer<std::uint8_t>(req[7]);
         if (fc == 0x03 || fc == 0x04) {
             serve_read(conn, txn, unit, fc, req);
+        } else if (fc == 0x01 || fc == 0x02) {
+            serve_read_bits(conn, txn, unit, fc, req);
         } else if (fc == 0x06) {
             serve_write(conn, txn, unit, req);
         } else if (fc == 0x10) {
@@ -174,6 +180,31 @@ struct FakeModbusServer {
         for (std::uint16_t i = 0; i < count; ++i) {
             const std::uint16_t v = (start + i) < registers.size() ? registers[start + i] : 0;
             put_u16_be(&resp[9 + 2 * i], v);
+        }
+        (void)send_all(conn, resp.data(), resp.size());
+    }
+
+    // FC01/FC02 (M9.1 PR D): same `coils` bank answers both — bit-packed, LSB-first per byte, byte_count
+    // = ceil(count/8) (Modbus's own packing rule). The last byte is zero-padded past `count` bits, which
+    // is exactly the padding ModbusBitsDecodeNode's Frame::raw trim exists to strip.
+    void serve_read_bits(quark::pal::fd_t conn, std::uint16_t txn, std::uint8_t unit, std::uint8_t fc,
+                          const std::array<std::byte, 12>& req) {
+        const std::uint16_t start = get_u16_be(&req[8]);
+        const std::uint16_t count = get_u16_be(&req[10]);
+
+        const auto byte_count = static_cast<std::uint8_t>((count + 7) / 8);
+        std::vector<std::byte> resp(static_cast<std::size_t>(9) + byte_count, std::byte{0});
+        put_u16_be(&resp[0], txn);
+        put_u16_be(&resp[2], 0x0000);
+        put_u16_be(&resp[4], static_cast<std::uint16_t>(3 + byte_count));
+        resp[6] = static_cast<std::byte>(unit);
+        resp[7] = static_cast<std::byte>(fc);
+        resp[8] = static_cast<std::byte>(byte_count);
+        for (std::uint16_t i = 0; i < count; ++i) {
+            const bool bit = (start + i) < coils.size() ? coils[start + i] : false;
+            if (!bit) continue;
+            const std::size_t idx = 9 + i / 8;
+            resp[idx] = resp[idx] | static_cast<std::byte>(1u << (i % 8));
         }
         (void)send_all(conn, resp.data(), resp.size());
     }
@@ -354,6 +385,75 @@ bool test_read_input_registers() {
     return ok;
 }
 
+// ---- (1c) M9.1 PR D: FC01 (Read Coils) round-trips through ModbusBitsDecodeNode -----------------------
+bool test_read_coils() {
+    FakeModbusServer server;
+    if (!server.start()) { std::printf("read_coils: server start failed\n"); return false; }
+
+    // coils[i] = (i % 3 == 0): over [0..7], expected bits are 1,0,0,1,0,0,1,0.
+    ModbusTcpDriver driver("127.0.0.1", server.port, /*unit*/ 1, /*start*/ 0, /*count*/ 8,
+                            ModbusTcpDriver::ReadFunction::Coils);
+    aero::DriverConfig cfg{};
+    bool ok = driver.open(cfg) == aero::DriverStatus::Ok;
+
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+    ok &= outcome.frame.has_value();
+    if (outcome.frame) {
+        ok &= outcome.frame->payload_len == 1;  // ceil(8/8) = 1 byte, no padding
+        ok &= outcome.frame->raw == 8;           // exact requested count stashed for the decode node
+
+        aero::ProcessingContext ctx;
+        ctx.reset(&*outcome.frame);
+        aero::nodes::ModbusBitsDecodeNode decode;
+        ok &= decode.process(ctx) == aero::NodeResult::Continue;
+        ok &= ctx.tags.size() == 8;
+        const bool expected[8] = {true, false, false, true, false, false, true, false};
+        for (std::size_t i = 0; i < 8 && i < ctx.tags.size(); ++i) {
+            ok &= ctx.tags[i].value == (expected[i] ? 1.0 : 0.0);
+        }
+    }
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("read_coils: assertion failed\n");
+    return ok;
+}
+
+// ---- (1d) M9.1 PR D: FC02 (Read Discrete Inputs) with a non-multiple-of-8 count exercises the padding
+// trim (byte_count = ceil(3/8) = 1, but only 3 of its 8 bits are real) --------------------------------
+bool test_read_discrete_inputs_padding() {
+    FakeModbusServer server;
+    if (!server.start()) { std::printf("read_discrete_inputs: server start failed\n"); return false; }
+
+    ModbusTcpDriver driver("127.0.0.1", server.port, /*unit*/ 1, /*start*/ 0, /*count*/ 3,
+                            ModbusTcpDriver::ReadFunction::DiscreteInputs);
+    aero::DriverConfig cfg{};
+    bool ok = driver.open(cfg) == aero::DriverStatus::Ok;
+
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+    ok &= outcome.frame.has_value();
+    if (outcome.frame) {
+        ok &= outcome.frame->payload_len == 1;
+        ok &= outcome.frame->raw == 3;
+
+        aero::ProcessingContext ctx;
+        ctx.reset(&*outcome.frame);
+        aero::nodes::ModbusBitsDecodeNode decode;
+        ok &= decode.process(ctx) == aero::NodeResult::Continue;
+        ok &= ctx.tags.size() == 3;  // trimmed to the requested count, not all 8 available bits
+        if (ctx.tags.size() == 3) {
+            ok &= ctx.tags[0].value == 1.0 && ctx.tags[1].value == 0.0 && ctx.tags[2].value == 0.0;
+        }
+    }
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("read_discrete_inputs: assertion failed\n");
+    return ok;
+}
+
 // ---- (2) an oversized register_count is rejected cleanly at open() -----------------------------------
 bool test_oversized_rejected() {
     // count*2 must exceed kMaxFramePayload; the server doesn't even need to be reachable — open() must
@@ -363,6 +463,18 @@ bool test_oversized_rejected() {
     aero::DriverConfig cfg{};
     const bool ok = driver.open(cfg) == aero::DriverStatus::Error;
     if (!ok) std::printf("oversized_rejected: open() did not reject count=%u\n", count);
+    return ok;
+}
+
+// ---- (2b) M9.1 PR D: the same rejection, but through the bit-packed byte-count formula -----------------
+bool test_oversized_coils_rejected() {
+    // ceil(count/8) must exceed kMaxFramePayload -> count > kMaxFramePayload*8.
+    const std::uint16_t count = static_cast<std::uint16_t>(aero::kMaxFramePayload * 8 + 1);
+    ModbusTcpDriver driver("127.0.0.1", /*port*/ 1, /*unit*/ 1, /*start*/ 0, count,
+                            ModbusTcpDriver::ReadFunction::Coils);
+    aero::DriverConfig cfg{};
+    const bool ok = driver.open(cfg) == aero::DriverStatus::Error;
+    if (!ok) std::printf("oversized_coils_rejected: open() did not reject count=%u\n", count);
     return ok;
 }
 
@@ -530,9 +642,21 @@ int main() {
     ok &= read_input_ok;
     std::printf("[read_input_registers] %s\n", read_input_ok ? "ok" : "FAIL");
 
+    const bool read_coils_ok = test_read_coils();
+    ok &= read_coils_ok;
+    std::printf("[read_coils] %s\n", read_coils_ok ? "ok" : "FAIL");
+
+    const bool read_discrete_ok = test_read_discrete_inputs_padding();
+    ok &= read_discrete_ok;
+    std::printf("[read_discrete_inputs_padding] %s\n", read_discrete_ok ? "ok" : "FAIL");
+
     const bool oversized_ok = test_oversized_rejected();
     ok &= oversized_ok;
     std::printf("[oversized_rejected] %s\n", oversized_ok ? "ok" : "FAIL");
+
+    const bool oversized_coils_ok = test_oversized_coils_rejected();
+    ok &= oversized_coils_ok;
+    std::printf("[oversized_coils_rejected] %s\n", oversized_coils_ok ? "ok" : "FAIL");
 
     const bool reconnect_ok = test_reconnect_after_loss();
     ok &= reconnect_ok;

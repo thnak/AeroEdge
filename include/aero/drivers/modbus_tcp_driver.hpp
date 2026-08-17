@@ -34,20 +34,23 @@
 
 namespace aero::drivers {
 
-// ModbusTcpDriver — FC03 (Read Holding Registers) and FC04 (Read Input Registers), selected at
-// construction (M9.1 PR B, 018 §8; both are wire-identical register reads, so they share one decode
-// path — ModbusDecodeNode doesn't care which address space the bytes came from). Construction takes
-// ownership of its config (host/port/unit_id/start_address/register_count/read_fn) at build time — the
-// factory in runtime.hpp::register_builtins() reads these straight out of the deploy-time JSON, per the
-// existing GeneratorDriver-style factory closure pattern; DriverConfig (aero/sdk/driver.hpp)
-// intentionally stays untouched (its endpoint/frame_count fields don't fit this driver's shape) beyond
-// the optional `rate_hz` poll-interval hint, honored here only as an observable stored value — the
-// actual poll cadence is the deployer's call (whatever drives `poll()` externally), not this driver's.
+// ModbusTcpDriver — FC03/FC04 (Read Holding/Input Registers, word-packed) and FC01/FC02 (Read
+// Coils/Discrete Inputs, bit-packed), selected at construction (M9a/PR B/PR D, 018 §8). Construction
+// takes ownership of its config (host/port/unit_id/start_address/register_count/read_fn) at build
+// time — the factory in runtime.hpp::register_builtins() reads these straight out of the deploy-time
+// JSON, per the existing GeneratorDriver-style factory closure pattern; DriverConfig (aero/sdk/
+// driver.hpp) intentionally stays untouched (its endpoint/frame_count fields don't fit this driver's
+// shape) beyond the optional `rate_hz` poll-interval hint, honored here only as an observable stored
+// value — the actual poll cadence is the deployer's call (whatever drives `poll()` externally), not
+// this driver's.
 class ModbusTcpDriver final : public IDriver {
 public:
-    // Which register address space poll() reads. Coils (FC01) and discrete inputs (FC02) are NOT here —
-    // they're bit-packed, not word-packed, and would need a decode node of their own (018 §8, backlog).
+    // Which address space poll() reads. FC03/FC04 are word-packed (2 bytes/item, decoded downstream by
+    // ModbusDecodeNode); FC01/FC02 are bit-packed (1 bit/item, decoded by ModbusBitsDecodeNode —
+    // register_count_ here means "coil/discrete-input count", not "register count", for those two).
     enum class ReadFunction : std::uint8_t {
+        Coils = 0x01,
+        DiscreteInputs = 0x02,
         HoldingRegisters = 0x03,
         InputRegisters = 0x04,
     };
@@ -63,10 +66,11 @@ public:
           read_fn_(read_fn) {}
 
     // Config-time rejection (never a silently truncated frame, per Part 1's Frame::payload_len/payload
-    // budget): register_count*2 must fit inside kMaxFramePayload. Otherwise dial now — open() is the
-    // ONE point a v1 deployment can observe "device unreachable" synchronously, before anything polls.
+    // budget): the response byte count (word-packed: count*2; bit-packed: ceil(count/8)) must fit
+    // inside kMaxFramePayload. Otherwise dial now — open() is the ONE point a v1 deployment can
+    // observe "device unreachable" synchronously, before anything polls.
     DriverStatus open(const DriverConfig& cfg) noexcept override {
-        if (static_cast<std::size_t>(register_count_) * 2 > aero::kMaxFramePayload) {
+        if (expected_response_bytes(read_fn_, register_count_) > aero::kMaxFramePayload) {
             return DriverStatus::Error;
         }
         rate_hz_ = cfg.rate_hz;  // advisory poll-interval hint only (see class banner) — not enforced here
@@ -181,6 +185,16 @@ private:
         if (s.empty()) return false;
         const auto res = std::from_chars(s.data(), s.data() + s.size(), out);
         return res.ec == std::errc{} && res.ptr == s.data() + s.size();
+    }
+
+    static constexpr bool is_bit_packed(ReadFunction fn) noexcept {
+        return fn == ReadFunction::Coils || fn == ReadFunction::DiscreteInputs;
+    }
+    // Bit-packed (FC01/FC02): ceil(count/8) bytes, Modbus's own packing rule. Word-packed (FC03/FC04):
+    // 2 bytes/register, as before PR D.
+    static constexpr std::size_t expected_response_bytes(ReadFunction fn, std::uint16_t count) noexcept {
+        return is_bit_packed(fn) ? (static_cast<std::size_t>(count) + 7) / 8
+                                  : static_cast<std::size_t>(count) * 2;
     }
 
     // Lazily reconnect, gated by the backoff clock — see class banner. false == still backing off, or
@@ -310,7 +324,7 @@ private:
             return DriverStatus::Error;
         }
 
-        const std::size_t expected_bytes = static_cast<std::size_t>(register_count_) * 2;
+        const std::size_t expected_bytes = expected_response_bytes(read_fn_, register_count_);
         if (pdu_len < 2) {
             io_ok = false;
             return DriverStatus::Error;
@@ -323,6 +337,11 @@ private:
 
         out.payload_len = static_cast<std::uint16_t>(expected_bytes);
         for (std::size_t i = 0; i < expected_bytes; ++i) out.payload[i] = pdu[2 + i];
+        // Bit-packed responses can carry padding bits past the last requested coil/discrete input (the
+        // last byte is padded out) — stash the EXACT requested count in Frame::raw (otherwise unused by
+        // any Modbus decode path) so ModbusBitsDecodeNode can trim them instead of guessing from the
+        // byte count alone.
+        if (is_bit_packed(read_fn_)) out.raw = static_cast<std::int64_t>(register_count_);
         return DriverStatus::Ok;
     }
 

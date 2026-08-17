@@ -2,6 +2,7 @@
 // and malformed input is handled WITHOUT a crash (a clean NodeResult::Error, never UB). No engine, no
 // socket — each node is driven directly over a ProcessingContext (like flow_zero_alloc), so the test is
 // a deterministic unit. Exit code 0 = OK; prints "FAIL" on any mismatch.
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -91,6 +92,41 @@ int main() {
         ok &= pass;
         std::printf("[modbus] odd-length frame => %s (expect Error) %s\n",
                     r == NodeResult::Error ? "Error" : "Continue", pass ? "ok" : "FAIL");
+    }
+
+    // --- ModbusBitsDecodeNode (M9.1 PR D, 018 §8): bit-packed coil/discrete-input payload -----------
+    {
+        // No Frame behind ctx (make_ctx() resets with nullptr) => decode every available bit, no
+        // trimming: 0x05 = 0b00000101, LSB-first => bit0=1, bit1=0, bit2=1, bit3..7=0.
+        nodes::ModbusBitsDecodeNode n;
+        auto ctx = make_ctx();
+        ctx.payload = std::string({static_cast<char>(0x05)});
+        const auto r = n.process(ctx);
+        const bool pass = r == NodeResult::Continue && ctx.tags.size() == 8 &&
+                          ctx.tags[0].value == 1.0 && ctx.tags[1].value == 0.0 &&
+                          ctx.tags[2].value == 1.0 && ctx.tags[0].name == "bit0" &&
+                          ctx.tags[2].name == "bit2";
+        ok &= pass;
+        std::printf("[modbus_bits] no-frame: bit0=%.0f bit1=%.0f bit2=%.0f n=%zu (expect 1,0,1,n=8) %s\n",
+                    ctx.tags[0].value, ctx.tags[1].value, ctx.tags[2].value, ctx.tags.size(),
+                    pass ? "ok" : "FAIL");
+    }
+    {
+        // With a real Frame behind ctx, Frame::raw trims padding: 0x05 has 8 available bits but only 3
+        // coils were actually requested (byte-packed into 1 byte with 5 padding bits) — ModbusTcpDriver
+        // stashes that count in Frame::raw for exactly this (018 §8).
+        nodes::ModbusBitsDecodeNode n;
+        Frame f{};
+        f.raw = 3;
+        f.payload_len = 1;
+        f.payload[0] = static_cast<std::byte>(0x05);
+        ProcessingContext ctx;
+        ctx.reset(&f);
+        const auto r = n.process(ctx);
+        const bool pass = r == NodeResult::Continue && ctx.tags.size() == 3 && ctx.tags[0].value == 1.0 &&
+                          ctx.tags[1].value == 0.0 && ctx.tags[2].value == 1.0;
+        ok &= pass;
+        std::printf("[modbus_bits] trimmed: n=%zu (expect 3) %s\n", ctx.tags.size(), pass ? "ok" : "FAIL");
     }
 
     // --- JsonParseNode: parse {name:number} into tags; malformed => Error --------------------------
