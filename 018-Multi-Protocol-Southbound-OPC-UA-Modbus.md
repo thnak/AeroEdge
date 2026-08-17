@@ -22,6 +22,7 @@
 | M9.1 PR F | `OpcUaDriver::write()` — single-argument method call via `UA_Client_call` (`"object\|method"` target form) | **Shipped** |
 | M9.1 PR G | `OpcUaDriver` — address-space browse mode (`UA_Client_Service_browse`, `browse_root` config) | **Shipped** |
 | M9.1 PR H | `ModbusRtuDriver` + `aero::pal::serial` — Modbus RTU/serial transport (FC01/02/03/04/06/16) | **Shipped** |
+| M9.2 | `Runtime` poll-timer wiring (006 §6.1) — makes `ModbusTcpDriver`/`ModbusRtuDriver`/`OpcUaDriver` actually deployable via a real Application, not just unit-testable | **Shipped** |
 
 ## 1. Why
 
@@ -62,6 +63,21 @@ decoding of their own**:
 Both drivers exist specifically to fill the gap those two Source nodes were built ahead of:
 `compute_nodes.hpp`'s own file header says real socket transports were "GATED" pending exactly
 this kind of driver work. This spec is that transport layer landing.
+
+**M9.2 correction**: from M9a through M9.1 PR H, "triggered by a timer/Command" above was
+aspirational, not actual — `runtime.hpp`'s driver-ingestion path unconditionally spawned a
+producer thread calling `drv->run(...)`, and every driver in this spec has `run()` as a hard
+`Unsupported` (§6.1: they are `poll()`-only). `poll()` was reachable ONLY from each driver's own
+test harness (a throwaway `StreamActivation` per call), never from a real deployed Application.
+M9.2 closes this: `Deployment::poller` (`runtime.hpp`) is a thread that, on the configured
+`rate_hz` cadence, stands up a small per-tick `StreamActivation` (mirroring the exact pattern the
+test harnesses already used — `poll()`'s `StreamSink`-by-value contract has no way to hand a
+producer token back for reuse across calls), calls `driver.poll(sink)` once, and `tell()`s
+whatever frame(s) that call produced into the `FlowActor` — the real "timer/Command → poll(sink)
+→ frames → stream" path §6.1 describes, finally implemented. `DriverDescriptor` gained a
+`poll_driven` flag (`aero/sdk/driver.hpp`) so `Runtime::deploy()` can pick the poll lane vs the
+existing push lane (producer+bridge threads) per driver, without probing `run()`/`poll()` at
+runtime to find out which one a driver supports.
 
 ## 3. Architecture — the shared prerequisite
 
@@ -254,6 +270,7 @@ children, and reading nested subtrees (v1 is exactly one browse level per `poll(
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |
 | Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | both drivers |
+| `Runtime::deploy()` actually drives PULL drivers (006 §6.1 timer/poll wiring) | **shipped** | M9.2, `Deployment::poller` |
 
 ## 7. Security
 
@@ -266,7 +283,7 @@ posture matching how these protocols are actually deployed today (a trusted OT n
 not a claim that either driver is safe to dial across an untrusted network — revisit if a
 deployment needs that.
 
-## 8. Open questions (M9.1)
+## 8. Open questions (M9.1/M9.2)
 
 - **OPC-UA security policies + cert-based auth.** Sign/SignAndEncrypt, client certificates —
   deferred because it would couple this driver's crypto needs to (or duplicate) 017 M5's mbedTLS
@@ -276,6 +293,13 @@ deployment needs that.
   subscribe-and-get-notified — would let `OpcUaDriver` become a push (`run()`) driver instead of
   poll, lower latency and lower request volume than v1's poll loop. Revisit once poll-interval
   latency is a measured problem, not preemptively.
+- **M9.2 poll-timer v1 limits.** `Deployment::poller`'s cadence is a plain `sleep`-based loop
+  (20ms wake-up granularity to check `stop_flag`), not a real Quark timer/scheduler primitive
+  (006 §6.1's original diagram sketched "Quark timer (011)" — 011 doesn't exist as a reusable
+  primitive yet, so this is a Runtime-owned thread instead); a fresh `StreamActivation` per tick
+  has real per-tick overhead that would matter at a much higher `rate_hz` than any current PLC/
+  OPC-UA polling target uses. Revisit alongside 011 if/when a real Quark timer facility lands, or
+  if a deployment needs sub-20ms poll jitter.
 - **Modbus RTU serial-config breadth.** PR H ships the common case (8 data bits fixed per spec,
   configurable baud/parity/stop-bits, no RS-485 driver-enable/DE-RTS toggling — assumes the
   serial adapter or a transceiver handles half-duplex turnaround itself). Revisit if a real

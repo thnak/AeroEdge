@@ -28,6 +28,11 @@ enum class DriverStatus {
 struct DriverDescriptor {
     std::string_view type_id;   // e.g. "aero.driver.tcp"
     bool writable = false;      // supports device writes (actuators / OTA transfer, 006 §7)
+    // true => this driver is PULL (§6.1): Runtime's deploy path invokes poll() on a timer instead of
+    // spawning a run() producer thread. Defaults false (existing push drivers/aggregate-inits are
+    // unaffected — a 2-field brace-init still compiles). Set true by every poll()-only driver
+    // (ModbusTcpDriver, ModbusRtuDriver, OpcUaDriver) — see runtime.hpp's driver-ingestion path.
+    bool poll_driven = false;
 };
 
 // Connection / behaviour knobs handed to open() (006 §11 open question: full schema aligns with the

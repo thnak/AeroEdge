@@ -315,7 +315,7 @@ public:
 
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ true};
+    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ true, /*poll_driven*/ true};
 
 private:
     // Connect-attempt timing is entirely open62541's own (UA_Client_connect blocks internally per its own
@@ -539,7 +539,7 @@ public:
     void close() noexcept override {}
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ false};
+    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ false, /*poll_driven*/ true};
 };
 
 }  // namespace aero::drivers

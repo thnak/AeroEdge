@@ -166,7 +166,7 @@ public:
     // Modbus exception code).
     [[nodiscard]] std::uint8_t last_exception_code() const noexcept { return last_exception_code_; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_tcp", /*writable*/ true};
+    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_tcp", /*writable*/ true, /*poll_driven*/ true};
 
 private:
     static constexpr int kConnectTimeoutMs = 2000;

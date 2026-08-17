@@ -21,6 +21,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -269,46 +270,108 @@ public:
                 return std::unexpected("driver.open failed for '" + app.driver->type_id + "'");
             }
 
-            quark::StreamActivation<aero::Frame>::Config scfg;
-            scfg.capacity = 256;  // ring == max credit == max in-flight frames (006 §3)
-            d->mr = std::make_unique<std::pmr::monotonic_buffer_resource>();
-            d->stream = std::make_unique<quark::StreamActivation<aero::Frame>>(scfg, d->mr.get());
-            auto tok = quark::open_stream(*d->stream);  // single-writer token (024, D1)
-            if (!tok) {
-                d->engine->stop();
-                return std::unexpected("open_stream failed");
-            }
-            aero::StreamSink<aero::Frame> sink(std::move(tok.value()));
             d->has_driver = true;
 
-            // Producer lane: the driver's run loop pushes frames honoring backpressure (D6).
-            d->producer = std::thread(
-                [drv = d->driver.get(), sink = std::move(sink), flag = &d->stop_flag,
-                 done = &d->producer_done]() mutable {
-                    drv->run(std::move(sink), aero::StopToken{flag});
-                    done->store(true, std::memory_order_release);
-                });
+            if (d->driver->descriptor().poll_driven) {
+                // --- PULL driver lane (006 §6.1, M9.2): a "Command/Timer -> driver.poll(sink)" loop ---
+                // that spec 006 documented but no code ever implemented — poll() was previously only
+                // ever called from each driver's own test harness (ModbusTcpDriver/OpcUaDriver/
+                // ModbusRtuDriver, all of spec 018, could NOT actually be deployed via a real
+                // Application before this). `poll(StreamSink<Frame>)`'s by-value contract consumes its
+                // sink after ONE call (a StreamActivation's single-producer bind is a lifetime
+                // commitment — no way to hand the token back for reuse), so unlike the push lane below
+                // there is no persistent d->stream/producer/bridge pair: EVERY tick stands up a small
+                // throwaway StreamActivation (mirrors the exact pattern this driver family's own tests
+                // already use), calls poll() once, and drains whatever frame(s) that single call
+                // produced straight into the actor — synchronously, on this one poller thread. No
+                // separate bridge thread is needed because one poll() is a bounded step, not an
+                // independent streaming producer.
+                //
+                // CADENCE: for a PULL driver, `rate_hz` stops being merely advisory (as it is for push
+                // drivers, which ignore it) and becomes the actual timer period — 0 falls back to
+                // kDefaultPollIntervalMs (1 Hz), never "poll as fast as possible" against a real device.
+                constexpr std::uint32_t kDefaultPollIntervalMs = 1000;
+                const std::uint32_t rate_hz = dcfg.rate_hz;
+                const auto interval = std::chrono::milliseconds(
+                    rate_hz > 0 ? (1000 / rate_hz) : kDefaultPollIntervalMs);
 
-            // Bridge lane: drain the stream and `tell` each frame into the actor (single-executor, I2).
-            Deployment* dp = d.get();
-            d->bridge = std::thread([dp]() {
-                auto& ch = dp->stream->channel();
-                auto ref = dp->router->get<FlowActor>(dp->key);
-                for (;;) {
-                    const bool producer_done = dp->producer_done.load(std::memory_order_acquire);
-                    while (ch.occupancy() > 0) {
-                        quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 64);
-                        while (const aero::Frame* f = batch.next()) {
-                            // copy raw + byte payload out of the pinned slot (006 §4)
-                            ref.tell(ReceiveFrame{f->raw, f->payload_len, f->payload});
-                            batch.retire();                  // return credit after the tell is enqueued
+                Deployment* dp = d.get();
+                d->poller = std::thread([dp, interval]() {
+                    auto ref = dp->router->get<FlowActor>(dp->key);
+                    while (!dp->stop_flag.load(std::memory_order_acquire)) {
+                        quark::StreamActivation<aero::Frame>::Config scfg;
+                        scfg.capacity = 4;  // one poll() call yields at most a handful of frames
+                        std::pmr::monotonic_buffer_resource mr;
+                        quark::StreamActivation<aero::Frame> act(scfg, &mr);
+                        auto tok = quark::open_stream(act);
+                        if (tok) {
+                            aero::StreamSink<aero::Frame> sink(std::move(tok.value()));
+                            if (dp->driver->poll(std::move(sink)) == aero::DriverStatus::Ok) {
+                                auto& ch = act.channel();
+                                while (ch.occupancy() > 0) {
+                                    quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 4);
+                                    while (const aero::Frame* f = batch.next()) {
+                                        ref.tell(ReceiveFrame{f->raw, f->payload_len, f->payload});
+                                        batch.retire();
+                                    }
+                                }
+                            }
+                            // A non-Ok poll() (device unreachable, mid-backoff, ...) is not fatal —
+                            // the driver's own bounded-backoff reconnect (006 §8) handles it; this loop
+                            // just tries again next tick.
+                        }
+
+                        // Sleep in short slices so stop_flag is observed promptly (006 §8 graceful
+                        // stop), not one long sleep_for(interval).
+                        const auto deadline = std::chrono::steady_clock::now() + interval;
+                        while (std::chrono::steady_clock::now() < deadline) {
+                            if (dp->stop_flag.load(std::memory_order_acquire)) break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
                         }
                     }
-                    if (dp->stop_flag.load(std::memory_order_acquire)) break;
-                    if (producer_done && ch.occupancy() == 0) break;  // bounded driver finished + drained
-                    std::this_thread::yield();  // no sleep; progress bounded by frame_count / stop
+                });
+            } else {
+                // --- PUSH driver lane (006 §6.2), unchanged: a persistent stream + producer + bridge. --
+                quark::StreamActivation<aero::Frame>::Config scfg;
+                scfg.capacity = 256;  // ring == max credit == max in-flight frames (006 §3)
+                d->mr = std::make_unique<std::pmr::monotonic_buffer_resource>();
+                d->stream = std::make_unique<quark::StreamActivation<aero::Frame>>(scfg, d->mr.get());
+                auto tok = quark::open_stream(*d->stream);  // single-writer token (024, D1)
+                if (!tok) {
+                    d->engine->stop();
+                    return std::unexpected("open_stream failed");
                 }
-            });
+                aero::StreamSink<aero::Frame> sink(std::move(tok.value()));
+
+                // Producer lane: the driver's run loop pushes frames honoring backpressure (D6).
+                d->producer = std::thread(
+                    [drv = d->driver.get(), sink = std::move(sink), flag = &d->stop_flag,
+                     done = &d->producer_done]() mutable {
+                        drv->run(std::move(sink), aero::StopToken{flag});
+                        done->store(true, std::memory_order_release);
+                    });
+
+                // Bridge lane: drain the stream and `tell` each frame into the actor (single-executor, I2).
+                Deployment* dp = d.get();
+                d->bridge = std::thread([dp]() {
+                    auto& ch = dp->stream->channel();
+                    auto ref = dp->router->get<FlowActor>(dp->key);
+                    for (;;) {
+                        const bool producer_done = dp->producer_done.load(std::memory_order_acquire);
+                        while (ch.occupancy() > 0) {
+                            quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 64);
+                            while (const aero::Frame* f = batch.next()) {
+                                // copy raw + byte payload out of the pinned slot (006 §4)
+                                ref.tell(ReceiveFrame{f->raw, f->payload_len, f->payload});
+                                batch.retire();  // return credit after the tell is enqueued
+                            }
+                        }
+                        if (dp->stop_flag.load(std::memory_order_acquire)) break;
+                        if (producer_done && ch.occupancy() == 0) break;  // bounded driver finished+drained
+                        std::this_thread::yield();  // no sleep; progress bounded by frame_count / stop
+                    }
+                });
+            }
         }
 
         dep_ = std::move(d);
@@ -751,6 +814,7 @@ private:
 
         std::thread producer;  // declared last → joined in teardown, dtor sees non-joinable
         std::thread bridge;
+        std::thread poller;    // PULL drivers only (§6.1) — see deploy()'s driver-ingestion branch
     };
 
     // Classify a reload as Live or BuildOnly (009 §4 table, P3). Returns nullopt for a Live change
@@ -786,6 +850,7 @@ private:
         d.stop_flag.store(true, std::memory_order_release);  // graceful stop (006 §8): finish in-flight
         if (d.producer.joinable()) d.producer.join();
         if (d.bridge.joinable()) d.bridge.join();
+        if (d.poller.joinable()) d.poller.join();
         if (d.engine) d.engine->stop();
         if (d.driver) d.driver->close();
     }

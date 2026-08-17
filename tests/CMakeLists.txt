@@ -59,6 +59,17 @@ target_link_libraries(runtime_deploy PRIVATE aero::runtime)
 add_test(NAME runtime_deploy COMMAND runtime_deploy)
 set_tests_properties(runtime_deploy PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# M9.2 LOAD-BEARING gate (006 §6.1, 018): proves Runtime::deploy() actually drives a PULL (poll()-only)
+# driver end to end now, not just push — before this, ModbusTcpDriver/ModbusRtuDriver/OpcUaDriver were
+# registered in the driver factory but could NOT be deployed via a real Application (the deploy path
+# only ever spawned a run() producer thread, and all three have run() as a hard Unsupported). Deploys
+# "aero.driver.modbus_tcp" against a hand-rolled fake Modbus-TCP server and asserts frames_processed
+# climbs over real wall-clock time at the configured rate_hz, plus clean teardown (poller thread joins).
+add_executable(runtime_poll_driver_wiring runtime/runtime_poll_driver_wiring.cpp)
+target_link_libraries(runtime_poll_driver_wiring PRIVATE aero::runtime quark::quark Threads::Threads)
+add_test(NAME runtime_poll_driver_wiring COMMAND runtime_poll_driver_wiring)
+set_tests_properties(runtime_poll_driver_wiring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-4 API gate (013 §5/§9): start the REST server on an ephemeral port, POST an Application + GET
 # /status over a real socket, assert it is reported, then shut down cleanly. Wait-for-ready by polling.
 add_executable(api_integration api/api_integration.cpp)

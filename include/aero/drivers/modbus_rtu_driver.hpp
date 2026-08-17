@@ -232,7 +232,7 @@ public:
     // Observability, same shape as ModbusTcpDriver::last_exception_code().
     [[nodiscard]] std::uint8_t last_exception_code() const noexcept { return last_exception_code_; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_rtu", /*writable*/ true};
+    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_rtu", /*writable*/ true, /*poll_driven*/ true};
 
 private:
     static constexpr int kReadTimeoutMs = 200;    // per-call transport read timeout (aero::pal::serial)

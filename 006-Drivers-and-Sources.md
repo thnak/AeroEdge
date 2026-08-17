@@ -136,6 +136,15 @@ The timer is Quark's (no AeroEdge timer, 004 §5). `poll` runs on the driver's b
 if the device read blocks; results enter the same stream as push drivers, so the flow layer
 is identical.
 
+**Implemented (018 §2/§8, M9.2)**: `Runtime::deploy()`'s driver-ingestion path (`runtime.hpp`)
+now actually drives this — a `Deployment::poller` thread ticks `driver.poll(sink)` on the
+configured `rate_hz` cadence and `tell()`s the resulting frame(s) into the actor, for any driver
+whose `DriverDescriptor::poll_driven` is true. It is a plain Runtime-owned thread with a
+sleep-based wake-up, not literally "Quark timer (011)" as sketched above — 011 isn't a reusable
+primitive yet (018 §8 tracks revisiting this if/when it lands). `poll()`'s `StreamSink`-by-value
+contract has no way to hand a producer token back for reuse across calls, so each tick uses a
+small throwaway `StreamActivation` rather than the persistent one push drivers use (§2).
+
 ### 6.2 Push (TCP / Serial / MQTT / Camera)
 
 A continuous `run` loop reads and pushes frames as they arrive. The loop lives on a
