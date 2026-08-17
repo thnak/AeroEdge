@@ -263,9 +263,102 @@ for this redesign.
 
 ## Phase 2 — Design candidates + validated claims
 
-(not started — next step: propose 2-3 candidate architectures anchored on §1.0's
-`IoContext` finding, each with an explicit validation plan against §1.5's gap list,
-before any is chosen)
+**Working constraint from the human owner of this initiative:** separate code paths
+per data-flow shape are explicitly acceptable — the public API (`Config`,
+`NativeBroker`'s surface) should stay clean/small; the delivery internals behind it may
+be larger/more specialized than a single unified mechanism, as long as each
+specialization has a clear, measured efficiency reason to exist. This directly shapes
+the proposal below: rather than one generic delivery path forced to serve every QoS/
+fan-out/transport shape, the design intentionally splits into a small number of
+purpose-built paths.
+
+### 2.1 Proposed architecture: `IoContext`-based reactor + per-flow specialized delivery
+
+Anchored on §1.0 — QuarkCpp's `IoContext` is adopted rather than reinvented. This is a
+proposal, not yet validated (see §2.3).
+
+**I/O layer (replaces thread-per-connection).** One or more `IoContext` loop(s)
+(§2.2 below — sharding is the one genuinely open sizing question). Each `Session` owns
+a private read buffer; `recv_some()` is called on `EPOLLIN`/readiness, and MQTT packets
+are parsed **incrementally** out of that buffer (this replaces `mqtt_codec.hpp`'s
+current blocking-with-retry `read_packet()`/`read_n()` for the broker's own read path —
+a new pull-based, resumable-across-readiness-events parser, *additive*: existing
+`read_packet()`/`read_n()` stay untouched for `MqttClientTransport`/bridge callers, per
+§1.6/1.0's "additive, don't touch shared code for one caller's needs" precedent already
+used for the topic index). Keep-alive becomes a `post_after()`-scheduled recurring
+timer per session (mirrors `voice_channel.hpp`'s idle-timeout-sweep exactly) instead of
+the 200ms poll idiom. TLS: buffering happens on **decrypted** bytes from repeated
+`mbedtls_ssl_read()` calls — never raw fd bytes — preserving the existing
+`PlainChannel`/`TlsChannel` `(recv_some/send_some/fd())` contract unchanged.
+
+**Delivery paths, deliberately separated by shape:**
+
+| Path | When it's taken | Why separate |
+|---|---|---|
+| **Single-recipient fast path** | `topic_index_candidates().size()==1` (already the common case per real telemetry patterns — one device, one topic) | Zero marshaling, zero chunking, zero extra bookkeeping — direct inline write, same as today's already-shipped fast path in `route_publish()`. |
+| **QoS 0 fan-out** | `qos==0`, N>1 candidates | No packet-id, no per-recipient ack tracking, no offline-queue interaction (nothing to durably queue). Cheapest possible per-recipient cost; can be chunked/continuation-scheduled (see §2.1.1) without needing to track completion beyond "sent." |
+| **QoS 1/2 fan-out** | `qos>=1`, N>1 candidates | Needs a real completion signal per recipient (this is what the offline-queue path already requires today) and the Message-Expiry/Max-Packet-Size choke points **recomputed per recipient at actual send time** (§1.2 — non-negotiable, highest-risk invariant). Kept as its own path so QoS 0's fast path never carries this overhead. |
+| **Bridge/cluster fan-out** (`on_publish_`, `IBridgeSink`, `peer_forwarder_`) | Every publish, unconditionally | Moved **off the reactor loop thread(s) entirely** onto a small, dedicated, persistent worker (mirrors `BrokerCluster`'s already-proven single-actor-thread pattern, §1.4) — because these are inherently slow, blocking, external-I/O calls (network dial/write to a remote MQTT broker, HTTP POST, AMQP publish) that must never share a thread with latency-sensitive local delivery. A slow/dead bridge sink degrades to "this bridge's own queue backs up," never "unrelated local subscribers stop receiving." |
+| **Retained / offline-queue path** | `retain==true` / `qos>=1` against `stored_sessions_` | Stays a simpler, lock-based path (Phase 1 found this orthogonal, lower-frequency) — **except** it should finally get the same topic-index treatment the live path already got in this round's shipped fix (Phase 1's documented asymmetry) — cheap, low-risk, proven pattern, no reason to leave it a linear scan. |
+
+**2.1.1 Fan-out under one reactor thread — the head-of-line-blocking fix.**
+`voice_channel.hpp` already solved this exact problem for Quark's own reactor usage:
+"bounded, chained `IoContext::post()` continuation — never inline." Applied here: a
+fan-out to N candidates is broken into small batches; each batch is written, then the
+*next* batch is scheduled via `post()` rather than looping inline — so a large fan-out
+interleaves with other connections' I/O on the same loop instead of hogging it. This
+is the mechanism §2.3's Experiment B validates directly.
+
+### 2.2 The one real open design question: single shared `IoContext` vs. sharded
+
+Not resolved by Phase 1 research (flagged as an explicit open question — "what
+connection-count scale is NativeBroker actually targeted for?" is undocumented).
+Proposed resolution: **don't choose between them — make shard count a runtime
+parameter, default low (1-2).** A single-shard deployment is just the N=1 degenerate
+case of the same sharded design, so this isn't "build both," it's "build the sharded
+one and default it small." Cross-shard delivery (a fan-out recipient living on a
+*different* shard than the publisher) becomes its own micro-path — a `post()` hop —
+which is the other concrete instance of "separate code path, justified by shape" the
+owner's guidance calls for: same-shard delivery stays a direct call, cross-shard
+delivery pays one marshaling hop, and the two are never conflated into one mechanism
+that's fast for neither case.
+
+### 2.3 Validation plan — real, isolated, before any of §2.1 is trusted
+
+Three experiments, each producing actual measured numbers or a pass/fail result, none
+touching `native_broker.hpp` (so none of this risks the shipped topic-index fix):
+
+- **Experiment A — quantify the I/O-layer win.** Build a minimal `IoContext`-based
+  prototype (reactor + per-connection buffer + incremental packet parsing, reusing
+  `mqtt_codec.hpp`'s `Packet` shape) and benchmark it with the *same* methodology as
+  `bench/broker/broker_bench.cpp` (1:1 no-fanout, and small fanout). If the ~23-63K
+  msg/s single-connection ceiling and the ~7x fan-out drop measured against the current
+  broker don't measurably improve, the whole premise needs revisiting before Phase 3.
+- **Experiment B — prove the head-of-line-blocking fix actually works.** Extend
+  Experiment A's prototype: N sessions on one `IoContext`, one deliberately
+  non-draining "slow" consumer, a fast publisher blasting to all N via §2.1.1's
+  bounded/chained `post()` fan-out. Measure whether the *other* N-1 consumers keep
+  receiving at low, bounded latency despite the slow one — this is the concrete
+  claim behind "async fan-out fixes head-of-line blocking," and it needs a real
+  demonstration, not an inference from Quark's docs.
+- **Experiment C — does a race already exist today, independent of any redesign?**
+  A new, permanent test (closes Phase 1 gap #1) against the **current shipped**
+  `native_broker.hpp`: many rounds of concurrent publish-while-teardown with no
+  artificial sleeps (unlike every existing test), stressing exactly the scenario
+  suspected — never proven — to have caused the reverted fan-out-pool attempt's
+  stall. This resolves real lingering uncertainty ("was that a logic bug we'd
+  reintroduce, or environmental Windows thread-creation variance we're free of no
+  matter what we build next") and is valuable test coverage either way, so it should
+  be proposed for merge regardless of what Phase 3 decides.
+
+Deferred (lower priority, not blocking a Phase 3 recommendation): TLS non-blocking
+compatibility with mbedTLS (real work, but AeroEdge's TLS usage is a smaller fraction
+of traffic, and can be an explicit Phase 3 sub-task with its own validation rather than
+a Phase 2 gate); cross-shard `post()` marshaling correctness (already covered by
+Quark's own `voice_channel_loopback_test.cpp` — re-validating from scratch here would
+mostly re-prove Quark's own test suite, low marginal value).
+
+(Results of A/B/C to be appended below once the validation workflow completes.)
 
 ## Phase 3 — Implementation
 
