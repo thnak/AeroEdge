@@ -372,6 +372,20 @@ target_compile_definitions(native_broker_security PRIVATE
 add_test(NAME native_broker_security COMMAND native_broker_security)
 set_tests_properties(native_broker_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 Phase 2 Experiment C gate (redesign doc §1.5 gap #1 / §2.3 Experiment C): does a concurrent
+# publish-vs-teardown race already exist in the CURRENT SHIPPED NativeBroker? Unlike every other
+# tests/broker/*.cpp test (which deliberately sleeps to AVOID this race), this one runs straight at it
+# for a sustained 12s window with no artificial sleeps: several publisher threads tight-loop QoS-1
+# PUBLISH to a shared topic while a separate thread repeatedly connects a fresh client, SUBSCRIBEs, and
+# abruptly closes it (no clean DISCONNECT) — forcing teardown_session's non-clean-disconnect path —
+# concurrently, while several STEADY, never-torn-down subscriber clients must keep receiving messages
+# throughout. Proves the broker never hangs/crashes and steady clients' delivery never silently stops.
+# TIMEOUT is generous headroom above the ~12-15s the stress window itself takes.
+add_executable(concurrency_stress broker/concurrency_stress.cpp)
+target_link_libraries(concurrency_stress PRIVATE aero::broker)
+add_test(NAME concurrency_stress COMMAND concurrency_stress)
+set_tests_properties(concurrency_stress PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL" TIMEOUT 60)
+
 # ---- M9a: multi-protocol southbound (018) ------------------------------------------------------------
 # ModbusTcpDriver (drivers/modbus_tcp_driver.hpp): a real Modbus-TCP PULL driver (FC03 Read Holding
 # Registers) over aero::pal::dial_tcp (Part 2) + a bounded-backoff reconnect (006 §8, first driver in

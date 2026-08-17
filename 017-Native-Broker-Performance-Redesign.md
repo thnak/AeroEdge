@@ -358,7 +358,93 @@ a Phase 2 gate); cross-shard `post()` marshaling correctness (already covered by
 Quark's own `voice_channel_loopback_test.cpp` — re-validating from scratch here would
 mostly re-prove Quark's own test suite, low marginal value).
 
-(Results of A/B/C to be appended below once the validation workflow completes.)
+### 2.4 Validation results — all three experiments, real measured numbers
+
+All three built and ran real code against real loopback sockets; none touched
+`native_broker.hpp`. Two ran clean via the validation workflow; the third (C) needed a
+manual finish (its agent ran out of turns mid-stress-test-loop without reporting — the
+built test itself was left in a working state and was picked up and run directly).
+
+**Experiment A — I/O-layer throughput, CONFIRMED, high confidence.** A minimal
+`IoContext`-based prototype (per-connection owned read buffer, MQTT packets parsed
+incrementally out of it — the buffered-read fix — vs. the current per-syscall
+`read_packet()`/`read_n()`), same 1-publisher→1-subscriber/no-fan-out/QoS-0 shape as
+the documented baseline (~63,000 msg/s, ~44ms p50, backlog-bound), 3 runs:
+
+| Run | Throughput | p50 | p99 | max |
+|---|---|---|---|---|
+| baseline (current broker) | ~63,000 msg/s | ~44ms | — | — |
+| prototype run 1 | 120,469 msg/s | 6.54ms | 14.36ms | 16.22ms |
+| prototype run 2 | 105,395 msg/s | 6.41ms | 13.08ms | 15.35ms |
+| prototype run 3 | 107,327 msg/s | 7.02ms | 15.99ms | 17.83ms |
+
+**~1.7-1.9x throughput, ~6-7x lower p50 latency**, 100% delivery, zero errors, all
+three runs. The latency win is the more decisive number — it points at the
+multi-syscall-per-packet read pattern (plus the 200ms poll-as-heartbeat idiom) as the
+real driver of the baseline's 44ms p50, not some other untouched bottleneck. Caveat:
+deliberately minimal first cut (CONNECT/CONNACK + single-recipient forwarding only —
+no SUBSCRIBE/topic-matching/QoS1-2/TLS/keep-alive/sharding), so it isolates the
+I/O-layer win specifically, not the full migration's net effect once every other
+subsystem is layered back on top of the same reactor thread.
+
+**Experiment B — head-of-line-blocking fix, CONFIRMED, high confidence, and the
+strongest result of the three.** 10 subscribers + 1 publisher on one `IoContext` loop,
+1 subscriber deliberately non-draining after its first 5 messages. Same delivery/drop
+outcome to the slow recipient in both modes (501/6000 dropped — the fix changes
+nothing about how the slow client itself is treated), but the effect on the other 9
+*healthy* subscribers:
+
+| Fan-out strategy | Healthy-subscriber p50 | p99 | max | Publish throughput |
+|---|---|---|---|---|
+| Naive inline loop | 1630ms | 1996ms | 2011ms | 102 msg/s |
+| Bounded/chained `post()` | **14.0ms** | **16.7ms** | **17.1ms** | **9,626 msg/s** |
+
+**~116-119x latency reduction**, reproduced with a second, independent parameter set
+(tighter retry cap, fewer messages: 519ms → 23.6ms p50, ~22x). The naive mode's
+publish-side throughput also collapsed 94x (102 vs 9,626 msg/s) — because the inline
+stall on the slow subscriber's socket also blocks the reactor from reading the
+publisher's *next* PUBLISH, so the stall propagates backward through TCP backpressure
+too, not just forward to the other subscribers. This is real, reproduced evidence for
+§1.0's claim that a slow handler stalls "every other connection on that loop" — not an
+inference from documentation, an observed effect. §2.1.1's proposed fix demonstrably
+works, at this N=10/single-shard scale.
+
+**Experiment C — does a concurrent publish-vs-teardown race exist today? NO, not
+detectably, high confidence.** New permanent test, `tests/broker/concurrency_stress.cpp`
+(merged this round — see commit history): against the **current, unmodified, already-
+shipped** `native_broker.hpp`, 3 publisher threads tight-loop QoS-1 PUBLISH with zero
+sleeps while a separate thread continuously connects-subscribes-abruptly-disconnects
+(no clean DISCONNECT, forcing `teardown_session`'s non-clean path) for a sustained 12s
+window, while 3 steady never-torn-down subscribers must keep receiving throughout.
+
+Run **16 times** (1 initial + 15 repeated, each a fresh process invocation): **16/16
+passed cleanly.** Across the 16 runs: ~285-298 teardown rounds per run (~4,600 total),
+~2,300-2,400 QoS-1 publishes delivered per steady subscriber per run (~37,000 total
+publish/deliver round trips), zero publish failures, zero connect/subscribe failures,
+zero hangs, zero crashes, every run's post-stress round trip succeeded. This is
+meaningful evidence — not proof, but real repeated stress at real volume — that the
+prior reverted fan-out-pool attempt's stall was **not** a latent race already present
+in the current serial/synchronous design being newly exposed by concurrency; the
+current design handles this exact stress shape without incident. This makes the
+"Windows thread-creation-cost variability" explanation from that prior incident more
+credible than "we already had a hidden logic bug," though it doesn't fully rule out a
+race specific to the *reverted pool design itself* (which no longer exists to
+re-test). This test is now permanent coverage regardless of what Phase 3 builds.
+
+**Net read on Phase 2 as a whole:** the core premise holds up under real, adversarial
+testing, not just the documentation/precedent case in §1.0. Recommend proceeding to
+Phase 3 scoping (a concrete implementation plan, starting with the I/O layer + the
+single-recipient and QoS-0 fan-out paths, per §2.1's table) rather than further
+validation — the open items flagged in §2.3 (TLS non-blocking compatibility,
+cross-shard `post()` correctness) remain real but lower-priority, addressable as
+Phase 3 sub-tasks with their own focused validation rather than blocking gates here.
+
+*(Process note: the Experiment A/B prototype source files were inadvertently deleted
+during worktree cleanup before being copied out of their isolated worktrees — an
+avoidable operational mistake. The measured numbers and conclusions above are intact
+(captured in the workflow journal before cleanup); the prototype code itself would
+need to be rewritten if wanted as a standing reference artifact. Experiment C's test
+file was copied out first and is preserved/merged.)*
 
 ## Phase 3 — Implementation
 
