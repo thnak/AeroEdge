@@ -21,6 +21,7 @@
 | M9.1 PR E | `OpcUaDriver::write()` — scalar write via `UA_Client_writeValueAttribute` | **Shipped** |
 | M9.1 PR F | `OpcUaDriver::write()` — single-argument method call via `UA_Client_call` (`"object\|method"` target form) | **Shipped** |
 | M9.1 PR G | `OpcUaDriver` — address-space browse mode (`UA_Client_Service_browse`, `browse_root` config) | **Shipped** |
+| M9.1 PR H | `ModbusRtuDriver` + `aero::pal::serial` — Modbus RTU/serial transport (FC01/02/03/04/06/16) | **Shipped** |
 
 ## 1. Why
 
@@ -155,7 +156,29 @@ downstream, not `"aero.source.modbus"`). The open()-time payload-cap check and `
 byte-count math are both now function-of-`ReadFunction` (word: `count*2`; bit: `ceil(count/8)`)
 rather than hardcoded to the word case.
 
-**Explicitly deferred** (M9.1, §8): Modbus RTU/serial transport (TCP only).
+**M9.1 PR H** shipped `ModbusRtuDriver` (`include/aero/drivers/modbus_rtu_driver.hpp`, type_id
+`aero.driver.modbus_rtu`) — the serial counterpart, over a NEW `aero::pal::serial` PAL
+(`include/aero/pal/serial.hpp`, this tree's first serial I/O of any kind: `CreateFileA`/`DCB`/
+`SetCommState`/`SetCommTimeouts` on Windows, `termios`/`VMIN`+`VTIME` on POSIX). Same FC01/02/03/04
+read + FC06/FC16 write surface and `cmd.target` encoding as `ModbusTcpDriver`, but NOT a refactor of
+it — RTU framing (`[addr:1][PDU][CRC16-LE:2]`, no length field, no transaction id, the request/
+response pairing implicit in half-duplex serial ordering) is different enough from MBAP+TCP that
+`ModbusRtuDriver` duplicates the short FC-byte-encoding shapes with RTU framing instead, rather than
+touching the shipped, working TCP driver. Modbus's own CRC-16 (poly `0xA001` reflected, init
+`0xFFFF`) is a distinct algorithm from `CrcNode`'s CCITT-FALSE — implemented once in the driver,
+verified against the Modbus spec's own worked example in the test suite. Same bounded-backoff
+reconnect posture as every other driver here (opening a serial port can fail exactly like a TCP
+dial can). Config: `port`, `baud_rate`, `slave_address`, `start_address`, `register_count`,
+`register_type`, `parity` (`N`/`E`/`O`), `stop_bits` (1/2) — mirrors `aero.driver.modbus_tcp`'s
+selector fields with serial-specific fields swapped in for `host`/`port`/`unit_id`.
+
+**Testability**: unlike a TCP loopback server, there is no portable way to fake a COM port without
+real hardware or a third-party virtual-COM driver — so `ModbusRtuDriver` talks to a small
+`ISerialTransport` seam instead of `aero::pal::serial` directly. Production code gets
+`RealSerialTransport` (a thin PAL wrapper); the test suite injects an in-memory fake that echoes
+canned RTU frames built independently (its own CRC16, not the driver's). This is the only
+abstraction this PR adds beyond duplicating `ModbusTcpDriver`'s shape, and exists purely because
+hardware-free testing has no other option.
 
 ## 5. Scope — M9b: OPC-UA
 
@@ -222,7 +245,7 @@ children, and reading nested subtrees (v1 is exactly one browse level per `poll(
 | Modbus-TCP: Read Input Registers (FC04) | **shipped** | M9.1 PR B, `ModbusTcpDriver::ReadFunction` |
 | Modbus-TCP: Write Multiple Registers (FC16) | **shipped** | M9.1 PR C, `ModbusTcpDriver::write()` |
 | Modbus-TCP: Read Coils / Discrete Inputs (FC01/FC02) | **shipped** | M9.1 PR D, `ModbusBitsDecodeNode` |
-| Modbus-TCP: RTU/serial transport | backlog | M9.1 |
+| Modbus RTU/serial transport (FC01/02/03/04/06/16) | **shipped** | M9.1 PR H, `ModbusRtuDriver` + `aero::pal::serial` |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: scalar write to a configured NodeId | **shipped** | M9.1 PR E, `OpcUaDriver::write()` |
 | OPC-UA: single-argument method call | **shipped** | M9.1 PR F, `OpcUaDriver::write()` |
@@ -253,8 +276,10 @@ deployment needs that.
   subscribe-and-get-notified — would let `OpcUaDriver` become a push (`run()`) driver instead of
   poll, lower latency and lower request volume than v1's poll loop. Revisit once poll-interval
   latency is a measured problem, not preemptively.
-- **Modbus RTU / serial transport.** v1 is TCP-only; RTU needs a serial PAL this codebase doesn't
-  have yet.
+- **Modbus RTU serial-config breadth.** PR H ships the common case (8 data bits fixed per spec,
+  configurable baud/parity/stop-bits, no RS-485 driver-enable/DE-RTS toggling — assumes the
+  serial adapter or a transceiver handles half-duplex turnaround itself). Revisit if a real
+  deployment's RS-485 hardware needs the driver to control DE/RE lines directly.
 - **Multi-frame chunking** for register-maps/NodeId-lists wider than the 128-byte payload cap
   (§3) — would need either a bigger `kMaxFramePayload` (blocked on Quark's mailbox cell size,
   upstream QuarkCpp work) or splitting one wide poll into multiple `Frame`s per cycle. Revisit if

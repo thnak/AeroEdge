@@ -38,6 +38,7 @@
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
+#include "aero/drivers/modbus_rtu_driver.hpp"
 #include "aero/drivers/modbus_tcp_driver.hpp"
 #include "aero/drivers/opcua_driver.hpp"
 #include "aero/ext/native_loader.hpp"
@@ -160,6 +161,24 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
             c.value("endpoint", std::string{}),
             c.value("node_ids", std::vector<std::string>{}),
             c.value("browse_root", std::string{}));
+    });
+    // M9.1 PR H (018 §8): Modbus RTU/serial counterpart to aero.driver.modbus_tcp above — same
+    // "register_type" selector and defaults, plus serial-specific fields (port name, baud, parity,
+    // stop_bits, slave_address in place of host/port/unit_id).
+    driver_reg.register_type("aero.driver.modbus_rtu", [](const nlohmann::json& c) {
+        using RF = aero::drivers::ModbusRtuDriver::ReadFunction;
+        auto read_fn = RF::HoldingRegisters;
+        const std::string rt = c.value("register_type", std::string{"holding"});
+        if (rt == "input") read_fn = RF::InputRegisters;
+        else if (rt == "coils") read_fn = RF::Coils;
+        else if (rt == "discrete_inputs") read_fn = RF::DiscreteInputs;
+        const std::string parity_s = c.value("parity", std::string{"N"});
+        const char parity = parity_s.empty() ? 'N' : parity_s[0];
+        return std::make_unique<aero::drivers::ModbusRtuDriver>(
+            c.value("port", std::string{}), c.value("baud_rate", std::uint32_t{9600}),
+            c.value("slave_address", std::uint8_t{1}), c.value("start_address", std::uint16_t{0}),
+            c.value("register_count", std::uint16_t{8}), read_fn, parity,
+            c.value("stop_bits", std::uint8_t{1}));
     });
 }
 

@@ -402,3 +402,18 @@ target_link_libraries(opcua_driver PRIVATE aero::drivers aero::nodes aero::sdk a
   quark::quark Threads::Threads)
 add_test(NAME opcua_driver COMMAND opcua_driver)
 set_tests_properties(opcua_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M9.1 PR H: Modbus RTU / serial southbound (018 §8) -----------------------------------------------
+# ModbusRtuDriver (drivers/modbus_rtu_driver.hpp): the serial counterpart to ModbusTcpDriver, over a new
+# aero::pal::serial PAL (this tree's first serial I/O of any kind). No portable hardware-free way to fake
+# a COM port exists (unlike a TCP loopback server), so the driver talks to an ISerialTransport seam
+# instead of the PAL directly; this test injects an in-memory fake transport that echoes canned RTU
+# frames (built independently in the test file, mirroring FakeModbusServer's own arm's-length approach)
+# to prove: (1) happy path read (FC03) decodes correctly and the driver's own request bytes/CRC are
+# correct; (2) a write (FC06) round-trip; (3) a Modbus exception response is a clean Error with the
+# transport left open; (4) a CRC-corrupted response is a clean Error with the transport closed
+# (reconnect-eligible); (5) modbus_crc16 itself matches the Modbus spec's own worked example.
+add_executable(modbus_rtu_driver drivers/modbus_rtu_driver.cpp)
+target_link_libraries(modbus_rtu_driver PRIVATE aero::drivers aero::nodes aero::sdk quark::quark Threads::Threads)
+add_test(NAME modbus_rtu_driver COMMAND modbus_rtu_driver)
+set_tests_properties(modbus_rtu_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
