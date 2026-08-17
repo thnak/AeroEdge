@@ -15,6 +15,7 @@
 | M9a | `Frame`/driver-pipeline byte-payload plumbing (shared prerequisite) + `ModbusTcpDriver` (FC03 poll, no new dependency) | **Shipped** |
 | M9b | open62541 vendoring + `OpcUaDriver` (no-security client, poll configured NodeIds) | **Shipped** |
 | M9.1 PR A | `ModbusTcpDriver::write()` — FC06 Write Single Register | **Shipped** |
+| M9.1 PR B | `ModbusTcpDriver` — FC04 Read Input Registers (`register_type` config selector) | **Shipped** |
 
 ## 1. Why
 
@@ -121,9 +122,16 @@ Same connect/reconnect/backoff path as `poll()` — a failed write drops the con
 a failed read does, and a well-formed Modbus exception response (0x86) is a clean `DriverStatus::Error`
 with `last_exception_code()` set, never a crash.
 
+**M9.1 PR B** shipped FC04 (Read Input Registers) alongside FC03: a `ReadFunction` enum
+(`HoldingRegisters` | `InputRegisters`) selected at construction, defaulting to FC03 for backward
+compatibility; the deploy-time JSON config selects it via `"register_type": "holding" | "input"`
+(runtime.hpp factory). FC03 and FC04 are wire-identical register reads, so both share
+`ModbusDecodeNode` unchanged — no new decode path needed.
+
 **Explicitly deferred** (M9.1, §8): FC16 Write Multiple Registers (needs a `DeviceCommand` shape
-change to carry more than one value — out of this PR's scope, see §8), other register/data types
-(coils FC01, discrete inputs FC02, input registers FC04), Modbus RTU/serial transport (TCP only).
+change to carry more than one value — out of scope, see §8), coils (FC01) and discrete inputs
+(FC02) (bit-packed, not word-packed — need a decode node of their own), Modbus RTU/serial transport
+(TCP only).
 
 ## 5. Scope — M9b: OPC-UA
 
@@ -152,7 +160,8 @@ address-space browsing (v1 reads only configured NodeIds, no discovery), method 
 |---|---|---|
 | Modbus-TCP: Read Holding Registers (FC03) | **shipped** | M9a, `ModbusTcpDriver` |
 | Modbus-TCP: Write Single Register (FC06) | **shipped** | M9.1 PR A, `ModbusTcpDriver::write()` |
-| Modbus-TCP: FC16 (write multiple), other register types, RTU/serial | backlog | M9.1 |
+| Modbus-TCP: Read Input Registers (FC04) | **shipped** | M9.1 PR B, `ModbusTcpDriver::ReadFunction` |
+| Modbus-TCP: FC16 (write multiple), coils/discrete inputs, RTU/serial | backlog | M9.1 |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: security policies, Subscriptions, browsing, method calls | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
@@ -186,7 +195,9 @@ deployment needs that.
   giving `ModbusTcpDriver` its own multi-value command shape. Revisit once an actuator/setpoint use
   case needs a multi-register write in one transaction (repeated FC06 calls cover the same end
   state today, just not atomically).
-- **Other Modbus register/data types** (coils FC01, discrete inputs FC02, input registers FC04).
+- **Coils (FC01) and discrete inputs (FC02).** Bit-packed, not word-packed like FC03/FC04 (M9.1 PR
+  B) — `ModbusDecodeNode` assumes 16-bit register values, so these need a decode node of their own,
+  not just a new `ReadFunction` value.
 - **Modbus RTU / serial transport.** v1 is TCP-only; RTU needs a serial PAL this codebase doesn't
   have yet.
 - **Multi-frame chunking** for register-maps/NodeId-lists wider than the 128-byte payload cap

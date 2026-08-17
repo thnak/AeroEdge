@@ -132,11 +132,16 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // M9a (018 §Multi-protocol southbound): a real Modbus-TCP PULL driver. Config is read straight out
     // of the deploy-time JSON at construction (not routed through DriverConfig's narrow endpoint/
     // frame_count/rate_hz fields, per this driver's explicit constraint — see modbus_tcp_driver.hpp).
+    // "register_type": "holding" (default, FC03) | "input" (FC04) — M9.1 PR B.
     driver_reg.register_type("aero.driver.modbus_tcp", [](const nlohmann::json& c) {
+        auto read_fn = aero::drivers::ModbusTcpDriver::ReadFunction::HoldingRegisters;
+        if (c.value("register_type", std::string{"holding"}) == "input") {
+            read_fn = aero::drivers::ModbusTcpDriver::ReadFunction::InputRegisters;
+        }
         return std::make_unique<aero::drivers::ModbusTcpDriver>(
             c.value("host", std::string{}), c.value("port", std::uint16_t{502}),
             c.value("unit_id", std::uint8_t{1}), c.value("start_address", std::uint16_t{0}),
-            c.value("register_count", std::uint16_t{8}));
+            c.value("register_count", std::uint16_t{8}), read_fn);
     });
     // M9b (018 §Multi-protocol southbound): a real OPC-UA client PULL driver (open62541-backed). Config
     // is read straight out of the deploy-time JSON at construction, same reasoning as

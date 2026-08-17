@@ -137,7 +137,7 @@ struct FakeModbusServer {
         }
     }
 
-    // Read exactly one request (12 bytes: MBAP7 + fc1 + 4 more PDU bytes — FC03's addr2+count2 and
+    // Read exactly one request (12 bytes: MBAP7 + fc1 + 4 more PDU bytes — FC03/FC04's addr2+count2 and
     // FC06's addr2+value2 are the same wire size), reply per function code, then return (caller closes
     // the connection).
     void serve_one(quark::pal::fd_t conn) {
@@ -147,14 +147,16 @@ struct FakeModbusServer {
         const std::uint16_t txn = get_u16_be(&req[0]);
         const std::uint8_t unit = std::to_integer<std::uint8_t>(req[6]);
         const std::uint8_t fc = std::to_integer<std::uint8_t>(req[7]);
-        if (fc == 0x03) {
-            serve_read(conn, txn, unit, req);
+        if (fc == 0x03 || fc == 0x04) {
+            serve_read(conn, txn, unit, fc, req);
         } else if (fc == 0x06) {
             serve_write(conn, txn, unit, req);
         }
     }
 
-    void serve_read(quark::pal::fd_t conn, std::uint16_t txn, std::uint8_t unit,
+    // Same `registers` bank answers both FC03 and FC04 — the fake server doesn't model separate holding
+    // vs input address spaces, it just needs to prove the driver's requested function code round-trips.
+    void serve_read(quark::pal::fd_t conn, std::uint16_t txn, std::uint8_t unit, std::uint8_t fc,
                      const std::array<std::byte, 12>& req) {
         const std::uint16_t start = get_u16_be(&req[8]);
         const std::uint16_t count = get_u16_be(&req[10]);
@@ -165,7 +167,7 @@ struct FakeModbusServer {
         put_u16_be(&resp[2], 0x0000);
         put_u16_be(&resp[4], static_cast<std::uint16_t>(3 + byte_count));  // unit(1)+fc(1)+bytecount(1)+data
         resp[6] = static_cast<std::byte>(unit);
-        resp[7] = static_cast<std::byte>(0x03);
+        resp[7] = static_cast<std::byte>(fc);
         resp[8] = static_cast<std::byte>(byte_count);
         for (std::uint16_t i = 0; i < count; ++i) {
             const std::uint16_t v = (start + i) < registers.size() ? registers[start + i] : 0;
@@ -277,6 +279,37 @@ bool test_happy_path() {
     driver.close();
     server.stop();
     if (!ok) std::printf("happy_path: assertion failed\n");
+    return ok;
+}
+
+// ---- (1b) M9.1 PR B: FC04 (Read Input Registers) round-trips through the same decode path -------------
+bool test_read_input_registers() {
+    FakeModbusServer server;
+    if (!server.start()) { std::printf("read_input_registers: server start failed\n"); return false; }
+
+    ModbusTcpDriver driver("127.0.0.1", server.port, /*unit*/ 1, /*start*/ 2, /*count*/ 4,
+                            ModbusTcpDriver::ReadFunction::InputRegisters);
+    aero::DriverConfig cfg{};
+    bool ok = driver.open(cfg) == aero::DriverStatus::Ok;
+
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+    ok &= outcome.frame.has_value();
+    if (outcome.frame) {
+        aero::ProcessingContext ctx;
+        ctx.reset(&*outcome.frame);
+        aero::nodes::ModbusDecodeNode decode;
+        ok &= decode.process(ctx) == aero::NodeResult::Continue;
+        ok &= ctx.tags.size() == 4;
+        const std::uint16_t expected[4] = {0xA002, 0xA003, 0xA004, 0xA005};
+        for (std::size_t i = 0; i < 4 && i < ctx.tags.size(); ++i) {
+            ok &= ctx.tags[i].value == static_cast<double>(expected[i]);
+        }
+    }
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("read_input_registers: assertion failed\n");
     return ok;
 }
 
@@ -394,6 +427,10 @@ int main() {
     const bool happy_ok = test_happy_path();
     ok &= happy_ok;
     std::printf("[happy_path] %s\n", happy_ok ? "ok" : "FAIL");
+
+    const bool read_input_ok = test_read_input_registers();
+    ok &= read_input_ok;
+    std::printf("[read_input_registers] %s\n", read_input_ok ? "ok" : "FAIL");
 
     const bool oversized_ok = test_oversized_rejected();
     ok &= oversized_ok;

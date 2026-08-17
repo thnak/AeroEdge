@@ -33,22 +33,33 @@
 
 namespace aero::drivers {
 
-// ModbusTcpDriver — FC03 (Read Holding Registers) only (v1 scope). Construction takes ownership of its
-// config (host/port/unit_id/start_address/register_count) at build time — the factory in
-// runtime.hpp::register_builtins() reads these straight out of the deploy-time JSON, per the existing
-// GeneratorDriver-style factory closure pattern; DriverConfig (aero/sdk/driver.hpp) intentionally stays
-// untouched (its endpoint/frame_count fields don't fit this driver's shape) beyond the optional
-// `rate_hz` poll-interval hint, honored here only as an observable stored value — the actual poll
-// cadence is the deployer's call (whatever drives `poll()` externally), not this driver's.
+// ModbusTcpDriver — FC03 (Read Holding Registers) and FC04 (Read Input Registers), selected at
+// construction (M9.1 PR B, 018 §8; both are wire-identical register reads, so they share one decode
+// path — ModbusDecodeNode doesn't care which address space the bytes came from). Construction takes
+// ownership of its config (host/port/unit_id/start_address/register_count/read_fn) at build time — the
+// factory in runtime.hpp::register_builtins() reads these straight out of the deploy-time JSON, per the
+// existing GeneratorDriver-style factory closure pattern; DriverConfig (aero/sdk/driver.hpp)
+// intentionally stays untouched (its endpoint/frame_count fields don't fit this driver's shape) beyond
+// the optional `rate_hz` poll-interval hint, honored here only as an observable stored value — the
+// actual poll cadence is the deployer's call (whatever drives `poll()` externally), not this driver's.
 class ModbusTcpDriver final : public IDriver {
 public:
+    // Which register address space poll() reads. Coils (FC01) and discrete inputs (FC02) are NOT here —
+    // they're bit-packed, not word-packed, and would need a decode node of their own (018 §8, backlog).
+    enum class ReadFunction : std::uint8_t {
+        HoldingRegisters = 0x03,
+        InputRegisters = 0x04,
+    };
+
     ModbusTcpDriver(std::string host, std::uint16_t port, std::uint8_t unit_id,
-                     std::uint16_t start_address, std::uint16_t register_count) noexcept
+                     std::uint16_t start_address, std::uint16_t register_count,
+                     ReadFunction read_fn = ReadFunction::HoldingRegisters) noexcept
         : host_(std::move(host)),
           port_(port),
           unit_id_(unit_id),
           start_address_(start_address),
-          register_count_(register_count) {}
+          register_count_(register_count),
+          read_fn_(read_fn) {}
 
     // Config-time rejection (never a silently truncated frame, per Part 1's Frame::payload_len/payload
     // budget): register_count*2 must fit inside kMaxFramePayload. Otherwise dial now — open() is the
@@ -133,7 +144,6 @@ private:
     static constexpr int kIoTimeoutMs = 3000;      // bounded total time for one send/recv-exact call
     static constexpr int kInitialBackoffMs = 200;
     static constexpr int kMaxBackoffMs = 5000;
-    static constexpr std::uint8_t kFcReadHoldingRegisters = 0x03;
     static constexpr std::uint8_t kFcWriteSingleRegister = 0x06;
     static constexpr std::uint8_t kFcExceptionBit = 0x80;
 
@@ -219,7 +229,7 @@ private:
         put_u16_be(&req[2], 0x0000);  // protocol id: always 0 (Modbus)
         put_u16_be(&req[4], 0x0006);  // length: unit(1) + fc(1) + addr(2) + count(2)
         req[6] = static_cast<std::byte>(unit_id_);
-        req[7] = static_cast<std::byte>(kFcReadHoldingRegisters);
+        req[7] = static_cast<std::byte>(read_fn_);
         put_u16_be(&req[8], start_address_);
         put_u16_be(&req[10], register_count_);
 
@@ -254,12 +264,12 @@ private:
 
         const auto fc = std::to_integer<std::uint8_t>(pdu[0]);
         if ((fc & kFcExceptionBit) != 0) {
-            // Well-formed Modbus exception (e.g. 0x83 for FC03): connection is fine, just a device-level
+            // Well-formed Modbus exception (e.g. 0x83/0x84): connection is fine, just a device-level
             // error — never close the socket for this (see function banner).
             last_exception_code_ = pdu_len >= 2 ? std::to_integer<std::uint8_t>(pdu[1]) : 0;
             return DriverStatus::Error;
         }
-        if (fc != kFcReadHoldingRegisters) {
+        if (fc != static_cast<std::uint8_t>(read_fn_)) {
             io_ok = false;  // an unexpected function code is a framing problem, not a device error
             return DriverStatus::Error;
         }
@@ -347,6 +357,7 @@ private:
     std::uint8_t unit_id_;
     std::uint16_t start_address_;
     std::uint16_t register_count_;
+    ReadFunction read_fn_;
     std::uint32_t rate_hz_ = 0;  // advisory only (see class banner)
 
     bool opened_ = false;
