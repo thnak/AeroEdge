@@ -18,6 +18,7 @@
 | M9.1 PR B | `ModbusTcpDriver` — FC04 Read Input Registers (`register_type` config selector) | **Shipped** |
 | M9.1 PR C | `ModbusTcpDriver::write()` — FC16 Write Multiple Registers (`"addr,v1,v2,..."` target form) | **Shipped** |
 | M9.1 PR D | `ModbusTcpDriver` — FC01/FC02 Read Coils/Discrete Inputs + `ModbusBitsDecodeNode` | **Shipped** |
+| M9.1 PR E | `OpcUaDriver::write()` — scalar write via `UA_Client_writeValueAttribute` | **Shipped** |
 
 ## 1. Why
 
@@ -170,10 +171,20 @@ of NodeId strings — bounded by the 128-byte payload cap, §3). `poll()` reads 
 NodeId's value via `UA_Client_readValueAttribute`, converts numeric variant types to `double`,
 serializes the NodeId→value map as flat JSON into the `Frame` payload for `JsonParseNode`.
 
+**M9.1 PR E** shipped `IDriver::write()` via `UA_Client_writeValueAttribute` — the OPC-UA
+counterpart to `ModbusTcpDriver`'s FC06. `cmd.target` is a NodeId string, parsed the same way as a
+configured `node_ids` entry (`UA_NodeId_parse`, checked BEFORE touching the connection, so a
+malformed target never dials); `cmd.value` is written as a `UA_Double`, matching this driver's own
+read-side convention of normalizing every value to `double`. Same connection-loss detection/
+teardown posture as `poll()` (006 §8): a genuine channel/session loss tears the session down for
+the next `poll()`/`write()` to reconnect, while a well-formed OPC-UA error over a healthy
+connection (bad NodeId, read-only node, type mismatch) is a clean `DriverStatus::Error` with the
+connection left up. `kDesc.writable` flipped to `true`.
+
 **Explicitly deferred** (M9.1, §8): security policies (Sign/SignAndEncrypt, certificate-based
 client auth), Subscriptions/MonitoredItems (OPC-UA's native push mechanism — v1 is pure poll,
 matching the pull-driver shape 006 §6 already defines and keeping parity with the Modbus driver),
-address-space browsing (v1 reads only configured NodeIds, no discovery), method calls.
+address-space browsing (v1 reads/writes only configured NodeIds, no discovery), method calls.
 
 ## 6. Capability table
 
@@ -186,6 +197,7 @@ address-space browsing (v1 reads only configured NodeIds, no discovery), method 
 | Modbus-TCP: Read Coils / Discrete Inputs (FC01/FC02) | **shipped** | M9.1 PR D, `ModbusBitsDecodeNode` |
 | Modbus-TCP: RTU/serial transport | backlog | M9.1 |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
+| OPC-UA: scalar write to a configured NodeId | **shipped** | M9.1 PR E, `OpcUaDriver::write()` |
 | OPC-UA: security policies, Subscriptions, browsing, method calls | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |

@@ -139,8 +139,10 @@ struct FakeOpcUaServer {
         server = UA_Server_newWithConfig(&config);
         if (!server) return false;
 
-        add_variable(server, "Temperature", 23.5);
-        add_variable(server, "Pressure", 101.3);
+        add_variable(server, "Temperature", 23.5, UA_ACCESSLEVELMASK_READ);
+        add_variable(server, "Pressure", 101.3, UA_ACCESSLEVELMASK_READ);
+        add_variable(server, "Setpoint", 0.0,
+                      UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE);  // M9.1 PR E write test target
 
         // Synchronous on THIS (the caller's) thread — see the struct banner above for why: this is the
         // real happens-before edge against the driver's own UA_Client startup (also called from the main
@@ -173,13 +175,13 @@ struct FakeOpcUaServer {
         server = nullptr;
     }
 
-    static void add_variable(UA_Server* srv, const char* name, UA_Double value) {
+    static void add_variable(UA_Server* srv, const char* name, UA_Double value, UA_Byte access_level) {
         UA_VariableAttributes attr = UA_VariableAttributes_default;
         UA_Variant_setScalar(&attr.value, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
         attr.description = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>(name));
         attr.displayName = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>(name));
         attr.dataType = UA_TYPES[UA_TYPES_DOUBLE].typeId;
-        attr.accessLevel = UA_ACCESSLEVELMASK_READ;
+        attr.accessLevel = access_level;
 
         const UA_NodeId node_id = UA_NODEID_STRING(1, const_cast<char*>(name));
         const UA_QualifiedName browse_name = UA_QUALIFIEDNAME(1, const_cast<char*>(name));
@@ -278,6 +280,72 @@ bool test_happy_path() {
     return ok;
 }
 
+// ---- (1b) M9.1 PR E: write() a scalar to the server's writable "Setpoint" node, read it back -----------
+bool test_write_scalar() {
+    FakeOpcUaServer server;
+    if (!server.start()) { std::printf("write_scalar: server start failed\n"); return false; }
+
+    OpcUaDriver driver(kEndpoint, std::vector<std::string>{"ns=1;s=Setpoint"});
+    aero::DriverConfig cfg{};
+    bool ok = open_with_retry(driver, cfg);
+    if (!ok) std::printf("write_scalar: open() never succeeded\n");
+
+    ok &= driver.write(aero::DeviceCommand{"ns=1;s=Setpoint", 42}) == aero::DriverStatus::Ok;
+
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+    ok &= outcome.frame.has_value();
+    if (outcome.frame) {
+        aero::ProcessingContext ctx;
+        ctx.reset(&*outcome.frame);
+        aero::nodes::JsonParseNode decode;
+        ok &= decode.process(ctx) == aero::NodeResult::Continue;
+        ok &= ctx.tags.size() == 1 && ctx.tags[0].name == "ns=1;s=Setpoint" && ctx.tags[0].value == 42.0;
+    }
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("write_scalar: assertion failed\n");
+    return ok;
+}
+
+// ---- (1c) M9.1 PR E: writing to a read-only node is a clean Error, connection stays healthy ------------
+bool test_write_read_only_rejected() {
+    FakeOpcUaServer server;
+    if (!server.start()) { std::printf("write_read_only: server start failed\n"); return false; }
+
+    OpcUaDriver driver(kEndpoint, std::vector<std::string>{"ns=1;s=Temperature"});
+    aero::DriverConfig cfg{};
+    bool ok = open_with_retry(driver, cfg);
+    if (!ok) std::printf("write_read_only: open() never succeeded\n");
+
+    ok &= driver.write(aero::DeviceCommand{"ns=1;s=Temperature", 99}) == aero::DriverStatus::Error;
+
+    // Connection should have stayed healthy — a normal poll() right after still succeeds.
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("write_read_only: assertion failed\n");
+    return ok;
+}
+
+// ---- (1d) M9.1 PR E: a malformed NodeId target is rejected without any I/O -----------------------------
+bool test_write_invalid_target() {
+    // Port 1 is expected to refuse the connect, so open() itself returns Error here — irrelevant to this
+    // test, same posture as ModbusTcpDriver's write_invalid_target test: open() sets `opened_` true
+    // before it ever dials, and write()'s target parse runs before it touches the connection at all.
+    OpcUaDriver driver("opc.tcp://127.0.0.1:1", std::vector<std::string>{});
+    aero::DriverConfig cfg{};
+    (void)driver.open(cfg);
+
+    const bool ok = driver.write(aero::DeviceCommand{"not-a-valid-nodeid", 1}) == aero::DriverStatus::Error;
+    driver.close();
+    if (!ok) std::printf("write_invalid_target: assertion failed\n");
+    return ok;
+}
+
 // ---- (2) a node_ids list too large for the 128-byte payload budget is rejected at open() --------------
 bool test_oversized_rejected() {
     // ~40 bytes/entry worst-case estimate (opcua_driver.hpp) -> 4 entries already exceeds 128 bytes.
@@ -350,6 +418,18 @@ int main() {
     const bool happy_ok = test_happy_path();
     ok &= happy_ok;
     std::printf("[happy_path] %s\n", happy_ok ? "ok" : "FAIL");
+
+    const bool write_ok = test_write_scalar();
+    ok &= write_ok;
+    std::printf("[write_scalar] %s\n", write_ok ? "ok" : "FAIL");
+
+    const bool write_ro_ok = test_write_read_only_rejected();
+    ok &= write_ro_ok;
+    std::printf("[write_read_only_rejected] %s\n", write_ro_ok ? "ok" : "FAIL");
+
+    const bool write_bad_target_ok = test_write_invalid_target();
+    ok &= write_bad_target_ok;
+    std::printf("[write_invalid_target] %s\n", write_bad_target_ok ? "ok" : "FAIL");
 
     const bool oversized_ok = test_oversized_rejected();
     ok &= oversized_ok;

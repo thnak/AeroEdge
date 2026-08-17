@@ -3,9 +3,10 @@
 // OPC-UA SDK. Same posture as ModbusTcpDriver (drivers/modbus_tcp_driver.hpp, this milestone's worked
 // reference): PULL, not PUSH — every read happens inside one `poll()` call, `run()` is a hard
 // Unsupported. v1 SCOPE (explicit, not an oversight): connect to ONE configured endpoint, read a fixed
-// set of configured NodeIds via UA_Client_readValueAttribute. NO security policies (Sign/SignAndEncrypt
-// is backlog), NO Subscriptions/MonitoredItems, NO browsing, NO method calls — pure poll-configured-
-// NodeIds only.
+// set of configured NodeIds via UA_Client_readValueAttribute, write a scalar to any NodeId via
+// UA_Client_writeValueAttribute (M9.1 PR E, 018 §8 — the OPC-UA counterpart to ModbusTcpDriver's FC06).
+// NO security policies (Sign/SignAndEncrypt is backlog), NO Subscriptions/MonitoredItems, NO browsing,
+// NO method calls — pure poll-configured-NodeIds plus single-NodeId scalar write only.
 //
 // REUSE, NOT REBUILD (the whole point): this driver's job stops at serializing the polled NodeId->value
 // results into a FLAT JSON OBJECT (e.g. {"ns=2;s=Temperature":23.5}) written into the Frame's byte
@@ -139,6 +140,58 @@ public:
         return DriverStatus::Ok;
     }
 
+    // A device-directed write (006 §7) via UA_Client_writeValueAttribute — the OPC-UA counterpart to
+    // ModbusTcpDriver's FC06. `cmd.target` is the NodeId string, parsed the same way as a configured
+    // `node_ids` entry (UA_NodeId_parse — a malformed target is a clean Error before any I/O); `cmd.value`
+    // is written as a UA_Double, matching this driver's own read-side convention of normalizing every
+    // value to double (variant_to_double()). Same connection-loss detection and teardown posture as
+    // poll() (006 §8): a genuine channel/session loss tears the session down for the next poll()/write()
+    // to reconnect; a well-formed OPC-UA error over a healthy connection (bad NodeId, type mismatch,
+    // access denied) is a clean DriverStatus::Error, connection stays up.
+    DriverStatus write(const DeviceCommand& cmd) noexcept override {
+        if (!opened_) return DriverStatus::Error;
+
+        // Parse the target BEFORE touching the connection (mirrors ModbusTcpDriver::write()): a
+        // malformed target is a config error, not a device/connection error, so it short-circuits
+        // without a reconnect attempt even when the driver is currently disconnected.
+        UA_NodeId id;
+        UA_NodeId_init(&id);
+        UA_String ua_target = UA_String_fromChars(std::string(cmd.target).c_str());
+        const UA_StatusCode parse_rc = UA_NodeId_parse(&id, ua_target);
+        UA_String_clear(&ua_target);
+        if (parse_rc != UA_STATUSCODE_GOOD) {
+            UA_NodeId_clear(&id);
+            return DriverStatus::Error;
+        }
+
+        if (!connected_ && !ensure_connected()) {
+            UA_NodeId_clear(&id);
+            return DriverStatus::Error;
+        }
+
+        UA_Variant value;
+        UA_Variant_init(&value);
+        UA_Double v = static_cast<UA_Double>(cmd.value);
+        const UA_StatusCode variant_rc = UA_Variant_setScalarCopy(&value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        if (variant_rc != UA_STATUSCODE_GOOD) {
+            UA_NodeId_clear(&id);
+            return DriverStatus::Error;
+        }
+
+        const UA_StatusCode rc = UA_Client_writeValueAttribute(client_, id, &value);
+        UA_Variant_clear(&value);
+        UA_NodeId_clear(&id);
+
+        if (rc != UA_STATUSCODE_GOOD) {
+            if (connection_lost()) {
+                teardown_session();  // (006 §8) -> reconnect w/ backoff on a later poll()/write()
+                return DriverStatus::Error;
+            }
+            return DriverStatus::Error;  // well-formed device-level error, connection stays healthy
+        }
+        return DriverStatus::Ok;
+    }
+
     void close() noexcept override {
         for (auto& id : node_ids_) UA_NodeId_clear(&id);
         node_ids_.clear();
@@ -153,7 +206,7 @@ public:
 
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ false};
+    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ true};
 
 private:
     // Connect-attempt timing is entirely open62541's own (UA_Client_connect blocks internally per its own
