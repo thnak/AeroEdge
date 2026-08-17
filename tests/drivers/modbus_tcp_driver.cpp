@@ -151,6 +151,8 @@ struct FakeModbusServer {
             serve_read(conn, txn, unit, fc, req);
         } else if (fc == 0x06) {
             serve_write(conn, txn, unit, req);
+        } else if (fc == 0x10) {
+            serve_write_multiple(conn, txn, unit, req);
         }
     }
 
@@ -205,6 +207,45 @@ struct FakeModbusServer {
         resp[7] = static_cast<std::byte>(0x06);
         put_u16_be(&resp[8], addr);
         put_u16_be(&resp[10], value);
+        (void)send_all(conn, resp.data(), resp.size());
+    }
+
+    // FC16: the first 12 bytes only cover header+fc+addr+qty — read the variable byte_count+data tail
+    // separately. Same exception posture as FC06's serve_write: addr+qty past the register bank ->
+    // a well-formed 0x90 exception (0x10 | exception bit), never a crash.
+    void serve_write_multiple(quark::pal::fd_t conn, std::uint16_t txn, std::uint8_t unit,
+                               const std::array<std::byte, 12>& req) {
+        const std::uint16_t addr = get_u16_be(&req[8]);
+        const std::uint16_t qty = get_u16_be(&req[10]);
+
+        std::byte byte_count_byte{};
+        if (!recv_exact(conn, &byte_count_byte, 1, running)) return;
+        const auto byte_count = std::to_integer<std::uint8_t>(byte_count_byte);
+        std::vector<std::byte> data(byte_count);
+        if (!data.empty() && !recv_exact(conn, data.data(), data.size(), running)) return;
+
+        if (static_cast<std::size_t>(addr) + qty > registers.size()) {
+            std::array<std::byte, 9> resp{};
+            put_u16_be(&resp[0], txn);
+            put_u16_be(&resp[2], 0x0000);
+            put_u16_be(&resp[4], 0x0003);
+            resp[6] = static_cast<std::byte>(unit);
+            resp[7] = static_cast<std::byte>(0x90);  // 0x10 | exception bit
+            resp[8] = static_cast<std::byte>(0x02);  // illegal data address
+            (void)send_all(conn, resp.data(), resp.size());
+            return;
+        }
+
+        for (std::uint16_t i = 0; i < qty; ++i) registers[addr + i] = get_u16_be(&data[2 * i]);
+
+        std::array<std::byte, 12> resp{};
+        put_u16_be(&resp[0], txn);
+        put_u16_be(&resp[2], 0x0000);
+        put_u16_be(&resp[4], 0x0006);  // unit(1)+fc(1)+addr(2)+qty(2)
+        resp[6] = static_cast<std::byte>(unit);
+        resp[7] = static_cast<std::byte>(0x10);
+        put_u16_be(&resp[8], addr);
+        put_u16_be(&resp[10], qty);
         (void)send_all(conn, resp.data(), resp.size());
     }
 };
@@ -419,6 +460,63 @@ bool test_write_invalid_target() {
     return ok;
 }
 
+// ---- (7) M9.1 FC16 write: "addr,v1,v2,v3" round-trips all three values through the register bank -----
+bool test_write_multiple_registers() {
+    FakeModbusServer server;
+    if (!server.start()) { std::printf("write_multiple_registers: server start failed\n"); return false; }
+
+    ModbusTcpDriver driver("127.0.0.1", server.port, /*unit*/ 1, /*start*/ 0, /*count*/ 1);
+    aero::DriverConfig cfg{};
+    bool ok = driver.open(cfg) == aero::DriverStatus::Ok;
+
+    ok &= driver.write(aero::DeviceCommand{"10,111,222,333", 0}) == aero::DriverStatus::Ok;
+    ok &= server.registers.size() > 12;
+    ok &= server.registers[10] == 111 && server.registers[11] == 222 && server.registers[12] == 333;
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("write_multiple_registers: assertion failed\n");
+    return ok;
+}
+
+// ---- (8) M9.1 FC16 write: addr+qty past the register bank is a clean Error via the 0x90 exception ----
+bool test_write_multiple_exception_response() {
+    FakeModbusServer server;
+    if (!server.start()) { std::printf("write_multiple_exception: server start failed\n"); return false; }
+
+    ModbusTcpDriver driver("127.0.0.1", server.port, /*unit*/ 1, /*start*/ 0, /*count*/ 1);
+    aero::DriverConfig cfg{};
+    bool ok = driver.open(cfg) == aero::DriverStatus::Ok;
+
+    const std::string target = std::to_string(server.registers.size() - 1) + ",1,2,3";  // spills past the end
+    ok &= driver.write(aero::DeviceCommand{target, 0}) == aero::DriverStatus::Error;
+    ok &= driver.last_exception_code() == 0x02;
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("write_multiple_exception: assertion failed\n");
+    return ok;
+}
+
+// ---- (9) M9.1 FC16 write: malformed lists (bad value, empty field, too many) are rejected pre-I/O -----
+bool test_write_multiple_invalid_target() {
+    ModbusTcpDriver driver("127.0.0.1", /*port*/ 1, /*unit*/ 1, /*start*/ 0, /*count*/ 1);
+    aero::DriverConfig cfg{};
+    (void)driver.open(cfg);  // see test_write_invalid_target: irrelevant, no I/O happens before rejection
+
+    bool ok = driver.write(aero::DeviceCommand{"5,not-a-number", 0}) == aero::DriverStatus::Error;
+    ok &= driver.write(aero::DeviceCommand{"5,1,,3", 0}) == aero::DriverStatus::Error;   // empty field
+    ok &= driver.write(aero::DeviceCommand{"5,", 0}) == aero::DriverStatus::Error;       // no values at all
+
+    std::string too_many = "5";
+    for (int i = 0; i < 124; ++i) too_many += ",1";  // 124 > kMaxWriteMultipleRegisters (123)
+    ok &= driver.write(aero::DeviceCommand{too_many, 0}) == aero::DriverStatus::Error;
+
+    driver.close();
+    if (!ok) std::printf("write_multiple_invalid_target: assertion failed\n");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -451,6 +549,18 @@ int main() {
     const bool write_bad_target_ok = test_write_invalid_target();
     ok &= write_bad_target_ok;
     std::printf("[write_invalid_target] %s\n", write_bad_target_ok ? "ok" : "FAIL");
+
+    const bool write_multi_ok = test_write_multiple_registers();
+    ok &= write_multi_ok;
+    std::printf("[write_multiple_registers] %s\n", write_multi_ok ? "ok" : "FAIL");
+
+    const bool write_multi_exc_ok = test_write_multiple_exception_response();
+    ok &= write_multi_exc_ok;
+    std::printf("[write_multiple_exception_response] %s\n", write_multi_exc_ok ? "ok" : "FAIL");
+
+    const bool write_multi_bad_ok = test_write_multiple_invalid_target();
+    ok &= write_multi_bad_ok;
+    std::printf("[write_multiple_invalid_target] %s\n", write_multi_bad_ok ? "ok" : "FAIL");
 
     std::printf("modbus_tcp_driver: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

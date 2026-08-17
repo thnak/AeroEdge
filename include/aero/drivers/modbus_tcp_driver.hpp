@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "aero/pal/net_dial.hpp"
@@ -104,25 +105,49 @@ public:
         return DriverStatus::Ok;
     }
 
-    // FC06 (Write Single Register), M9.1's v1 write slice (018 §8). `cmd.target` is the register
-    // address as a decimal string (DeviceCommand has no dedicated address field, 006 §7), `cmd.value`
-    // the register value — must fit a Modbus register (0..65535). Same connect/reconnect/backoff path
-    // as poll() (a write and a read share one socket; a failed write drops the connection exactly like
-    // a failed read does). FC16 (write multiple) and other write function codes stay backlog (M9.1).
+    // FC06 (Write Single Register) or FC16 (Write Multiple Registers), M9.1's write slice (018 §8).
+    // `DeviceCommand` has no dedicated address/multi-value field (006 §7, a shared SDK type also used
+    // by OTA — not widened for this), so both forms live entirely in `cmd.target`:
+    //   - a bare decimal address ("5") -> FC06, value from `cmd.value` (0..65535) — unchanged from PR A.
+    //   - "addr,v1,v2,..." (comma-separated, up to kMaxWriteMultipleRegisters values) -> FC16, `cmd.value`
+    //     unused in this form.
+    // Same connect/reconnect/backoff path as poll() either way (a write and a read share one socket; a
+    // failed write drops the connection exactly like a failed read does).
     DriverStatus write(const DeviceCommand& cmd) noexcept override {
         if (!opened_) return DriverStatus::Error;
-        if (cmd.value < 0 || cmd.value > 0xFFFF) return DriverStatus::Error;
+
+        const auto comma = cmd.target.find(',');
+        if (comma == std::string_view::npos) {
+            if (cmd.value < 0 || cmd.value > 0xFFFF) return DriverStatus::Error;
+            std::uint16_t address = 0;
+            if (!parse_u16(cmd.target, address)) return DriverStatus::Error;
+
+            if (fd_ == quark::pal::invalid_fd && !ensure_connected()) return DriverStatus::Error;
+            bool io_ok = true;
+            const DriverStatus st = do_write_transaction(address, static_cast<std::uint16_t>(cmd.value), io_ok);
+            if (!io_ok) close_socket();  // connection lost (006 §8) -> reconnect w/ backoff on a later call
+            return st;
+        }
 
         std::uint16_t address = 0;
-        const char* begin = cmd.target.data();
-        const char* end = begin + cmd.target.size();
-        const auto parsed = std::from_chars(begin, end, address);
-        if (parsed.ec != std::errc{} || parsed.ptr != end) return DriverStatus::Error;
+        if (!parse_u16(cmd.target.substr(0, comma), address)) return DriverStatus::Error;
+
+        std::array<std::uint16_t, kMaxWriteMultipleRegisters> values{};
+        std::size_t count = 0;
+        for (std::string_view rest = cmd.target.substr(comma + 1); !rest.empty();) {
+            if (count >= kMaxWriteMultipleRegisters) return DriverStatus::Error;
+            const auto next = rest.find(',');
+            const std::string_view field = next == std::string_view::npos ? rest : rest.substr(0, next);
+            std::uint16_t v = 0;
+            if (!parse_u16(field, v)) return DriverStatus::Error;
+            values[count++] = v;
+            rest = next == std::string_view::npos ? std::string_view{} : rest.substr(next + 1);
+        }
+        if (count == 0) return DriverStatus::Error;
 
         if (fd_ == quark::pal::invalid_fd && !ensure_connected()) return DriverStatus::Error;
-
         bool io_ok = true;
-        const DriverStatus st = do_write_transaction(address, static_cast<std::uint16_t>(cmd.value), io_ok);
+        const DriverStatus st = do_write_multiple_transaction(address, values.data(), count, io_ok);
         if (!io_ok) close_socket();  // connection lost (006 §8) -> reconnect w/ backoff on a later call
         return st;
     }
@@ -145,7 +170,18 @@ private:
     static constexpr int kInitialBackoffMs = 200;
     static constexpr int kMaxBackoffMs = 5000;
     static constexpr std::uint8_t kFcWriteSingleRegister = 0x06;
+    static constexpr std::uint8_t kFcWriteMultipleRegisters = 0x10;
     static constexpr std::uint8_t kFcExceptionBit = 0x80;
+    // Modbus's own FC16 implementation limit (not this codebase's — every stack caps it here), so a
+    // register-map wider than this needs multiple write() calls, same posture as the 128B Frame payload
+    // cap on reads (§3 of spec 018) forcing multiple poll() configs for a wide register map.
+    static constexpr std::size_t kMaxWriteMultipleRegisters = 123;
+
+    static bool parse_u16(std::string_view s, std::uint16_t& out) noexcept {
+        if (s.empty()) return false;
+        const auto res = std::from_chars(s.data(), s.data() + s.size(), out);
+        return res.ec == std::errc{} && res.ptr == s.data() + s.size();
+    }
 
     // Lazily reconnect, gated by the backoff clock — see class banner. false == still backing off, or
     // the dial itself failed (in which case the backoff for the NEXT attempt is scheduled here).
@@ -346,6 +382,72 @@ private:
         // A conformant server echoes address+value back on success; a mismatch means desync, not a
         // device-level error — treat it as a framing problem like the rest of this function.
         if (get_u16_be(&pdu[1]) != address || get_u16_be(&pdu[3]) != value) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+        return DriverStatus::Ok;
+    }
+
+    // One FC16 request/response transaction. Same io_ok/exception contract as do_write_transaction().
+    // `count` is already bounded to kMaxWriteMultipleRegisters by the caller (write()).
+    DriverStatus do_write_multiple_transaction(std::uint16_t address, const std::uint16_t* values,
+                                                std::size_t count, bool& io_ok) noexcept {
+        const std::uint16_t txn_id = next_txn_id_++;
+        const auto byte_count = static_cast<std::uint8_t>(count * 2);
+
+        std::array<std::byte, 13 + 2 * kMaxWriteMultipleRegisters> req{};
+        put_u16_be(&req[0], txn_id);
+        put_u16_be(&req[2], 0x0000);
+        put_u16_be(&req[4], static_cast<std::uint16_t>(6 + byte_count));  // unit+fc+addr+qty+bytecount+data
+        req[6] = static_cast<std::byte>(unit_id_);
+        req[7] = static_cast<std::byte>(kFcWriteMultipleRegisters);
+        put_u16_be(&req[8], address);
+        put_u16_be(&req[10], static_cast<std::uint16_t>(count));
+        req[12] = static_cast<std::byte>(byte_count);
+        for (std::size_t i = 0; i < count; ++i) put_u16_be(&req[13 + 2 * i], values[i]);
+        const std::size_t req_len = 13 + byte_count;
+
+        if (!send_all(fd_, req.data(), req_len)) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+
+        std::array<std::byte, 7> hdr{};
+        if (!recv_exact(fd_, hdr.data(), hdr.size())) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+        const std::uint16_t resp_txn = get_u16_be(&hdr[0]);
+        const std::uint16_t resp_len = get_u16_be(&hdr[4]);
+        if (resp_txn != txn_id || resp_len == 0) {
+            io_ok = false;  // desynced/malformed — don't trust the byte stream further
+            return DriverStatus::Error;
+        }
+
+        const std::size_t pdu_len = static_cast<std::size_t>(resp_len) - 1;
+        constexpr std::size_t kMaxWritePdu = 5;  // fc(1) + addr(2) + qty(2), the largest well-formed reply
+        if (pdu_len < 1 || pdu_len > kMaxWritePdu) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+        std::array<std::byte, kMaxWritePdu> pdu{};
+        if (!recv_exact(fd_, pdu.data(), pdu_len)) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+
+        const auto fc = std::to_integer<std::uint8_t>(pdu[0]);
+        if ((fc & kFcExceptionBit) != 0) {
+            last_exception_code_ = pdu_len >= 2 ? std::to_integer<std::uint8_t>(pdu[1]) : 0;
+            return DriverStatus::Error;
+        }
+        if (fc != kFcWriteMultipleRegisters || pdu_len != 5) {
+            io_ok = false;  // an unexpected function code / short reply is a framing problem
+            return DriverStatus::Error;
+        }
+        // A conformant server echoes address+quantity back on success; a mismatch means desync, not a
+        // device-level error — treat it as a framing problem like the rest of this function.
+        if (get_u16_be(&pdu[1]) != address || get_u16_be(&pdu[3]) != count) {
             io_ok = false;
             return DriverStatus::Error;
         }

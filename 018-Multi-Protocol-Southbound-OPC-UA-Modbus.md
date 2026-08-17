@@ -16,6 +16,7 @@
 | M9b | open62541 vendoring + `OpcUaDriver` (no-security client, poll configured NodeIds) | **Shipped** |
 | M9.1 PR A | `ModbusTcpDriver::write()` — FC06 Write Single Register | **Shipped** |
 | M9.1 PR B | `ModbusTcpDriver` — FC04 Read Input Registers (`register_type` config selector) | **Shipped** |
+| M9.1 PR C | `ModbusTcpDriver::write()` — FC16 Write Multiple Registers (`"addr,v1,v2,..."` target form) | **Shipped** |
 
 ## 1. Why
 
@@ -128,10 +129,16 @@ compatibility; the deploy-time JSON config selects it via `"register_type": "hol
 (runtime.hpp factory). FC03 and FC04 are wire-identical register reads, so both share
 `ModbusDecodeNode` unchanged — no new decode path needed.
 
-**Explicitly deferred** (M9.1, §8): FC16 Write Multiple Registers (needs a `DeviceCommand` shape
-change to carry more than one value — out of scope, see §8), coils (FC01) and discrete inputs
-(FC02) (bit-packed, not word-packed — need a decode node of their own), Modbus RTU/serial transport
-(TCP only).
+**M9.1 PR C** shipped FC16 (Write Multiple Registers) — without widening `DeviceCommand` (006 §7,
+still a shared SDK type also used by OTA): `write()` reads `cmd.target` as either a bare decimal
+address (FC06, `cmd.value` supplies the value, unchanged from PR A) or a comma-separated
+`"addr,v1,v2,..."` list (FC16, `cmd.value` unused in this form), up to Modbus's own FC16
+implementation limit of 123 registers per call. Same connect/reconnect/backoff and exception
+(0x90) posture as the other write paths.
+
+**Explicitly deferred** (M9.1, §8): coils (FC01) and discrete inputs (FC02) — bit-packed, not
+word-packed — need a decode node of their own, unlike FC03/FC04/FC06/FC16, which all share the
+existing word-oriented path; Modbus RTU/serial transport (TCP only).
 
 ## 5. Scope — M9b: OPC-UA
 
@@ -161,7 +168,8 @@ address-space browsing (v1 reads only configured NodeIds, no discovery), method 
 | Modbus-TCP: Read Holding Registers (FC03) | **shipped** | M9a, `ModbusTcpDriver` |
 | Modbus-TCP: Write Single Register (FC06) | **shipped** | M9.1 PR A, `ModbusTcpDriver::write()` |
 | Modbus-TCP: Read Input Registers (FC04) | **shipped** | M9.1 PR B, `ModbusTcpDriver::ReadFunction` |
-| Modbus-TCP: FC16 (write multiple), coils/discrete inputs, RTU/serial | backlog | M9.1 |
+| Modbus-TCP: Write Multiple Registers (FC16) | **shipped** | M9.1 PR C, `ModbusTcpDriver::write()` |
+| Modbus-TCP: coils/discrete inputs (FC01/FC02), RTU/serial | backlog | M9.1 |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: security policies, Subscriptions, browsing, method calls | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
@@ -189,15 +197,11 @@ deployment needs that.
   subscribe-and-get-notified — would let `OpcUaDriver` become a push (`run()`) driver instead of
   poll, lower latency and lower request volume than v1's poll loop. Revisit once poll-interval
   latency is a measured problem, not preemptively.
-- **Modbus FC16 (Write Multiple Registers)** — deferred from M9.1 PR A because `DeviceCommand`
-  (`target: string_view`, `value: int64_t`) has no way to carry an address plus a list of values;
-  landing it means either widening `DeviceCommand` (a shared SDK type also used by OTA, 006 §7) or
-  giving `ModbusTcpDriver` its own multi-value command shape. Revisit once an actuator/setpoint use
-  case needs a multi-register write in one transaction (repeated FC06 calls cover the same end
-  state today, just not atomically).
 - **Coils (FC01) and discrete inputs (FC02).** Bit-packed, not word-packed like FC03/FC04 (M9.1 PR
   B) — `ModbusDecodeNode` assumes 16-bit register values, so these need a decode node of their own,
-  not just a new `ReadFunction` value.
+  not just a new `ReadFunction` value. Reading them would also need to decide how to represent
+  padding bits (a byte-packed response can carry more bits than were actually requested) — an open
+  design question this codebase hasn't hit yet for any other decode node.
 - **Modbus RTU / serial transport.** v1 is TCP-only; RTU needs a serial PAL this codebase doesn't
   have yet.
 - **Multi-frame chunking** for register-maps/NodeId-lists wider than the 128-byte payload cap
