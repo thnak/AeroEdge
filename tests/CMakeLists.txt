@@ -155,6 +155,15 @@ target_link_libraries(resequencer PRIVATE aero::transport)
 add_test(NAME resequencer COMMAND resequencer)
 set_tests_properties(resequencer PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): try_parse_packet() (mqtt_codec.hpp), the
+# buffered-read counterpart to read_packet()/read_n() NativeBroker's session_loop now drives directly.
+# Pure function, no sockets — proves the parser correct in isolation (empty/partial/malformed/burst
+# buffers) before it drives the broker's only ingestion path; closes Phase 1's test-coverage gap #4.
+add_executable(mqtt_codec transport/mqtt_codec.cpp)
+target_link_libraries(mqtt_codec PRIVATE aero::transport)
+add_test(NAME mqtt_codec COMMAND mqtt_codec)
+set_tests_properties(mqtt_codec PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-7 cross-node gate (014 §2 X1): two actors on distinct NodeIds exchange a message over Quark's
 # REAL LoopbackTransport + DistributedRouter (fully-wired in-process path) — delivery + per-sender FIFO.
 add_executable(cross_node_message transport/cross_node_message.cpp)
