@@ -448,4 +448,51 @@ file was copied out first and is preserved/merged.)*
 
 ## Phase 3 — Implementation
 
+### 3.0 Scoping: what ships now vs. deferred (post-critique)
+
+An initial Phase 3 draft proposed implementing BOTH Phase 2 wins as smaller,
+non-reactor, thread-per-connection-preserving changes: buffered reads (§2.4
+Experiment A's mechanism) and a per-session outbound queue for fan-out (an
+approximation of §2.4 Experiment B's mechanism, without adopting `IoContext`).
+
+A Plan-agent critique of that draft found the buffered-read piece sound and
+low-risk, but found **real, concrete correctness bugs** in the fan-out piece as
+originally scoped:
+1. Queuing pre-serialized packet bytes breaks the Message-Expiry-Interval
+   invariant (`publish_to()`, native_broker.hpp — the single highest-risk item
+   in the whole §1.2 inventory) — the expiry/remaining-seconds check would only
+   ever run once, at enqueue time, not at actual flush time (which could be much
+   later for a backed-up recipient).
+2. It needs a new dedicated mutex, an explicit ordering-preservation rule
+   (queued items must never be leapfrogged by a later inline send to the same
+   recipient), and every write to `Session::channel` — including the new
+   non-blocking attempt — must still route through the existing `io_mu` or it
+   risks wire corruption.
+3. Even fixed, its poll-cycle-driven flush (~200ms granularity, since it piggy-
+   backs on `session_loop`'s existing `wait_readable(200)` cadence rather than
+   an event-driven wakeup) would NOT match Experiment B's measured ~14ms p50
+   recipient latency — it would only remove the publisher-side stall, not
+   reproduce the recipient-side latency win. Framing it as "captures Experiment
+   B's result" would overstate what it actually delivers.
+
+**Decision:** ship only the buffered-read change this round (§3.1 below) — the
+larger, more broadly-applicable win (helps every connection, not just the
+high-fan-out-with-a-slow-consumer case), already independently critiqued as
+low-risk and well-scoped, touching neither locking, `teardown_session`, TLS, nor
+keep-alive timing. The fan-out/outbound-queue change is deferred to a future
+phase with a corrected design: queue `{topic, payload, qos, retain, extras}`
+(`QueuedMessage`-shaped, matching the precedent already established for
+`StoredSession`'s offline queue — not pre-serialized bytes), re-run the full
+choke-point sequence at actual flush time, add a dedicated `outbox_mu`, enforce
+the ordering rule, and scope the latency claim honestly against what it can and
+can't match from Experiment B. `route_publish()`'s offline-queue topic-index
+parity (the §1.1 asymmetry) and the full `IoContext` reactor migration both
+remain separately deferred, per §2.4's own recommendation.
+
+### 3.1 Buffered incremental packet reads
+
+Status: implementing. See commit history for the actual diff; this section is
+updated with real before/after numbers once verification (per the plan's
+Verification section) completes.
+
 (not started)
