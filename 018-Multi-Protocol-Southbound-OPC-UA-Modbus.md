@@ -13,7 +13,7 @@
 | Milestone | What | Status |
 |---|---|---|
 | M9a | `Frame`/driver-pipeline byte-payload plumbing (shared prerequisite) + `ModbusTcpDriver` (FC03 poll, no new dependency) | **Shipped** |
-| M9b | open62541 vendoring + `OpcUaDriver` (no-security client, poll configured NodeIds) | In progress |
+| M9b | open62541 vendoring + `OpcUaDriver` (no-security client, poll configured NodeIds) | **Shipped** |
 
 ## 1. Why
 
@@ -144,7 +144,7 @@ address-space browsing (v1 reads only configured NodeIds, no discovery), method 
 |---|---|---|
 | Modbus-TCP: Read Holding Registers (FC03) | **shipped** | M9a, `ModbusTcpDriver` |
 | Modbus-TCP: writes, other register types, RTU/serial | backlog | M9.1 |
-| OPC-UA: no-security client, poll configured NodeIds | **shipped** (M9b in progress) | `OpcUaDriver` |
+| OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: security policies, Subscriptions, browsing, method calls | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |
