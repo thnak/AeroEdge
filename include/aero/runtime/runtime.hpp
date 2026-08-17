@@ -158,7 +158,8 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     driver_reg.register_type("aero.driver.opcua", [](const nlohmann::json& c) {
         return std::make_unique<aero::drivers::OpcUaDriver>(
             c.value("endpoint", std::string{}),
-            c.value("node_ids", std::vector<std::string>{}));
+            c.value("node_ids", std::vector<std::string>{}),
+            c.value("browse_root", std::string{}));
     });
 }
 

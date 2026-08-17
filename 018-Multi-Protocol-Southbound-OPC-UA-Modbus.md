@@ -20,6 +20,7 @@
 | M9.1 PR D | `ModbusTcpDriver` — FC01/FC02 Read Coils/Discrete Inputs + `ModbusBitsDecodeNode` | **Shipped** |
 | M9.1 PR E | `OpcUaDriver::write()` — scalar write via `UA_Client_writeValueAttribute` | **Shipped** |
 | M9.1 PR F | `OpcUaDriver::write()` — single-argument method call via `UA_Client_call` (`"object\|method"` target form) | **Shipped** |
+| M9.1 PR G | `OpcUaDriver` — address-space browse mode (`UA_Client_Service_browse`, `browse_root` config) | **Shipped** |
 
 ## 1. Why
 
@@ -191,10 +192,26 @@ before the connection is touched, same as PR E. 0-arg/multi-arg calls and readin
 backlog (§8) — `DeviceCommand`'s single-value shape can't carry an argument list without a wider
 SDK change, the same constraint that bounded Modbus FC16 to a comma-separated `target`.
 
+**M9.1 PR G** shipped a v1 address-space browse mode via `UA_Client_Service_browse` — a THIRD,
+mutually-exclusive constructor mode (`browse_root`, alongside the scalar `node_ids` poll mode),
+not another `write()`-reuse trick: a browse result (child NodeId + BrowseName pairs) doesn't fit
+the `{nodeId: value}` JSON shape the scalar path emits, so `poll()` itself branches into
+`browse_once()` when the driver was constructed with a non-empty `browse_root` (`open()` rejects a
+config that sets both `node_ids` and `browse_root`). Browses exactly the configured root's
+HierarchicalReferences children (Organizes/HasComponent/HasProperty/...; `HasTypeDefinition` and
+other non-hierarchical references are excluded — the conventional "list an object's children"
+restriction), one level, no continuation points: `requestedMaxReferencesPerNode` is capped at
+`kMaxBrowseResults` (3) so the server itself truncates, keeping the JSON array
+(`[{"id":...,"name":...}, ...]`) inside the 128-byte payload cap by construction. No dedicated
+decode node ships for this shape — v1 puts the raw JSON array straight into the `Frame` payload for
+a caller/flow to consume directly (`JsonParseNode`, the scalar path's own decoder, does not
+understand this shape).
+
 **Explicitly deferred** (M9.1, §8): security policies (Sign/SignAndEncrypt, certificate-based
 client auth), Subscriptions/MonitoredItems (OPC-UA's native push mechanism — v1 is pure poll,
 matching the pull-driver shape 006 §6 already defines and keeping parity with the Modbus driver),
-address-space browsing (v1 reads/writes/calls only configured/given NodeIds, no discovery).
+and — within browsing itself — continuation-point paging beyond the first `kMaxBrowseResults`
+children, and reading nested subtrees (v1 is exactly one browse level per `poll()` call).
 
 ## 6. Capability table
 
@@ -209,7 +226,8 @@ address-space browsing (v1 reads/writes/calls only configured/given NodeIds, no 
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: scalar write to a configured NodeId | **shipped** | M9.1 PR E, `OpcUaDriver::write()` |
 | OPC-UA: single-argument method call | **shipped** | M9.1 PR F, `OpcUaDriver::write()` |
-| OPC-UA: security policies, Subscriptions, address-space browsing | backlog | M9.1 |
+| OPC-UA: address-space browse (one root, one level, capped result count) | **shipped** | M9.1 PR G, `OpcUaDriver` browse mode |
+| OPC-UA: security policies, Subscriptions, browse paging/nested subtrees | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |
 | Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | both drivers |
@@ -244,9 +262,11 @@ deployment needs that.
 - **Device/register-map hot-reload** without a full flow redeploy — today, changing a driver's
   polled register/NodeId list means redeploying the Application (009 §4's hot-reload swaps the
   *flow*, not driver config).
-- **OPC-UA address-space browsing** — v1 (reads, writes, method calls all alike) requires every
-  NodeId to be known and given up front; no discovery. Would also need a new poll "mode" (a browse
-  result is a NodeId/BrowseName list, not the scalar-per-NodeId shape `poll()`'s JSON encoding
-  assumes today) rather than fitting into the existing `write()`-reuse trick PR E/PR F used.
 - **OPC-UA method calls: 0-arg / multi-arg, reading outputs.** PR F's v1 is exactly one scalar
   input, outputs discarded — see PR F's note above on why (`DeviceCommand`'s single-value shape).
+- **OPC-UA browse paging + nested subtrees.** PR G ships one root, one level, capped at
+  `kMaxBrowseResults` (3) children via `requestedMaxReferencesPerNode` — a root with more children
+  than that is silently truncated server-side (documented v1 constraint, not a bug). A v2 would
+  consume the browse response's own (currently unread) `continuationPoint` via
+  `UA_Client_Service_browseNext` to page through the rest, and/or recurse into child NodeIds for a
+  full subtree walk — both out of scope for "smallest independent slice."

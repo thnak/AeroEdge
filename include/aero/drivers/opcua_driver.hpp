@@ -6,10 +6,10 @@
 // set of configured NodeIds via UA_Client_readValueAttribute, write a scalar to any NodeId via
 // UA_Client_writeValueAttribute (M9.1 PR E, 018 §8 — the OPC-UA counterpart to ModbusTcpDriver's FC06),
 // call an object/method NodeId pair with exactly one scalar input argument via UA_Client_call (M9.1 PR
-// F — the FC16-ish "structured target string" counterpart, output arguments discarded unread). NO
-// security policies (Sign/SignAndEncrypt is backlog), NO Subscriptions/MonitoredItems, NO address-space
-// browsing (both still backlog) — pure poll-configured-NodeIds, single-NodeId scalar write, and
-// single-argument method call only.
+// F — the FC16-ish "structured target string" counterpart, output arguments discarded unread), OR browse
+// ONE configured NodeId's children via UA_Client_Service_browse (M9.1 PR G, 018 §8 — a SEPARATE poll
+// mode from the scalar-NodeId reads, see poll()/browse_once()'s banner). NO security policies
+// (Sign/SignAndEncrypt is backlog), NO Subscriptions/MonitoredItems — both still backlog.
 //
 // REUSE, NOT REBUILD (the whole point): this driver's job stops at serializing the polled NodeId->value
 // results into a FLAT JSON OBJECT (e.g. {"ns=2;s=Temperature":23.5}) written into the Frame's byte
@@ -61,8 +61,14 @@ namespace aero::drivers {
 // fit this driver's shape.
 class OpcUaDriver final : public IDriver {
 public:
-    OpcUaDriver(std::string endpoint, std::vector<std::string> node_ids) noexcept
-        : endpoint_(std::move(endpoint)), node_id_strings_(std::move(node_ids)) {}
+    // `browse_root` (default empty = disabled) switches this instance into BROWSE mode (M9.1 PR G):
+    // poll() browses that ONE NodeId's children instead of reading node_ids's scalars. The two modes are
+    // mutually exclusive in v1 (open() rejects a config that sets both) — see poll()/browse_once().
+    OpcUaDriver(std::string endpoint, std::vector<std::string> node_ids,
+                std::string browse_root = {}) noexcept
+        : endpoint_(std::move(endpoint)),
+          node_id_strings_(std::move(node_ids)),
+          browse_root_str_(std::move(browse_root)) {}
 
     ~OpcUaDriver() override { close(); }
 
@@ -73,8 +79,17 @@ public:
     // socket. Mirrors ModbusTcpDriver: `opened_` is armed before the dial attempt, so a reachability
     // failure here still leaves the driver armed for a later poll() to retry (see ensure_connected()).
     DriverStatus open(const DriverConfig& cfg) noexcept override {
-        if (!fits_payload_budget()) return DriverStatus::Error;
-        if (!parse_node_ids()) return DriverStatus::Error;
+        browse_mode_ = !browse_root_str_.empty();
+        if (browse_mode_) {
+            // v1: a browse-mode instance browses exactly one root, not a mix of both poll shapes —
+            // catches a config error here rather than silently ignoring node_ids in poll().
+            if (!node_id_strings_.empty()) return DriverStatus::Error;
+            UA_NodeId_init(&browse_root_id_);
+            if (!parse_node_id(browse_root_str_, browse_root_id_)) return DriverStatus::Error;
+        } else {
+            if (!fits_payload_budget()) return DriverStatus::Error;
+            if (!parse_node_ids()) return DriverStatus::Error;
+        }
 
         rate_hz_ = cfg.rate_hz;  // advisory poll-interval hint only (see ModbusTcpDriver's own banner)
         opened_ = true;
@@ -103,6 +118,7 @@ public:
     DriverStatus poll(StreamSink<Frame> sink) noexcept override {
         if (!opened_) return DriverStatus::Error;
         if (!connected_ && !ensure_connected()) return DriverStatus::Error;
+        if (browse_mode_) return browse_once(std::move(sink));
 
         nlohmann::json j = nlohmann::json::object();
         bool conn_lost = false;
@@ -131,6 +147,88 @@ public:
         const std::string body = j.dump();
         // Should have been caught by open()'s config-time budget check; treat as a bug guard, never a
         // silently truncated frame.
+        if (body.size() > aero::kMaxFramePayload) return DriverStatus::Error;
+
+        Frame frame{};
+        frame.payload_len = static_cast<std::uint16_t>(body.size());
+        std::memcpy(frame.payload.data(), body.data(), body.size());
+
+        while (!sink.try_push(frame)) {
+            std::this_thread::yield();  // lossless backpressure (006 §3): stall, never drop
+        }
+        return DriverStatus::Ok;
+    }
+
+    // BROWSE mode's whole poll cycle (M9.1 PR G, 018 §8) — a SEPARATE JSON SHAPE from the scalar path
+    // above: emits a JSON ARRAY of {"id":..., "name":...} objects (one per child reference), not a
+    // {nodeId: value} object, because a browse result isn't a value at all. `aero::nodes::JsonParseNode`
+    // (the scalar path's downstream decoder) does NOT understand this shape — v1 ships the raw array in
+    // the Frame payload for a caller/flow to consume directly (a dedicated browse-decode node is
+    // backlog, matching PR F's own "reading call outputs" deferral).
+    //
+    // ONE browse call, ONE level, NO continuation points (018 §8 open questions): requestedMaxReferencesPerNode
+    // is capped at kMaxBrowseResults so the SERVER already truncates server-side; if the true child count
+    // is larger, the response's own (unread) continuationPoint would let a v2 fetch the rest via
+    // UA_Client_Service_browseNext — out of scope here, same "smallest independent slice" posture as
+    // every other M9.1 PR. The final body-size check is a bug guard (should be unreachable given the
+    // requestedMaxReferencesPerNode cap) — mirrors poll()'s own guard on the scalar path.
+    DriverStatus browse_once(StreamSink<Frame> sink) noexcept {
+        UA_BrowseDescription bd;
+        UA_BrowseDescription_init(&bd);
+        bd.nodeId = browse_root_id_;  // borrowed (see close(): browse_root_id_ is cleared exactly once)
+        bd.browseDirection = UA_BROWSEDIRECTION_FORWARD;
+        // HierarchicalReferences only (Organizes/HasComponent/HasProperty/...), NOT every reference type:
+        // an unrestricted browse (referenceTypeId left NULL) also returns e.g. HasTypeDefinition ->
+        // BaseObjectType, which isn't a "child" in the sense a caller means by browsing — this is the
+        // conventional "list an object's children" restriction most OPC-UA browsers apply by default.
+        bd.referenceTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_HIERARCHICALREFERENCES);
+        bd.includeSubtypes = true;
+        bd.nodeClassMask = 0;  // every NodeClass
+        bd.resultMask = UA_BROWSERESULTMASK_BROWSENAME;
+
+        UA_BrowseRequest request;
+        UA_BrowseRequest_init(&request);
+        request.requestedMaxReferencesPerNode = kMaxBrowseResults;
+        request.nodesToBrowseSize = 1;
+        request.nodesToBrowse = &bd;  // stack-local; never UA_BrowseRequest_clear'd (would double-free bd.nodeId)
+
+        UA_BrowseResponse response = UA_Client_Service_browse(client_, request);
+
+        const bool service_ok = response.responseHeader.serviceResult == UA_STATUSCODE_GOOD;
+        const bool result_ok =
+            service_ok && response.resultsSize == 1 && response.results[0].statusCode == UA_STATUSCODE_GOOD;
+
+        nlohmann::json j = nlohmann::json::array();
+        if (result_ok) {
+            const auto& result = response.results[0];
+            for (std::size_t i = 0; i < result.referencesSize && j.size() < kMaxBrowseResults; ++i) {
+                const auto& ref = result.references[i];
+                UA_String printed = UA_STRING_NULL;
+                if (UA_ExpandedNodeId_print(&ref.nodeId, &printed) != UA_STATUSCODE_GOOD) {
+                    UA_String_clear(&printed);
+                    continue;  // one malformed reference doesn't fail the whole browse
+                }
+                const std::string id_str(reinterpret_cast<const char*>(printed.data), printed.length);
+                UA_String_clear(&printed);
+                const std::string name_str(reinterpret_cast<const char*>(ref.browseName.name.data),
+                                            ref.browseName.name.length);
+                j.push_back({{"id", id_str}, {"name", name_str}});
+            }
+        }
+        UA_BrowseResponse_clear(&response);
+
+        if (!service_ok) {
+            if (connection_lost()) {
+                teardown_session();  // (006 §8) -> reconnect w/ backoff on a later poll()
+                return DriverStatus::Error;
+            }
+            return DriverStatus::Error;  // well-formed device-level error, connection stays healthy
+        }
+        if (!result_ok) return DriverStatus::Error;  // e.g. bad root NodeId, connection stays healthy
+
+        const std::string body = j.dump();
+        // Bug guard, see this method's banner — the requestedMaxReferencesPerNode cap should already
+        // keep this under budget.
         if (body.size() > aero::kMaxFramePayload) return DriverStatus::Error;
 
         Frame frame{};
@@ -205,6 +303,7 @@ public:
     void close() noexcept override {
         for (auto& id : node_ids_) UA_NodeId_clear(&id);
         node_ids_.clear();
+        if (browse_mode_) UA_NodeId_clear(&browse_root_id_);
         if (client_) {
             if (connected_) UA_Client_disconnect(client_);
             UA_Client_delete(client_);
@@ -227,6 +326,10 @@ private:
     // Conservative worst-case per-entry serialized size (quoted NodeId string + colon + a long-ish
     // double + comma), see file banner. 2 accounts for the object's own "{" "}".
     static constexpr std::size_t kBytesPerEntryEstimate = 40;
+    // BROWSE mode (M9.1 PR G): capped small enough that even long BrowseNames stay under
+    // kMaxFramePayload (see browse_once()'s banner) — also passed to the server as
+    // requestedMaxReferencesPerNode, so this is enforced server-side too, not just client-side truncation.
+    static constexpr std::uint32_t kMaxBrowseResults = 3;
 
     [[nodiscard]] bool fits_payload_budget() const noexcept {
         return node_id_strings_.size() * kBytesPerEntryEstimate + 2 <= aero::kMaxFramePayload;
@@ -403,6 +506,10 @@ private:
     std::vector<std::string> node_id_strings_;  // config order; index-paired with node_ids_
     std::uint32_t rate_hz_ = 0;  // advisory only (see ModbusTcpDriver's own banner)
 
+    std::string browse_root_str_;   // BROWSE mode (M9.1 PR G): empty == disabled (scalar poll instead)
+    bool browse_mode_ = false;      // set from browse_root_str_ in open(), not the constructor
+    UA_NodeId browse_root_id_{};    // parsed at open(), cleared at close() — see close()'s guard
+
     bool opened_ = false;
     bool connected_ = false;
     UA_Client* client_ = nullptr;
@@ -421,7 +528,8 @@ namespace aero::drivers {
 
 class OpcUaDriver final : public IDriver {
 public:
-    OpcUaDriver(std::string /*endpoint*/, std::vector<std::string> /*node_ids*/) noexcept {}
+    OpcUaDriver(std::string /*endpoint*/, std::vector<std::string> /*node_ids*/,
+                std::string /*browse_root*/ = {}) noexcept {}
 
     DriverStatus open(const DriverConfig& /*cfg*/) noexcept override { return DriverStatus::Error; }
     DriverStatus run(StreamSink<Frame> /*sink*/, StopToken /*stop*/) noexcept override {

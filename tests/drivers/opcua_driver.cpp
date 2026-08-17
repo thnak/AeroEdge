@@ -22,6 +22,8 @@
 //       against the now-dead endpoint fails cleanly (Error, no crash/hang), and a LATER poll() (after the
 //       driver's bounded backoff, once the server is brought back up on the same port) reconnects and
 //       succeeds.
+//   (4) M9.1 PR G: a BROWSE-mode driver (constructed with a `browse_root`) lists a known node's children
+//       as a JSON array, and rejects a malformed root / a config that sets both node_ids and browse_root.
 // Deterministic-enough, exit-code-gated (0 = pass); bounded polling/retries; clean shutdown.
 #include <atomic>
 #include <chrono>
@@ -41,6 +43,7 @@
 #include "aero/drivers/opcua_driver.hpp"
 #include "aero/nodes/compute_nodes.hpp"
 #include "aero/sdk/processing_context.hpp"
+#include "nlohmann/json.hpp"
 #include "quark/core/stream_activation.hpp"
 
 using aero::Frame;
@@ -144,6 +147,7 @@ struct FakeOpcUaServer {
         add_variable(server, "Setpoint", 0.0,
                       UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE);  // M9.1 PR E write test target
         add_increment_method(server);  // M9.1 PR F call_method() test target
+        add_browse_root(server);       // M9.1 PR G browse() test target: "ns=1;s=BrowseRoot" -> 2 children
 
         // Synchronous on THIS (the caller's) thread — see the struct banner above for why: this is the
         // real happens-before edge against the driver's own UA_Client startup (also called from the main
@@ -176,7 +180,8 @@ struct FakeOpcUaServer {
         server = nullptr;
     }
 
-    static void add_variable(UA_Server* srv, const char* name, UA_Double value, UA_Byte access_level) {
+    static void add_variable(UA_Server* srv, const char* name, UA_Double value, UA_Byte access_level,
+                              UA_NodeId parent = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER)) {
         UA_VariableAttributes attr = UA_VariableAttributes_default;
         UA_Variant_setScalar(&attr.value, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
         attr.description = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>(name));
@@ -186,11 +191,31 @@ struct FakeOpcUaServer {
 
         const UA_NodeId node_id = UA_NODEID_STRING(1, const_cast<char*>(name));
         const UA_QualifiedName browse_name = UA_QUALIFIEDNAME(1, const_cast<char*>(name));
-        const UA_NodeId parent = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
         const UA_NodeId parent_ref = UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES);
         const UA_NodeId type_def = UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE);
         UA_Server_addVariableNode(srv, node_id, parent, parent_ref, browse_name, type_def, attr, nullptr,
                                    nullptr);
+    }
+
+    // "BrowseRoot": an Object node (ns=1;s=BrowseRoot) with exactly two known children ("ChildA",
+    // "ChildB") — test_browse()'s deterministic target (kMaxBrowseResults=3 comfortably covers 2).
+    static void add_browse_root(UA_Server* srv) {
+        UA_ObjectAttributes attr = UA_ObjectAttributes_default;
+        attr.description = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>("BrowseRoot"));
+        attr.displayName = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>("BrowseRoot"));
+
+        const UA_NodeId node_id = UA_NODEID_STRING(1, const_cast<char*>("BrowseRoot"));
+        const UA_QualifiedName browse_name = UA_QUALIFIEDNAME(1, const_cast<char*>("BrowseRoot"));
+        const UA_NodeId parent = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
+        const UA_NodeId parent_ref = UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES);
+        const UA_NodeId type_def = UA_NODEID_NUMERIC(0, UA_NS0ID_BASEOBJECTTYPE);
+        UA_Server_addObjectNode(srv, node_id, parent, parent_ref, browse_name, type_def, attr, nullptr,
+                                 nullptr);
+
+        add_variable(srv, "ChildA", 1.0, UA_ACCESSLEVELMASK_READ,
+                     UA_NODEID_STRING(1, const_cast<char*>("BrowseRoot")));
+        add_variable(srv, "ChildB", 2.0, UA_ACCESSLEVELMASK_READ,
+                     UA_NODEID_STRING(1, const_cast<char*>("BrowseRoot")));
     }
 
     // "Increment": one scalar double in, one scalar double out (out = in + 1) — a minimal callable
@@ -450,6 +475,63 @@ bool test_call_method_invalid_target() {
     return ok;
 }
 
+// ---- (1h) M9.1 PR G: browse-mode driver lists a known node's children as a JSON array -------------------
+bool test_browse() {
+    FakeOpcUaServer server;
+    if (!server.start()) { std::printf("browse: server start failed\n"); return false; }
+
+    OpcUaDriver driver(kEndpoint, std::vector<std::string>{}, "ns=1;s=BrowseRoot");
+    aero::DriverConfig cfg{};
+    bool ok = open_with_retry(driver, cfg);
+    if (!ok) std::printf("browse: open() never succeeded\n");
+
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+    ok &= outcome.frame.has_value();
+    if (outcome.frame) {
+        const std::string body(reinterpret_cast<const char*>(outcome.frame->payload.data()),
+                                outcome.frame->payload_len);
+        const auto arr = nlohmann::json::parse(body, nullptr, /*allow_exceptions*/ false);
+        ok &= !arr.is_discarded() && arr.is_array() && arr.size() == 2;
+        bool saw_a = false, saw_b = false;
+        if (arr.is_array()) {
+            for (const auto& e : arr) {
+                const auto name = e.value("name", std::string{});
+                const auto id = e.value("id", std::string{});
+                if (name == "ChildA") saw_a = !id.empty();
+                if (name == "ChildB") saw_b = !id.empty();
+            }
+        }
+        ok &= saw_a && saw_b;
+    }
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("browse: assertion failed\n");
+    return ok;
+}
+
+// ---- (1i) M9.1 PR G: a malformed browse_root NodeId is rejected at open(), no I/O -----------------------
+bool test_browse_invalid_root() {
+    OpcUaDriver driver("opc.tcp://127.0.0.1:1", std::vector<std::string>{}, "not-a-valid-nodeid");
+    aero::DriverConfig cfg{};
+    const bool ok = driver.open(cfg) == aero::DriverStatus::Error;
+    driver.close();
+    if (!ok) std::printf("browse_invalid_root: assertion failed\n");
+    return ok;
+}
+
+// ---- (1j) M9.1 PR G: configuring both node_ids and browse_root together is rejected at open() -----------
+bool test_browse_and_node_ids_rejected() {
+    OpcUaDriver driver("opc.tcp://127.0.0.1:1", std::vector<std::string>{"ns=1;s=Temperature"},
+                        "ns=1;s=BrowseRoot");
+    aero::DriverConfig cfg{};
+    const bool ok = driver.open(cfg) == aero::DriverStatus::Error;
+    driver.close();
+    if (!ok) std::printf("browse_and_node_ids_rejected: assertion failed\n");
+    return ok;
+}
+
 // ---- (2) a node_ids list too large for the 128-byte payload budget is rejected at open() --------------
 bool test_oversized_rejected() {
     // ~40 bytes/entry worst-case estimate (opcua_driver.hpp) -> 4 entries already exceeds 128 bytes.
@@ -546,6 +628,18 @@ int main() {
     const bool call_method_bad_target_ok = test_call_method_invalid_target();
     ok &= call_method_bad_target_ok;
     std::printf("[call_method_invalid_target] %s\n", call_method_bad_target_ok ? "ok" : "FAIL");
+
+    const bool browse_ok = test_browse();
+    ok &= browse_ok;
+    std::printf("[browse] %s\n", browse_ok ? "ok" : "FAIL");
+
+    const bool browse_invalid_root_ok = test_browse_invalid_root();
+    ok &= browse_invalid_root_ok;
+    std::printf("[browse_invalid_root] %s\n", browse_invalid_root_ok ? "ok" : "FAIL");
+
+    const bool browse_and_node_ids_ok = test_browse_and_node_ids_rejected();
+    ok &= browse_and_node_ids_ok;
+    std::printf("[browse_and_node_ids_rejected] %s\n", browse_and_node_ids_ok ? "ok" : "FAIL");
 
     const bool oversized_ok = test_oversized_rejected();
     ok &= oversized_ok;
