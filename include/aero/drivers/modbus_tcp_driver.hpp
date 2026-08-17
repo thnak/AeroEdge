@@ -20,6 +20,7 @@
 #pragma once
 
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -92,16 +93,40 @@ public:
         return DriverStatus::Ok;
     }
 
+    // FC06 (Write Single Register), M9.1's v1 write slice (018 §8). `cmd.target` is the register
+    // address as a decimal string (DeviceCommand has no dedicated address field, 006 §7), `cmd.value`
+    // the register value — must fit a Modbus register (0..65535). Same connect/reconnect/backoff path
+    // as poll() (a write and a read share one socket; a failed write drops the connection exactly like
+    // a failed read does). FC16 (write multiple) and other write function codes stay backlog (M9.1).
+    DriverStatus write(const DeviceCommand& cmd) noexcept override {
+        if (!opened_) return DriverStatus::Error;
+        if (cmd.value < 0 || cmd.value > 0xFFFF) return DriverStatus::Error;
+
+        std::uint16_t address = 0;
+        const char* begin = cmd.target.data();
+        const char* end = begin + cmd.target.size();
+        const auto parsed = std::from_chars(begin, end, address);
+        if (parsed.ec != std::errc{} || parsed.ptr != end) return DriverStatus::Error;
+
+        if (fd_ == quark::pal::invalid_fd && !ensure_connected()) return DriverStatus::Error;
+
+        bool io_ok = true;
+        const DriverStatus st = do_write_transaction(address, static_cast<std::uint16_t>(cmd.value), io_ok);
+        if (!io_ok) close_socket();  // connection lost (006 §8) -> reconnect w/ backoff on a later call
+        return st;
+    }
+
     void close() noexcept override { close_socket(); }
 
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    // Observability: the exception code from the most recent Modbus exception response (0x83), if any —
-    // "log the exception code" without a required stderr dependency in a header (mirrors GeneratorDriver's
-    // produced()/stalls() counters). 0 means "none observed yet" (0 is not a valid Modbus exception code).
+    // Observability: the exception code from the most recent Modbus exception response (0x83/0x86), if
+    // any — "log the exception code" without a required stderr dependency in a header (mirrors
+    // GeneratorDriver's produced()/stalls() counters). 0 means "none observed yet" (0 is not a valid
+    // Modbus exception code).
     [[nodiscard]] std::uint8_t last_exception_code() const noexcept { return last_exception_code_; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_tcp", /*writable*/ false};
+    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_tcp", /*writable*/ true};
 
 private:
     static constexpr int kConnectTimeoutMs = 2000;
@@ -109,6 +134,7 @@ private:
     static constexpr int kInitialBackoffMs = 200;
     static constexpr int kMaxBackoffMs = 5000;
     static constexpr std::uint8_t kFcReadHoldingRegisters = 0x03;
+    static constexpr std::uint8_t kFcWriteSingleRegister = 0x06;
     static constexpr std::uint8_t kFcExceptionBit = 0x80;
 
     // Lazily reconnect, gated by the backoff clock — see class banner. false == still backing off, or
@@ -251,6 +277,68 @@ private:
 
         out.payload_len = static_cast<std::uint16_t>(expected_bytes);
         for (std::size_t i = 0; i < expected_bytes; ++i) out.payload[i] = pdu[2 + i];
+        return DriverStatus::Ok;
+    }
+
+    // One FC06 request/response transaction. Same io_ok contract as do_transaction(): false only for a
+    // transport/framing problem (caller reconnects); a clean exception response (0x86) is a healthy
+    // connection reporting a device-level error (io_ok stays true).
+    DriverStatus do_write_transaction(std::uint16_t address, std::uint16_t value, bool& io_ok) noexcept {
+        const std::uint16_t txn_id = next_txn_id_++;
+
+        std::array<std::byte, 12> req{};
+        put_u16_be(&req[0], txn_id);
+        put_u16_be(&req[2], 0x0000);
+        put_u16_be(&req[4], 0x0006);  // length: unit(1) + fc(1) + addr(2) + value(2)
+        req[6] = static_cast<std::byte>(unit_id_);
+        req[7] = static_cast<std::byte>(kFcWriteSingleRegister);
+        put_u16_be(&req[8], address);
+        put_u16_be(&req[10], value);
+
+        if (!send_all(fd_, req.data(), req.size())) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+
+        std::array<std::byte, 7> hdr{};
+        if (!recv_exact(fd_, hdr.data(), hdr.size())) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+        const std::uint16_t resp_txn = get_u16_be(&hdr[0]);
+        const std::uint16_t resp_len = get_u16_be(&hdr[4]);
+        if (resp_txn != txn_id || resp_len == 0) {
+            io_ok = false;  // desynced/malformed — don't trust the byte stream further
+            return DriverStatus::Error;
+        }
+
+        const std::size_t pdu_len = static_cast<std::size_t>(resp_len) - 1;
+        constexpr std::size_t kMaxWritePdu = 5;  // fc(1) + addr(2) + value(2), the largest well-formed reply
+        if (pdu_len < 1 || pdu_len > kMaxWritePdu) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+        std::array<std::byte, kMaxWritePdu> pdu{};
+        if (!recv_exact(fd_, pdu.data(), pdu_len)) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
+
+        const auto fc = std::to_integer<std::uint8_t>(pdu[0]);
+        if ((fc & kFcExceptionBit) != 0) {
+            last_exception_code_ = pdu_len >= 2 ? std::to_integer<std::uint8_t>(pdu[1]) : 0;
+            return DriverStatus::Error;
+        }
+        if (fc != kFcWriteSingleRegister || pdu_len != 5) {
+            io_ok = false;  // an unexpected function code / short reply is a framing problem
+            return DriverStatus::Error;
+        }
+        // A conformant server echoes address+value back on success; a mismatch means desync, not a
+        // device-level error — treat it as a framing problem like the rest of this function.
+        if (get_u16_be(&pdu[1]) != address || get_u16_be(&pdu[3]) != value) {
+            io_ok = false;
+            return DriverStatus::Error;
+        }
         return DriverStatus::Ok;
     }
 

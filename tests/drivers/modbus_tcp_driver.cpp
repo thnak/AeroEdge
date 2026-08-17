@@ -137,8 +137,9 @@ struct FakeModbusServer {
         }
     }
 
-    // Read exactly one FC03 request (12 bytes: MBAP7 + fc1 + addr2 + count2), reply with the canned
-    // register slice, then return (caller closes the connection).
+    // Read exactly one request (12 bytes: MBAP7 + fc1 + 4 more PDU bytes — FC03's addr2+count2 and
+    // FC06's addr2+value2 are the same wire size), reply per function code, then return (caller closes
+    // the connection).
     void serve_one(quark::pal::fd_t conn) {
         std::array<std::byte, 12> req{};
         if (!recv_exact(conn, req.data(), req.size(), running)) return;
@@ -146,9 +147,17 @@ struct FakeModbusServer {
         const std::uint16_t txn = get_u16_be(&req[0]);
         const std::uint8_t unit = std::to_integer<std::uint8_t>(req[6]);
         const std::uint8_t fc = std::to_integer<std::uint8_t>(req[7]);
+        if (fc == 0x03) {
+            serve_read(conn, txn, unit, req);
+        } else if (fc == 0x06) {
+            serve_write(conn, txn, unit, req);
+        }
+    }
+
+    void serve_read(quark::pal::fd_t conn, std::uint16_t txn, std::uint8_t unit,
+                     const std::array<std::byte, 12>& req) {
         const std::uint16_t start = get_u16_be(&req[8]);
         const std::uint16_t count = get_u16_be(&req[10]);
-        if (fc != 0x03) return;
 
         const std::uint8_t byte_count = static_cast<std::uint8_t>(count * 2);
         std::vector<std::byte> resp(static_cast<std::size_t>(9) + byte_count);
@@ -162,6 +171,38 @@ struct FakeModbusServer {
             const std::uint16_t v = (start + i) < registers.size() ? registers[start + i] : 0;
             put_u16_be(&resp[9 + 2 * i], v);
         }
+        (void)send_all(conn, resp.data(), resp.size());
+    }
+
+    // FC06: reject addr >= registers.size() with a well-formed 0x86 exception (code 0x02, illegal data
+    // address) — exercises the driver's exception path; anything else stores the value and echoes the
+    // request back verbatim, exactly like a conformant Modbus-TCP server.
+    void serve_write(quark::pal::fd_t conn, std::uint16_t txn, std::uint8_t unit,
+                      const std::array<std::byte, 12>& req) {
+        const std::uint16_t addr = get_u16_be(&req[8]);
+        const std::uint16_t value = get_u16_be(&req[10]);
+
+        if (addr >= registers.size()) {
+            std::array<std::byte, 9> resp{};
+            put_u16_be(&resp[0], txn);
+            put_u16_be(&resp[2], 0x0000);
+            put_u16_be(&resp[4], 0x0003);  // unit(1)+fc(1)+exception_code(1)
+            resp[6] = static_cast<std::byte>(unit);
+            resp[7] = static_cast<std::byte>(0x86);  // 0x06 | exception bit
+            resp[8] = static_cast<std::byte>(0x02);  // illegal data address
+            (void)send_all(conn, resp.data(), resp.size());
+            return;
+        }
+
+        registers[addr] = value;
+        std::array<std::byte, 12> resp{};
+        put_u16_be(&resp[0], txn);
+        put_u16_be(&resp[2], 0x0000);
+        put_u16_be(&resp[4], 0x0006);
+        resp[6] = static_cast<std::byte>(unit);
+        resp[7] = static_cast<std::byte>(0x06);
+        put_u16_be(&resp[8], addr);
+        put_u16_be(&resp[10], value);
         (void)send_all(conn, resp.data(), resp.size());
     }
 };
@@ -291,6 +332,60 @@ bool test_reconnect_after_loss() {
     return ok;
 }
 
+// ---- (4) M9.1 FC06 write: value round-trips through the fake server's register bank -------------------
+bool test_write_single_register() {
+    FakeModbusServer server;
+    if (!server.start()) { std::printf("write_single_register: server start failed\n"); return false; }
+
+    ModbusTcpDriver driver("127.0.0.1", server.port, /*unit*/ 1, /*start*/ 0, /*count*/ 1);
+    aero::DriverConfig cfg{};
+    bool ok = driver.open(cfg) == aero::DriverStatus::Ok;
+
+    ok &= driver.write(aero::DeviceCommand{"5", 0x1234}) == aero::DriverStatus::Ok;
+    ok &= server.registers.size() > 5 && server.registers[5] == 0x1234;
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("write_single_register: assertion failed\n");
+    return ok;
+}
+
+// ---- (5) M9.1 FC06 write: a well-formed 0x86 exception is a clean Error, connection stays healthy -----
+bool test_write_exception_response() {
+    FakeModbusServer server;
+    if (!server.start()) { std::printf("write_exception: server start failed\n"); return false; }
+
+    ModbusTcpDriver driver("127.0.0.1", server.port, /*unit*/ 1, /*start*/ 0, /*count*/ 1);
+    aero::DriverConfig cfg{};
+    bool ok = driver.open(cfg) == aero::DriverStatus::Ok;
+
+    // address >= registers.size() -> the fake server replies with a 0x86 exception (illegal data address).
+    const std::string bad_addr = std::to_string(server.registers.size() + 1);
+    ok &= driver.write(aero::DeviceCommand{bad_addr, 7}) == aero::DriverStatus::Error;
+    ok &= driver.last_exception_code() == 0x02;
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("write_exception: assertion failed\n");
+    return ok;
+}
+
+// ---- (6) M9.1 FC06 write: a malformed target (non-numeric address) is rejected without touching I/O ---
+bool test_write_invalid_target() {
+    // Port 1 is expected to refuse the connect, so open() itself returns Error here — irrelevant to
+    // this test: open() sets `opened_` true before it ever dials (see class banner), and write()'s
+    // target parse runs before it touches the socket at all, so this proves the parse failure short-
+    // circuits without depending on a live connection.
+    ModbusTcpDriver driver("127.0.0.1", /*port*/ 1, /*unit*/ 1, /*start*/ 0, /*count*/ 1);
+    aero::DriverConfig cfg{};
+    (void)driver.open(cfg);
+
+    const bool ok = driver.write(aero::DeviceCommand{"not-a-number", 1}) == aero::DriverStatus::Error;
+    driver.close();
+    if (!ok) std::printf("write_invalid_target: assertion failed\n");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -307,6 +402,18 @@ int main() {
     const bool reconnect_ok = test_reconnect_after_loss();
     ok &= reconnect_ok;
     std::printf("[reconnect_after_loss] %s\n", reconnect_ok ? "ok" : "FAIL");
+
+    const bool write_ok = test_write_single_register();
+    ok &= write_ok;
+    std::printf("[write_single_register] %s\n", write_ok ? "ok" : "FAIL");
+
+    const bool write_exc_ok = test_write_exception_response();
+    ok &= write_exc_ok;
+    std::printf("[write_exception_response] %s\n", write_exc_ok ? "ok" : "FAIL");
+
+    const bool write_bad_target_ok = test_write_invalid_target();
+    ok &= write_bad_target_ok;
+    std::printf("[write_invalid_target] %s\n", write_bad_target_ok ? "ok" : "FAIL");
 
     std::printf("modbus_tcp_driver: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

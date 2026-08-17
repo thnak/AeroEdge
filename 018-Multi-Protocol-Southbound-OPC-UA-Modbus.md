@@ -14,6 +14,7 @@
 |---|---|---|
 | M9a | `Frame`/driver-pipeline byte-payload plumbing (shared prerequisite) + `ModbusTcpDriver` (FC03 poll, no new dependency) | **Shipped** |
 | M9b | open62541 vendoring + `OpcUaDriver` (no-security client, poll configured NodeIds) | **Shipped** |
+| M9.1 PR A | `ModbusTcpDriver::write()` — FC06 Write Single Register | **Shipped** |
 
 ## 1. Why
 
@@ -113,8 +114,15 @@ validates the response (transaction id match, function code, byte count; a Modbu
 response — high bit set on the function code — is a clean `DriverStatus::Error`, never a crash),
 and delivers the raw register bytes to `ModbusDecodeNode` via the `Frame` payload described in §3.
 
-**Explicitly deferred** (M9.1, §8): writes (FC06 Write Single Register, FC16 Write Multiple
-Registers — `IDriver::write()` stays at its default `Unsupported`), other register/data types
+**M9.1 PR A** shipped `IDriver::write()`: FC06 (Write Single Register) only. `DeviceCommand.target`
+is the register address as a decimal string (`DeviceCommand` has no dedicated address field, 006
+§7); `DeviceCommand.value` is the register value (rejected at `write()` if outside `0..65535`).
+Same connect/reconnect/backoff path as `poll()` — a failed write drops the connection exactly like
+a failed read does, and a well-formed Modbus exception response (0x86) is a clean `DriverStatus::Error`
+with `last_exception_code()` set, never a crash.
+
+**Explicitly deferred** (M9.1, §8): FC16 Write Multiple Registers (needs a `DeviceCommand` shape
+change to carry more than one value — out of this PR's scope, see §8), other register/data types
 (coils FC01, discrete inputs FC02, input registers FC04), Modbus RTU/serial transport (TCP only).
 
 ## 5. Scope — M9b: OPC-UA
@@ -143,7 +151,8 @@ address-space browsing (v1 reads only configured NodeIds, no discovery), method 
 | Capability | Status | Where |
 |---|---|---|
 | Modbus-TCP: Read Holding Registers (FC03) | **shipped** | M9a, `ModbusTcpDriver` |
-| Modbus-TCP: writes, other register types, RTU/serial | backlog | M9.1 |
+| Modbus-TCP: Write Single Register (FC06) | **shipped** | M9.1 PR A, `ModbusTcpDriver::write()` |
+| Modbus-TCP: FC16 (write multiple), other register types, RTU/serial | backlog | M9.1 |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: security policies, Subscriptions, browsing, method calls | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
@@ -171,8 +180,13 @@ deployment needs that.
   subscribe-and-get-notified — would let `OpcUaDriver` become a push (`run()`) driver instead of
   poll, lower latency and lower request volume than v1's poll loop. Revisit once poll-interval
   latency is a measured problem, not preemptively.
-- **Modbus writes (FC06/FC16) and other register/data types** (coils, discrete inputs, input
-  registers) — `IDriver::write()` stays `Unsupported` until an actuator/setpoint use case exists.
+- **Modbus FC16 (Write Multiple Registers)** — deferred from M9.1 PR A because `DeviceCommand`
+  (`target: string_view`, `value: int64_t`) has no way to carry an address plus a list of values;
+  landing it means either widening `DeviceCommand` (a shared SDK type also used by OTA, 006 §7) or
+  giving `ModbusTcpDriver` its own multi-value command shape. Revisit once an actuator/setpoint use
+  case needs a multi-register write in one transaction (repeated FC06 calls cover the same end
+  state today, just not atomically).
+- **Other Modbus register/data types** (coils FC01, discrete inputs FC02, input registers FC04).
 - **Modbus RTU / serial transport.** v1 is TCP-only; RTU needs a serial PAL this codebase doesn't
   have yet.
 - **Multi-frame chunking** for register-maps/NodeId-lists wider than the 128-byte payload cap
