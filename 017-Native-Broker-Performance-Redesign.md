@@ -491,8 +491,57 @@ remain separately deferred, per §2.4's own recommendation.
 
 ### 3.1 Buffered incremental packet reads
 
-Status: implementing. See commit history for the actual diff; this section is
-updated with real before/after numbers once verification (per the plan's
-Verification section) completes.
+Status: **shipped.**
 
-(not started)
+- **Step A** — `try_parse_packet()` added to `mqtt_codec.hpp`, additive alongside
+  the unchanged `read_packet()`/`read_n()`. Unit-tested in isolation
+  (`tests/transport/mqtt_codec.cpp`): empty/partial/malformed/burst/split buffers,
+  zero-length body, multi-byte remaining-length — all pass.
+- **Step B** — wired into `NativeBroker::session_loop()`: a per-`Session` owned
+  `read_buf`/`read_pos`, one `recv_some()` burst per outer poll cycle, an inner
+  loop draining every complete packet currently buffered (with `kicked`
+  re-checked per packet, not just per outer iteration, per the critique's
+  finding). `read_packet()`/`read_n()` stay untouched for every other caller.
+
+**Verification, all green:**
+- Full existing broker suite (`native_broker`, `mqtt5`, `broker_cluster`, `acl`,
+  `bridge`, `concurrency_stress`) — including `test_disconnect_reason_session_
+  taken_over` (mqtt5.cpp), the existing regression coverage for exactly the
+  `kicked`-promptness concern the critique raised.
+- New `tests/broker/buffered_read_framing.cpp` (broker-integration level, closes
+  Phase 1 gap #4 alongside the unit tests above): two packets delivered in one
+  burst (dispatched correctly, in order), one packet split across two separate
+  socket writes (dispatched correctly once complete), and session takeover
+  staying prompt (<2s) with a 50-packet backlog buffered ahead of it. 5/5 repeat
+  runs clean, no flakiness.
+- `concurrency_stress` run 18x independently (same methodology as Phase 2's
+  Experiment C): 18/18 clean, zero hangs, zero failures.
+
+**Real measured throughput/latency, `broker_bench`, 1 publisher → 1 subscriber,
+no fan-out** (vs. the documented pre-Phase-3 baseline):
+
+| Scenario | Throughput | p50 latency |
+|---|---|---|
+| QoS 0 baseline (pre-Phase-3) | ~63,000 msg/s | ~44ms |
+| QoS 0, buffered reads (3 runs) | 93,699 / 99,248 / 95,069 msg/s | 29.7 / 28.5 / 29.0 ms |
+| QoS 1 baseline (pre-Phase-3) | ~22,700 msg/s | ~0.031ms |
+| QoS 1, buffered reads | 22,446 msg/s | 0.032ms |
+
+**QoS 0: ~1.5-1.6x throughput, ~1.5x lower p50 latency** — real and consistent
+across repeat runs, but smaller than Experiment A's isolated-prototype numbers
+(~1.7-1.9x / ~6-7x). Honest read: the prototype deliberately measured ONLY the
+read-path change (CONNECT/CONNACK + single-recipient forwarding, no
+SUBSCRIBE/topic-matching/ACL/retained-message overhead); the real, integrated
+broker still pays for everything else on the per-message path unchanged by this
+slice (topic index lookup, `subs_mu` locking, the ACL gate even when unset,
+`retained_mu_`), which dilutes the isolated win. Still a genuine, worthwhile
+improvement, just not the full isolated-prototype magnitude — expected and
+consistent with what's actually in scope for this slice (§3.0).
+
+**QoS 1: no measurable change (expected, not a regression).** QoS 1 is
+round-trip-bound — the publisher waits for a PUBACK before sending the next
+message, so at most one packet is ever in flight, and the buffered-read win
+(amortizing read overhead across many packets available at once) has nothing to
+amortize over. This matches the mechanism exactly: buffered reads help
+unthrottled/bursty traffic (QoS 0, or QoS 1/2 fan-out to many subscribers under
+load), not single-in-flight round-trip-bound traffic.

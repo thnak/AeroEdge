@@ -196,6 +196,18 @@ target_link_libraries(native_broker PRIVATE aero::broker)
 add_test(NAME native_broker COMMAND native_broker)
 set_tests_properties(native_broker PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): NativeBroker::session_loop()'s buffered read
+# behaves correctly over a REAL socket — multiple complete packets delivered in one burst (forcing the
+# inner drain loop to carve more than one out of a single recv_some()), a packet split across two
+# separate writes (forcing a genuinely Incomplete parse across more than one read cycle), and session
+# takeover staying prompt even with a non-trivial backlog buffered ahead of it. Closes Phase 1's
+# test-coverage gap #4 at the broker-integration level (tests/transport/mqtt_codec.cpp already covers the
+# parser itself in isolation).
+add_executable(buffered_read_framing broker/buffered_read_framing.cpp)
+target_link_libraries(buffered_read_framing PRIVATE aero::broker)
+add_test(NAME buffered_read_framing COMMAND buffered_read_framing)
+set_tests_properties(buffered_read_framing PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # 017 §6 (revised scope) gate: bridge.hpp — bridging (MqttBridgeSink, HttpWebhookBridgeSink) + the
 # BrokerRuleEngine reusing aero-nodes' ExprRuleNode (008 §6) as the content gate over on_publish().
 # MqttBridgeSink is proven against a real NativeBroker; HttpWebhookBridgeSink against a local httplib

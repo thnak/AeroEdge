@@ -322,6 +322,14 @@ private:
         std::mutex subs_mu;
         std::vector<Subscription> subs;
 
+        // 017 Phase 3: the buffered-read inbound byte buffer (redesign doc §2.4 Experiment A / §3.1) —
+        // same single-thread-owned discipline as client_id/keep_alive_s/etc. below (only this session's
+        // own reader thread, session_loop, ever touches these — no lock needed). read_pos marks how much
+        // of read_buf's prefix has already been dispatched as complete packets; session_loop compacts it
+        // back to 0 once per outer read cycle.
+        std::vector<std::byte> read_buf;
+        std::size_t read_pos = 0;
+
         std::string client_id;
         std::uint16_t keep_alive_s = 0;
         bool clean_session = true;
@@ -460,20 +468,29 @@ private:
         return std::chrono::steady_clock::now() - s.last_activity > limit;
     }
 
+    // 017 Phase 3: buffered read (redesign doc §2.4 Experiment A / §3.1) — one recv_some() burst here can
+    // hand over many packets' worth of bytes at once (or a partial one, split across TCP segments); the
+    // inner drain loop below carves every complete packet currently in `s->read_buf` via
+    // try_parse_packet() before this outer loop polls again, replacing the old one-outer-iteration-per-
+    // packet call into read_packet() (which did its own internal per-byte recv_some()-or-poll cycle: 3+
+    // syscalls per packet, unconditionally). `read_packet()`/`read_n()` themselves are UNCHANGED — still
+    // used by MqttClientTransport, bridge.hpp, and every test's hand-rolled client.
     void session_loop(const std::shared_ptr<Session>& s) {
         bool clean_disconnect = false;  // true only for an explicit DISCONNECT (0xE0) — gates the Will
         while (running_.load(std::memory_order_acquire)) {
-            // Checked every iteration (not just on a read timeout): a session-takeover CONNECT (3.1.4)
-            // must end this session promptly even if it's mid-read of something else.
+            // Checked every outer iteration (not just on a read timeout): a session-takeover CONNECT
+            // (3.1.4) must end this session promptly even if it's mid-read of something else. Also
+            // re-checked inside the inner drain loop below (see its own comment) — a single recv_some()
+            // burst can hand over several buffered packets before this outer check would run again.
             if (s->kicked.load(std::memory_order_acquire)) {
                 send_disconnect(*s, 0x8E);  // Session taken over (M7.1)
                 break;
             }
 
-            // Explicit poll-then-read (rather than letting read_packet's own internal 200ms polling loop
-            // block until a full packet arrives) so a silent-but-still-open connection gets its keep-alive
-            // checked every ~200ms too, not just when a packet actually shows up (mirrors
-            // tcp_transport.hpp's accept_loop poll-timeout-as-heartbeat idiom).
+            // Explicit poll-then-read (rather than letting recv_some's would-block handling loop
+            // internally) so a silent-but-still-open connection gets its keep-alive checked every ~200ms
+            // too, not just when data actually shows up (mirrors tcp_transport.hpp's accept_loop
+            // poll-timeout-as-heartbeat idiom — unchanged from before this Phase 3 change).
             const auto ready = aero::pal::wait_readable(s->fd, 200);
             if (!ready) break;  // poll itself failed
             if (!*ready) {
@@ -484,31 +501,71 @@ private:
                 continue;
             }
 
-            auto pkt = std::visit(
-                [&](auto& ch) { return aero::transport::mqtt::read_packet(ch, running_); }, s->channel);
-            if (!pkt) break;  // peer closed / error / running flipped false
-            s->last_activity = std::chrono::steady_clock::now();  // ANY inbound packet refreshes it
-            const std::uint8_t type = pkt->type_flags & 0xF0;
-            if (type == 0x10) {          // CONNECT
-                if (!handle_connect(s, *pkt)) break;
-            } else if (type == 0x80) {   // SUBSCRIBE
-                if (!handle_subscribe(s, *pkt)) break;
-            } else if (type == 0x30) {   // PUBLISH
-                if (!handle_publish(*s, *pkt)) break;
-            } else if (type == 0x60) {   // PUBREL (4.3.3 step 3; low nibble MUST be 0x2, not checked —
-                                          // mirrors this file's existing tolerance of e.g. SUBSCRIBE's flags)
-                if (!handle_pubrel(*s, *pkt)) break;
-            } else if (type == 0xC0) {   // PINGREQ
-                if (!s->send_packet(std::byte{0xD0}, {})) break;  // PINGRESP, no body
-            } else if (type == 0xE0) {   // DISCONNECT (3.1.1 §3.14): graceful — no Will on a clean
-                                          // disconnect, so discard it BEFORE teardown runs.
-                s->has_will = false;
-                clean_disconnect = true;
-                break;
+            std::byte recv_scratch[4096];
+            auto got = std::visit(
+                [&](auto& ch) { return ch.recv_some(recv_scratch, sizeof(recv_scratch)); }, s->channel);
+            if (!got) {
+                // A spurious would-block right after wait_readable said ready is a legitimate TOCTOU —
+                // just poll again, exactly like read_n's own would-block handling did before this change.
+                if (got.error() != quark::pal::would_block()) break;  // real error — same exit as before
+                continue;
             }
-            // 0x40 PUBACK from the peer (ack of a QoS-1 delivery we sent): no retry state kept in v1
-            // (mirrors MqttClientTransport's own honest "no QoS-1 sender-side retransmit" scope) — read
-            // and discard, already consumed by read_packet above.
+            if (*got == 0) break;  // peer closed — same as read_packet()'s Ok(0)/EOF contract
+            s->read_buf.insert(s->read_buf.end(), recv_scratch, recv_scratch + *got);
+
+            bool stop_session = false;
+            while (true) {
+                // Re-checked every packet drained from the buffer, not just once per outer iteration —
+                // see this function's own banner: a buffered read can hand several packets to this inner
+                // loop at once, so checking `kicked` only at the top of the outer loop would honor a
+                // session takeover less promptly than the pre-Phase-3 one-packet-per-iteration contract.
+                if (s->kicked.load(std::memory_order_acquire)) {
+                    send_disconnect(*s, 0x8E);
+                    stop_session = true;
+                    break;
+                }
+                auto pkt = aero::transport::mqtt::try_parse_packet(s->read_buf, s->read_pos);
+                if (!pkt) {
+                    // Incomplete: not an error, just nothing more to dispatch until more bytes arrive —
+                    // fall through to compact the buffer and let the outer loop poll again. Malformed
+                    // (a remaining-length varint past MQTT's 4-byte cap): fatal framing error, same
+                    // "close the connection" exit read_packet() returning nullopt used to trigger.
+                    if (pkt.error() == aero::transport::mqtt::ParseStatus::Malformed) stop_session = true;
+                    break;
+                }
+                s->last_activity = std::chrono::steady_clock::now();  // ANY inbound packet refreshes it
+                const std::uint8_t type = pkt->type_flags & 0xF0;
+                if (type == 0x10) {          // CONNECT
+                    if (!handle_connect(s, *pkt)) { stop_session = true; break; }
+                } else if (type == 0x80) {   // SUBSCRIBE
+                    if (!handle_subscribe(s, *pkt)) { stop_session = true; break; }
+                } else if (type == 0x30) {   // PUBLISH
+                    if (!handle_publish(*s, *pkt)) { stop_session = true; break; }
+                } else if (type == 0x60) {   // PUBREL (4.3.3 step 3; low nibble MUST be 0x2, not checked —
+                                              // mirrors this file's existing tolerance of e.g. SUBSCRIBE's flags)
+                    if (!handle_pubrel(*s, *pkt)) { stop_session = true; break; }
+                } else if (type == 0xC0) {   // PINGREQ
+                    if (!s->send_packet(std::byte{0xD0}, {})) { stop_session = true; break; }  // PINGRESP
+                } else if (type == 0xE0) {   // DISCONNECT (3.1.1 §3.14): graceful — no Will on a clean
+                                              // disconnect, so discard it BEFORE teardown runs.
+                    s->has_will = false;
+                    clean_disconnect = true;
+                    stop_session = true;
+                    break;
+                }
+                // 0x40 PUBACK from the peer (ack of a QoS-1 delivery we sent): no retry state kept in v1
+                // (mirrors MqttClientTransport's own honest "no QoS-1 sender-side retransmit" scope) —
+                // parsed and discarded, nothing to dispatch it to.
+            }
+
+            // Compact the already-dispatched prefix out of the buffer so it doesn't grow unbounded across
+            // many read cycles — read_pos always sits at "everything before this has been consumed".
+            if (s->read_pos > 0) {
+                s->read_buf.erase(s->read_buf.begin(),
+                                  s->read_buf.begin() + static_cast<std::ptrdiff_t>(s->read_pos));
+                s->read_pos = 0;
+            }
+            if (stop_session) break;
         }
         teardown_session(s, clean_disconnect);
     }
