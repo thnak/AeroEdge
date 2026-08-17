@@ -4,9 +4,12 @@
 // reference): PULL, not PUSH — every read happens inside one `poll()` call, `run()` is a hard
 // Unsupported. v1 SCOPE (explicit, not an oversight): connect to ONE configured endpoint, read a fixed
 // set of configured NodeIds via UA_Client_readValueAttribute, write a scalar to any NodeId via
-// UA_Client_writeValueAttribute (M9.1 PR E, 018 §8 — the OPC-UA counterpart to ModbusTcpDriver's FC06).
-// NO security policies (Sign/SignAndEncrypt is backlog), NO Subscriptions/MonitoredItems, NO browsing,
-// NO method calls — pure poll-configured-NodeIds plus single-NodeId scalar write only.
+// UA_Client_writeValueAttribute (M9.1 PR E, 018 §8 — the OPC-UA counterpart to ModbusTcpDriver's FC06),
+// call an object/method NodeId pair with exactly one scalar input argument via UA_Client_call (M9.1 PR
+// F — the FC16-ish "structured target string" counterpart, output arguments discarded unread). NO
+// security policies (Sign/SignAndEncrypt is backlog), NO Subscriptions/MonitoredItems, NO address-space
+// browsing (both still backlog) — pure poll-configured-NodeIds, single-NodeId scalar write, and
+// single-argument method call only.
 //
 // REUSE, NOT REBUILD (the whole point): this driver's job stops at serializing the polled NodeId->value
 // results into a FLAT JSON OBJECT (e.g. {"ns=2;s=Temperature":23.5}) written into the Frame's byte
@@ -140,26 +143,33 @@ public:
         return DriverStatus::Ok;
     }
 
-    // A device-directed write (006 §7) via UA_Client_writeValueAttribute — the OPC-UA counterpart to
-    // ModbusTcpDriver's FC06. `cmd.target` is the NodeId string, parsed the same way as a configured
-    // `node_ids` entry (UA_NodeId_parse — a malformed target is a clean Error before any I/O); `cmd.value`
-    // is written as a UA_Double, matching this driver's own read-side convention of normalizing every
-    // value to double (variant_to_double()). Same connection-loss detection and teardown posture as
-    // poll() (006 §8): a genuine channel/session loss tears the session down for the next poll()/write()
-    // to reconnect; a well-formed OPC-UA error over a healthy connection (bad NodeId, type mismatch,
-    // access denied) is a clean DriverStatus::Error, connection stays up.
+    // A device-directed write (006 §7), M9.1's write slice (018 §8). `DeviceCommand` has no dedicated
+    // object/method field (006 §7, a shared SDK type also used by OTA — not widened for this), so both
+    // forms live entirely in `cmd.target`, mirroring ModbusTcpDriver::write()'s comma-vs-bare split:
+    //   - a bare NodeId string ("ns=1;s=Setpoint") -> UA_Client_writeValueAttribute (PR E), `cmd.value`
+    //     written as a UA_Double, matching this driver's read-side convention of normalizing every value
+    //     to double (variant_to_double()).
+    //   - "objectNodeId|methodNodeId" (PR F) -> UA_Client_call with EXACTLY ONE scalar UA_Double input
+    //     argument (`cmd.value`); output arguments are freed, unread (v1 — 0-arg/multi-arg calls and
+    //     reading outputs are backlog, §8). OPC-UA NodeId identifier strings don't use "|" in this
+    //     codebase's own encoding, so the two forms don't collide.
+    // Both forms parse their NodeId(s) BEFORE touching the connection (a malformed target is a config
+    // error, not a device/connection error, so it short-circuits without a reconnect attempt even when
+    // disconnected), and share the same connection-loss detection/teardown posture as poll() (006 §8): a
+    // genuine channel/session loss tears the session down for the next poll()/write() to reconnect; a
+    // well-formed OPC-UA error over a healthy connection (bad NodeId, type mismatch, access denied,
+    // wrong argument count) is a clean DriverStatus::Error, connection stays up.
     DriverStatus write(const DeviceCommand& cmd) noexcept override {
         if (!opened_) return DriverStatus::Error;
 
-        // Parse the target BEFORE touching the connection (mirrors ModbusTcpDriver::write()): a
-        // malformed target is a config error, not a device/connection error, so it short-circuits
-        // without a reconnect attempt even when the driver is currently disconnected.
+        const auto sep = cmd.target.find('|');
+        if (sep != std::string_view::npos) {
+            return call_method(cmd.target.substr(0, sep), cmd.target.substr(sep + 1), cmd.value);
+        }
+
         UA_NodeId id;
         UA_NodeId_init(&id);
-        UA_String ua_target = UA_String_fromChars(std::string(cmd.target).c_str());
-        const UA_StatusCode parse_rc = UA_NodeId_parse(&id, ua_target);
-        UA_String_clear(&ua_target);
-        if (parse_rc != UA_STATUSCODE_GOOD) {
+        if (!parse_node_id(cmd.target, id)) {
             UA_NodeId_clear(&id);
             return DriverStatus::Error;
         }
@@ -284,6 +294,65 @@ private:
     void teardown_session() noexcept {
         UA_Client_disconnect(client_);
         connected_ = false;
+    }
+
+    // Shared NodeId-string parse (UA_NodeId_parse) — write()'s bare-NodeId form and call_method()'s
+    // object/method pair both go through this. `out` must already be UA_NodeId_init'd by the caller;
+    // on failure `out` is left as its init'd (empty) value, never partially populated.
+    static bool parse_node_id(std::string_view s, UA_NodeId& out) noexcept {
+        UA_String ua_s = UA_String_fromChars(std::string(s).c_str());
+        const UA_StatusCode rc = UA_NodeId_parse(&out, ua_s);
+        UA_String_clear(&ua_s);
+        return rc == UA_STATUSCODE_GOOD;
+    }
+
+    // "objectNodeId|methodNodeId" method call (M9.1 PR F, 018 §8) — see write()'s banner for the v1
+    // scope (exactly one scalar UA_Double input argument, output arguments discarded unread).
+    DriverStatus call_method(std::string_view object_str, std::string_view method_str,
+                              std::int64_t value) noexcept {
+        UA_NodeId object_id, method_id;
+        UA_NodeId_init(&object_id);
+        UA_NodeId_init(&method_id);
+        if (!parse_node_id(object_str, object_id) || !parse_node_id(method_str, method_id)) {
+            UA_NodeId_clear(&object_id);
+            UA_NodeId_clear(&method_id);
+            return DriverStatus::Error;
+        }
+
+        if (!connected_ && !ensure_connected()) {
+            UA_NodeId_clear(&object_id);
+            UA_NodeId_clear(&method_id);
+            return DriverStatus::Error;
+        }
+
+        UA_Variant input;
+        UA_Variant_init(&input);
+        UA_Double v = static_cast<UA_Double>(value);
+        const UA_StatusCode variant_rc = UA_Variant_setScalarCopy(&input, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        if (variant_rc != UA_STATUSCODE_GOOD) {
+            UA_NodeId_clear(&object_id);
+            UA_NodeId_clear(&method_id);
+            return DriverStatus::Error;
+        }
+
+        std::size_t output_size = 0;
+        UA_Variant* output = nullptr;
+        const UA_StatusCode rc =
+            UA_Client_call(client_, object_id, method_id, 1, &input, &output_size, &output);
+
+        UA_Variant_clear(&input);
+        UA_NodeId_clear(&object_id);
+        UA_NodeId_clear(&method_id);
+        if (output != nullptr) UA_Array_delete(output, output_size, &UA_TYPES[UA_TYPES_VARIANT]);
+
+        if (rc != UA_STATUSCODE_GOOD) {
+            if (connection_lost()) {
+                teardown_session();  // (006 §8) -> reconnect w/ backoff on a later poll()/write()
+                return DriverStatus::Error;
+            }
+            return DriverStatus::Error;  // well-formed device-level error, connection stays healthy
+        }
+        return DriverStatus::Ok;
     }
 
     static bool variant_to_double(const UA_Variant& v, double& out) noexcept {

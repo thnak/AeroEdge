@@ -19,6 +19,7 @@
 | M9.1 PR C | `ModbusTcpDriver::write()` — FC16 Write Multiple Registers (`"addr,v1,v2,..."` target form) | **Shipped** |
 | M9.1 PR D | `ModbusTcpDriver` — FC01/FC02 Read Coils/Discrete Inputs + `ModbusBitsDecodeNode` | **Shipped** |
 | M9.1 PR E | `OpcUaDriver::write()` — scalar write via `UA_Client_writeValueAttribute` | **Shipped** |
+| M9.1 PR F | `OpcUaDriver::write()` — single-argument method call via `UA_Client_call` (`"object\|method"` target form) | **Shipped** |
 
 ## 1. Why
 
@@ -181,10 +182,19 @@ the next `poll()`/`write()` to reconnect, while a well-formed OPC-UA error over 
 connection (bad NodeId, read-only node, type mismatch) is a clean `DriverStatus::Error` with the
 connection left up. `kDesc.writable` flipped to `true`.
 
+**M9.1 PR F** shipped a v1 method call via `UA_Client_call` — reusing `write()` rather than adding
+new `IDriver` surface, the same "encode structure into `cmd.target`" move as
+`ModbusTcpDriver`'s FC16 (018 PR C). A `"|"` in `cmd.target` switches from PR E's bare-NodeId write
+form to `"objectNodeId|methodNodeId"`: calls the method with **exactly one** scalar `UA_Double`
+input argument (`cmd.value`); any output arguments are freed unread. Both NodeId halves are parsed
+before the connection is touched, same as PR E. 0-arg/multi-arg calls and reading outputs are v1.1
+backlog (§8) — `DeviceCommand`'s single-value shape can't carry an argument list without a wider
+SDK change, the same constraint that bounded Modbus FC16 to a comma-separated `target`.
+
 **Explicitly deferred** (M9.1, §8): security policies (Sign/SignAndEncrypt, certificate-based
 client auth), Subscriptions/MonitoredItems (OPC-UA's native push mechanism — v1 is pure poll,
 matching the pull-driver shape 006 §6 already defines and keeping parity with the Modbus driver),
-address-space browsing (v1 reads/writes only configured NodeIds, no discovery), method calls.
+address-space browsing (v1 reads/writes/calls only configured/given NodeIds, no discovery).
 
 ## 6. Capability table
 
@@ -198,7 +208,8 @@ address-space browsing (v1 reads/writes only configured NodeIds, no discovery), 
 | Modbus-TCP: RTU/serial transport | backlog | M9.1 |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: scalar write to a configured NodeId | **shipped** | M9.1 PR E, `OpcUaDriver::write()` |
-| OPC-UA: security policies, Subscriptions, browsing, method calls | backlog | M9.1 |
+| OPC-UA: single-argument method call | **shipped** | M9.1 PR F, `OpcUaDriver::write()` |
+| OPC-UA: security policies, Subscriptions, address-space browsing | backlog | M9.1 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |
 | Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | both drivers |
@@ -233,5 +244,9 @@ deployment needs that.
 - **Device/register-map hot-reload** without a full flow redeploy — today, changing a driver's
   polled register/NodeId list means redeploying the Application (009 §4's hot-reload swaps the
   *flow*, not driver config).
-- **OPC-UA address-space browsing + method calls** — v1 requires every NodeId to be known and
-  configured up front; no discovery, no calling OPC-UA methods on the server.
+- **OPC-UA address-space browsing** — v1 (reads, writes, method calls all alike) requires every
+  NodeId to be known and given up front; no discovery. Would also need a new poll "mode" (a browse
+  result is a NodeId/BrowseName list, not the scalar-per-NodeId shape `poll()`'s JSON encoding
+  assumes today) rather than fitting into the existing `write()`-reuse trick PR E/PR F used.
+- **OPC-UA method calls: 0-arg / multi-arg, reading outputs.** PR F's v1 is exactly one scalar
+  input, outputs discarded — see PR F's note above on why (`DeviceCommand`'s single-value shape).

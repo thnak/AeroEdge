@@ -143,6 +143,7 @@ struct FakeOpcUaServer {
         add_variable(server, "Pressure", 101.3, UA_ACCESSLEVELMASK_READ);
         add_variable(server, "Setpoint", 0.0,
                       UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE);  // M9.1 PR E write test target
+        add_increment_method(server);  // M9.1 PR F call_method() test target
 
         // Synchronous on THIS (the caller's) thread — see the struct banner above for why: this is the
         // real happens-before edge against the driver's own UA_Client startup (also called from the main
@@ -190,6 +191,52 @@ struct FakeOpcUaServer {
         const UA_NodeId type_def = UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE);
         UA_Server_addVariableNode(srv, node_id, parent, parent_ref, browse_name, type_def, attr, nullptr,
                                    nullptr);
+    }
+
+    // "Increment": one scalar double in, one scalar double out (out = in + 1) — a minimal callable
+    // target for test_call_method()'s M9.1 PR F coverage. Attached directly to the ObjectsFolder
+    // (i=85, ns=0) via HasComponent, the standard shape UA_Client_call expects (objectId must have the
+    // method as a HasComponent child, not just any arbitrary NodeId pair).
+    static UA_StatusCode increment_callback(UA_Server*, const UA_NodeId*, void*, const UA_NodeId*, void*,
+                                             const UA_NodeId*, void*, std::size_t input_size,
+                                             const UA_Variant* input, std::size_t output_size,
+                                             UA_Variant* output) {
+        if (input_size != 1 || output_size != 1) return UA_STATUSCODE_BADARGUMENTSMISSING;
+        if (!UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE])) {
+            return UA_STATUSCODE_BADTYPEMISMATCH;
+        }
+        const UA_Double in = *static_cast<const UA_Double*>(input[0].data);
+        UA_Double out = in + 1.0;
+        return UA_Variant_setScalarCopy(&output[0], &out, &UA_TYPES[UA_TYPES_DOUBLE]);
+    }
+
+    static void add_increment_method(UA_Server* srv) {
+        UA_Argument input_arg;
+        UA_Argument_init(&input_arg);
+        input_arg.description = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>("value"));
+        input_arg.name = UA_STRING(const_cast<char*>("value"));
+        input_arg.dataType = UA_TYPES[UA_TYPES_DOUBLE].typeId;
+        input_arg.valueRank = UA_VALUERANK_SCALAR;
+
+        UA_Argument output_arg;
+        UA_Argument_init(&output_arg);
+        output_arg.description = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>("result"));
+        output_arg.name = UA_STRING(const_cast<char*>("result"));
+        output_arg.dataType = UA_TYPES[UA_TYPES_DOUBLE].typeId;
+        output_arg.valueRank = UA_VALUERANK_SCALAR;
+
+        UA_MethodAttributes attr = UA_MethodAttributes_default;
+        attr.description = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>("Increment"));
+        attr.displayName = UA_LOCALIZEDTEXT(const_cast<char*>("en-US"), const_cast<char*>("Increment"));
+        attr.executable = true;
+        attr.userExecutable = true;
+
+        const UA_NodeId method_id = UA_NODEID_STRING(1, const_cast<char*>("Increment"));
+        const UA_QualifiedName browse_name = UA_QUALIFIEDNAME(1, const_cast<char*>("Increment"));
+        const UA_NodeId parent = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
+        const UA_NodeId parent_ref = UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT);
+        UA_Server_addMethodNode(srv, method_id, parent, parent_ref, browse_name, attr, increment_callback,
+                                 1, &input_arg, 1, &output_arg, nullptr, nullptr);
     }
 };
 
@@ -346,6 +393,63 @@ bool test_write_invalid_target() {
     return ok;
 }
 
+// ---- (1e) M9.1 PR F: "object|method" calls the fake server's Increment method (out = in + 1, v1
+// discards the output — only DriverStatus::Ok proves the call round-tripped with the right arg count
+// and type) --------------------------------------------------------------------------------------------
+bool test_call_method() {
+    FakeOpcUaServer server;
+    if (!server.start()) { std::printf("call_method: server start failed\n"); return false; }
+
+    OpcUaDriver driver(kEndpoint, std::vector<std::string>{});
+    aero::DriverConfig cfg{};
+    bool ok = open_with_retry(driver, cfg);
+    if (!ok) std::printf("call_method: open() never succeeded\n");
+
+    // object = ObjectsFolder (i=85, ns=0), method = ns=1;s=Increment.
+    ok &= driver.write(aero::DeviceCommand{"i=85|ns=1;s=Increment", 41}) == aero::DriverStatus::Ok;
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("call_method: assertion failed\n");
+    return ok;
+}
+
+// ---- (1f) M9.1 PR F: an unknown method NodeId is a clean Error, connection stays healthy ---------------
+bool test_call_method_unknown_rejected() {
+    FakeOpcUaServer server;
+    if (!server.start()) { std::printf("call_method_unknown: server start failed\n"); return false; }
+
+    OpcUaDriver driver(kEndpoint, std::vector<std::string>{});
+    aero::DriverConfig cfg{};
+    bool ok = open_with_retry(driver, cfg);
+
+    ok &= driver.write(aero::DeviceCommand{"i=85|ns=1;s=Nonexistent", 1}) == aero::DriverStatus::Error;
+
+    // Connection should have stayed healthy — a normal poll() right after still succeeds.
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("call_method_unknown: assertion failed\n");
+    return ok;
+}
+
+// ---- (1g) M9.1 PR F: a malformed method half of "object|method" is rejected without any I/O -----------
+bool test_call_method_invalid_target() {
+    // Same posture as test_write_invalid_target: open() sets `opened_` true before it ever dials against
+    // the refused port 1, and both NodeId halves must parse cleanly before either is touched.
+    OpcUaDriver driver("opc.tcp://127.0.0.1:1", std::vector<std::string>{});
+    aero::DriverConfig cfg{};
+    (void)driver.open(cfg);
+
+    const bool ok =
+        driver.write(aero::DeviceCommand{"i=85|not-a-valid-nodeid", 1}) == aero::DriverStatus::Error;
+    driver.close();
+    if (!ok) std::printf("call_method_invalid_target: assertion failed\n");
+    return ok;
+}
+
 // ---- (2) a node_ids list too large for the 128-byte payload budget is rejected at open() --------------
 bool test_oversized_rejected() {
     // ~40 bytes/entry worst-case estimate (opcua_driver.hpp) -> 4 entries already exceeds 128 bytes.
@@ -430,6 +534,18 @@ int main() {
     const bool write_bad_target_ok = test_write_invalid_target();
     ok &= write_bad_target_ok;
     std::printf("[write_invalid_target] %s\n", write_bad_target_ok ? "ok" : "FAIL");
+
+    const bool call_method_ok = test_call_method();
+    ok &= call_method_ok;
+    std::printf("[call_method] %s\n", call_method_ok ? "ok" : "FAIL");
+
+    const bool call_method_unknown_ok = test_call_method_unknown_rejected();
+    ok &= call_method_unknown_ok;
+    std::printf("[call_method_unknown_rejected] %s\n", call_method_unknown_ok ? "ok" : "FAIL");
+
+    const bool call_method_bad_target_ok = test_call_method_invalid_target();
+    ok &= call_method_bad_target_ok;
+    std::printf("[call_method_invalid_target] %s\n", call_method_bad_target_ok ? "ok" : "FAIL");
 
     const bool oversized_ok = test_oversized_rejected();
     ok &= oversized_ok;
