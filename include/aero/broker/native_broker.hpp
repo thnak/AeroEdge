@@ -1172,7 +1172,13 @@ private:
             return true;
         }
 
-        std::vector<std::byte> vh;
+        // 017 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector on every one of
+        // this function's 3 call sites (route_publish's fan-out loop, offline-queue flush, retained
+        // replay) - safe because write_packet() (mqtt_codec.hpp) fully copies its `body` parameter (vh)
+        // into its own owned buffer BEFORE the potentially-blocking send/retry loop starts, so a stalled
+        // recipient socket can never extend vh's "live" window past this function's return.
+        static thread_local std::vector<std::byte> vh;
+        vh.clear();
         aero::transport::mqtt::put_str(vh, topic);
         if (qos > 0) aero::transport::mqtt::put_u16_be(vh, next_packet_id());
 
@@ -1292,11 +1298,21 @@ private:
     // pattern as the old sessions_mu_ snapshot this replaced): topic_index_mu_ is held only long enough to
     // copy shared_ptrs, never while route_publish()'s callers do the actual (possibly blocking) socket
     // writes.
-    [[nodiscard]] std::vector<std::shared_ptr<Session>> topic_index_candidates(const std::string& topic) {
-        std::vector<std::shared_ptr<Session>> out;
+    // 017 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector every publish — safe
+    // because NativeBroker is thread-per-connection (session reader threads) plus the cluster relay path
+    // (BrokerRelayActor, a quark::Sequential actor - confirmed single-in-flight, never reentrant on its own
+    // worker thread), so no thread can call back into this function while a previous call's `out` on that
+    // SAME thread is still being iterated. `out.clear()` MUST run unconditionally on every call, not just
+    // when exact_topic_index_ has a match - a fresh local was always implicitly "cleared" by construction,
+    // but a persistent thread_local isn't, and skipping this would leak a previous call's sessions into a
+    // topic that has none today.
+    [[nodiscard]] const std::vector<std::shared_ptr<Session>>& topic_index_candidates(const std::string& topic) {
+        static thread_local std::vector<std::shared_ptr<Session>> out;
+        out.clear();
         {
             std::lock_guard<std::mutex> g(topic_index_mu_);
-            if (auto it = exact_topic_index_.find(topic); it != exact_topic_index_.end()) out = it->second;
+            if (auto it = exact_topic_index_.find(topic); it != exact_topic_index_.end())
+                out.insert(out.end(), it->second.begin(), it->second.end());
             out.insert(out.end(), wildcard_subscribers_.begin(), wildcard_subscribers_.end());
         }
         std::sort(out.begin(), out.end());

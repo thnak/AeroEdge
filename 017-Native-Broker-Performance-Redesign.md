@@ -891,3 +891,81 @@ real implementation would need a bounded-batch-size cap to avoid.
 | Pooling | N/A (isolated microbench, not integrated) | Real, reproduced independently, cross-checked against real broker numbers | **Worth pursuing** as a Phase 5 candidate |
 | Cache-line padding (`kicked`) | N/A | Real effect exists but at an unrealistic write rate; production write rate is negligible | **Not worth pursuing** |
 | QoS 0 write batching | Sound — avoids all 3 originally-critiqued bugs | Not validated — unconfirmed test config + a real `broker_bench` percentile bug + insufficient repeats | **Design keeper, re-test before trusting any number** |
+
+## Phase 5 — Buffer pooling: shipped, real but smaller than estimated
+
+Turned §4.1's "worth pursuing" pooling finding into a real, scoped
+implementation, following the same critique-before-code discipline used for
+Phase 3. A Plan-agent critique of the draft (full write-up in the approved
+plan) found and the shipped version incorporates three fixes before any code
+was written:
+
+1. **A real bug in the naive description**: `topic_index_candidates()`'s
+   "not found" branch never reset its output vector — harmless when it was a
+   fresh local every call, but would silently leak a previous call's stale
+   sessions into the current one once it became a persistent `thread_local`.
+   Fixed: `out.clear()` now runs unconditionally, before the lookup.
+2. **A reentrancy gap the original draft's analysis missed**:
+   `route_publish()` has a second caller, `deliver_remote_publish()` (the
+   cluster relay path, dispatched from `BrokerRelayActor` on a Quark actor-
+   engine worker thread, not a session's reader thread). Verified safe by
+   reading QuarkCpp's `activation.hpp`: `BrokerRelayActor` is a
+   `quark::Sequential` actor, confirmed single-in-flight (never processes a
+   second message before the first fully completes) — combined with
+   `thread_local` being inherently per-OS-thread, there's no cross-call
+   interference regardless of which thread dispatches into this code.
+3. **A scope cut**: pooling `route_publish()`'s per-candidate `matches`
+   vector (`vector<Subscription>`) was dropped — it only saves the outer
+   vector's own allocation, since each `Subscription` still heap-allocates
+   its own `filter` string on every refill (SSO doesn't cover realistic MQTT
+   topic lengths), a much smaller win than the other two candidates for the
+   same added auditing burden.
+
+**Shipped**: `topic_index_candidates()`'s output vector and `publish_to()`'s
+outbound `vh` buffer are now `static thread_local`, reused across calls
+instead of freshly heap-allocated every time (`publish_to()` covers all 3 of
+its call sites — live fan-out, offline-queue flush, retained replay — not
+just the one originally scoped). `handle_publish`'s `topic`/`payload` and the
+QoS 2 / offline-queue persisted copies remain unpooled, per §4.1's original
+scoping (public extension-hook exposure and genuine cross-call persistence,
+respectively).
+
+**Verification**: full broker test suite green (`native_broker`, `mqtt5`,
+`broker_cluster`, `acl`, `bridge`, `buffered_read_framing`, `mqtt_codec`,
+`native_broker_security`); `concurrency_stress` run 18x independently, 18/18
+clean.
+
+**Real measured result — smaller than the §4.1 estimate, and a genuine
+lesson in machine-noise discipline.** The first measurement pass (interleaved
+baseline-vs-pooled `broker_bench` runs) was unusable: the dev machine had
+heavy concurrent background load (a JetBrains Rider indexing pass, Docker
+Desktop) at the time, and pooled vs. baseline throughput swung both
+directions between rounds with no consistent signal. Per this project's own
+established discipline (§3.4, §4.3), a noisy, direction-flipping comparison
+is not evidence either way — so rather than report it, the background load
+was quiesced and the comparison re-run clean:
+
+| Scenario | Baseline (10 interleaved runs) | Pooled (10 interleaved runs) | Delta |
+|---|---|---|---|
+| QoS 0, 1:1, 300K msgs | mean ≈63,046 msg/s | mean ≈64,957 msg/s (1 early outlier run excluded from the tighter read: ≈66,478 msg/s) | **+3% to +5%** |
+| QoS 1, 1:1, 50K msgs (3 rounds) | mean ≈8,922 msg/s | mean ≈8,727 msg/s | ~flat (within noise, as expected — round-trip-bound) |
+| Shared-topic fan-out, 8 subs × 2 pubs, 5 rounds | mean ≈12,209 msg/s | mean ≈11,971 msg/s | **inconclusive** — noisy in both directions at this scale, no signal either way |
+
+QoS 0's single-connection win is real and directionally consistent (pooled
+ahead in 9 of 10 clean rounds) but **landed at the low end of §4.1's own
+hedged estimate (~10-20%), not the middle of it** — actual measured gain is
+roughly 3-5%. This is not a failure of the investigation: §4.1 explicitly
+flagged this as an *estimate*, not a measurement, and correctly anticipated
+"the real hot path is dominated by mutex locks, topic matching, and the
+actual socket write" diluting the allocation-only ratio — the real number
+just landed lower within that already-acknowledged range than the midpoint
+suggested. The fan-out scenario, where the `vh`-pooling win should scale with
+recipient count, showed no clear signal at this small scale (8 subscribers) —
+plausibly because subscriber-side receive/dispatch cost dominates at this
+size, or because the effect is real but too small to separate from noise in
+a handful of runs; not chased further this round.
+
+**Bottom line**: real, positive, shipped — but a good reminder that an
+isolated microbenchmark's ratio is a ceiling, not a prediction, for the
+integrated system, and that machine noise must be actively controlled for
+(not just disclosed) before a small effect can be trusted at all.
