@@ -990,3 +990,64 @@ tested this round.
 isolated microbenchmark's ratio is a ceiling, not a prediction, for the
 integrated system, and that machine noise must be actively controlled for
 (not just disclosed) before a small effect can be trusted at all.
+
+### 5.1 Independent review (code + results), post-ship
+
+An independent agent (no prior context on this session — read the repo cold)
+reviewed both the shipped diff and this section's write-up, the same
+skeptical-by-default standard used for Phase 4's red-team passes.
+
+**Code: no bug found, safe as shipped.** Every safety claim above was
+re-derived independently rather than trusted: re-confirmed `topic_index_
+candidates()`'s call sites (exactly one), `publish_to()`'s call sites (exactly
+three), that `out.clear()` genuinely runs unconditionally in the shipped
+diff (not just described as fixed), that `write_packet()` really does copy
+`vh` before any blocking I/O, and — read directly from QuarkCpp's
+`activation.hpp` rather than taking the citation on faith — that a
+`quark::Sequential` actor's synchronous `handle()` runs to completion on its
+worker thread before the next mailbox message is even dequeued, closing the
+cluster-relay reentrancy question for real. One non-bug note worth recording:
+because both pooled buffers are `static thread_local` in inline header
+functions, they're one instance **per OS thread for the whole process**, not
+per-`NativeBroker`-instance — harmless under this file's existing no-nested-
+call invariant, but worth knowing if this pattern is ever reused somewhere
+that invariant doesn't hold.
+
+**Results: arithmetic and the reported statistics check out**
+(independently recomputed, not just re-read) **— but the write-up applied
+real statistical scrutiny asymmetrically**, and one methodology gap limits
+how auditable it is. Specifics:
+
+- The reviewer ran the significance test this section never did for QoS 0 —
+  a sign test on win-counts (needs no raw magnitudes, just the counts already
+  reported): QoS 0's 9/10 wins gives P≈0.011 one-tailed (**nominally
+  significant**); the fan-out result's 9/12 wins gives P≈0.073 one-tailed
+  (**not significant** — consistent with the paired t-test above). The
+  qualitative claim this section makes — "QoS 0 solid, fan-out isn't" — is
+  therefore independently corroborated. But this section only ran a
+  statistical test (SD, paired t-test) for the *less* flattering fan-out
+  result, and asserted the *more* flattering QoS 0 result on win-count alone
+  with no equivalent rigor — an asymmetry worth naming even though it didn't
+  change the conclusion here.
+- **No raw per-round `broker_bench` output was preserved anywhere in the
+  repo** for either comparison — only this section's aggregated prose. That
+  means the specific outlier-exclusion calls above (QoS 0's "1 early
+  outlier," fan-out's "4 noise-spike rounds") are not independently
+  re-checkable against a neutral, pre-declared rule (e.g. a fixed z-score/IQR
+  cutoff) from what's committed — only the author's description of them.
+  **Action for future rounds of this doc**: commit the raw run output (even
+  as pasted lines) alongside any aggregated comparison table, so exclusion
+  decisions are falsifiable by a reviewer — exactly the failure mode this
+  project's own red-team process (the `broker_bench.cpp` percentile bug, the
+  CPU-sampling contamination) exists to catch, and this section fell slightly
+  short of its own standard on that front.
+- Minor, non-invalidating: the fan-out sample was explicitly extended from an
+  inconclusive 5-round first pass to 16 rounds specifically because the first
+  pass didn't show a clean result — a mild "optional stopping" pattern. Named
+  here for completeness; it didn't flip the outcome (the larger sample still
+  didn't cross significance and was reported as such), but future rounds
+  should decide sample size in advance where practical.
+- The "landed at the low end of the estimate, not a contradiction of it"
+  framing was checked against §4.1's original text and holds up — the 10-20%
+  figure was labeled an estimate with the same dilution hedge *before* any
+  real measurement existed, so this isn't retroactive softening.
