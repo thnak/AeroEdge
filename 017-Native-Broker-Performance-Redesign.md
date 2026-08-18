@@ -752,3 +752,142 @@ not a 6-core laptop CPU, and (per §3.2) likely represent a different
 connection-count/volume regime than tested here. The volume-dependent
 degradation above is a more interesting lead for closing that gap than raw
 core count is.
+
+## Phase 4 — Next-round candidates: investigated, red-team verified, none shipped
+
+Three candidates raised in review (pooling, cache-line padding, QoS-0-specific
+outbound write batching) were investigated via a workflow: one agent per
+candidate builds a small, isolated, real prototype and measures it (repeated,
+never a single sample), then **two independent adversarial agents per
+candidate** try to refute the finding — the same "prove it, then try to break
+it" discipline used for Phase 3's implementation plan. No production code
+changed as a result of this section; it's a validated punch list for a future
+round. One real bug in `broker_bench` itself *was* found and fixed as a direct
+result (§4.3).
+
+### 4.1 Object/buffer pooling for the PUBLISH hot path — real, worth pursuing
+
+**Investigation:** every PUBLISH today allocates ~6 heap objects on the common
+path (`handle_publish`'s topic/resolved_topic/payload copies, `route_publish`'s
+candidate-session and per-session-matches vectors, `publish_to`'s outbound
+buffer — exact line numbers in the investigation transcript). A standalone
+microbenchmark (no AeroEdge headers, pure `clang++ -O2`) replicated the same
+allocation shapes/sizes: **fresh allocation every iteration averaged
+~890ns/op; a pooled/reused-buffer variant averaged ~38ns/op — a 15-23x
+speedup on the allocation-only slice**, measured 3 independent process runs ×
+3 repeats each (9 samples/variant), with real run-to-run variance
+(2.3-2.7x) openly disclosed rather than cherry-picked.
+
+**Independently re-verified twice more:** once by re-running the agent's exact
+compiled binary myself in a separate process (~882-895ns fresh / ~37-40ns
+pooled, 23.7x — matching the original), and once by two independent red-team
+agents (both marked the finding **not refuted**) who additionally cross-checked
+the allocation-only cost against this doc's own §3.1 broker_bench numbers:
+~0.9-2.0us of allocation cost is ~9-19% of QoS 0's real per-message budget
+(~10.1-10.7us at current throughput) and only ~2-4.5% of QoS 1's (PUBACK-round-
+trip-bound, ~44.5us/message) — independently corroborating the investigator's
+own hedged estimate almost exactly.
+
+**Honest scope:** the 15-23x ratio describes only the allocation slice, not
+the whole hot path (locks, topic matching, and the actual socket write/PUBACK
+round trip aren't modeled). Estimated real-world impact if implemented:
+**roughly 10-20% additional QoS 0 whole-broker throughput, likely negligible
+for QoS 1** — smaller than Phase 3's shipped buffered-reads win, not a
+replacement for it. Not yet attempted end-to-end. **Recommended as a real
+Phase 5 candidate** — next step would be an actual pooled implementation in
+`native_broker.hpp` (thread_local reusable buffers, with real lifetime
+verification against the thread-per-connection model) measured with
+`broker_bench`, not another isolated prototype.
+
+### 4.2 Cache-line padding for `Session::kicked` — investigated, not worth pursuing
+
+**Investigation:** hypothesized that `Session::kicked` (an
+`std::atomic<bool>` written once by a takeover thread, read every drain-loop
+iteration by the owning thread) might suffer false sharing with adjacent
+fields the owning thread mutates constantly (`read_buf`/`subs`/`client_id`).
+A standalone microbenchmark confirmed false sharing is a *real, measurable*
+effect on this hardware **under a pathological, continuously-hammering writer**
+(non-overlapping ~20-40% throughput hit) — but the effect vanished into noise
+at more realistic write rates, and production's actual write rate (`kicked`
+is set **at most once, ever, per superseded session** — not periodic, not
+per-message) sits many orders of magnitude below where the benchmark could
+even detect anything.
+
+**Red team correction (both agents independently found this via
+`offsetof` on the real struct):** the investigation's own claim about *which*
+fields are adjacent to `kicked` was factually wrong. On this ABI, `kicked`
+(offset 312) is a full cache line away from `read_buf`/`subs`/`client_id`
+(offsets 192-279) — its actual neighbors are
+`keep_alive_s`/`clean_session`/`protocol_version`/`session_expiry_interval`/
+`max_packet_size`/`last_activity`/`has_will`, and even the closest "hot"
+candidate (`last_activity`) is written once per *packet*, not once per
+drain-loop *iteration* as the benchmark modeled. This doesn't flip the
+conclusion — if anything it reinforces it — but the original mechanism
+description should not be trusted as-is.
+
+**Verdict: not worth pursuing.** Both red-team agents concurred
+(`refuted: false` on the "don't pursue" recommendation) — the write frequency
+argument alone is sufficient and doesn't depend on the (partly incorrect)
+layout claim.
+
+### 4.3 QoS-0-specific outbound write batching — correctness design is sound, performance claim did NOT survive red-team review
+
+This is the corrected version of the fan-out/outbound-queue idea deferred
+back in §3.0. The investigating agent built a real prototype in an isolated
+worktree (not a microbenchmark — an actual scoped edit to `native_broker.hpp`,
+QoS 0 only): a dedicated `outbox_mu` separate from `io_mu`/`subs_mu`, a
+strict single-flusher FIFO (no leapfrogging), and — critically — it queues
+`{topic, payload, extras}` (the logical message) and **re-runs the real
+Message-Expiry/Maximum-Packet-Size choke points at actual flush time**, not
+at enqueue time. **Code-level correctness holds**: both red-team agents
+independently read the real diff and confirmed all three of §3.0's original
+critique bugs are genuinely avoided by construction.
+
+**But the performance case does not survive review — both red-team agents
+marked it `refuted: true`.** Two independent, serious problems surfaced:
+
+1. **Unconfirmed whether the new code path was even exercised.**
+   `broker_bench` defaults to `--qos 1`, and one `--qos` flag governs both
+   publish and subscribe QoS (the new batching path only activates when
+   *delivered* QoS is 0). None of the investigation's reported run labels
+   record `--qos 0` being passed, and no startup log confirming it was found.
+   If it wasn't, both "baseline" and "prototype" binaries ran the identical,
+   untouched code for every message, and the entire measured differential —
+   including a reported ~140x heavy-load median-latency improvement — would
+   have nothing to do with the change under test.
+2. **A real, confirmed bug in `broker_bench.cpp` itself**: percentiles were
+   computed only over messages that arrived before `--timeout-s` expired, so
+   an incomplete run silently excludes its own slowest deliveries — making
+   *worse-performing, incomplete* runs look *better* on p95/p99 than complete
+   ones. The red team found the reported data matching this pattern exactly
+   (each variant's one incomplete run was its own best-looking p95). **This
+   bug is real and not specific to this one investigation** — it could have
+   silently biased any past or future `broker_bench` run that didn't fully
+   drain within its timeout window. **Fixed directly in `bench/broker/broker_bench.cpp`**:
+   the tool now prints an explicit stderr warning whenever delivery is
+   incomplete, naming the percentiles as survivorship-biased and
+   untrustworthy, instead of silently reporting them. Verified with a real
+   run forced into a 99.8%-complete window — the warning fires correctly.
+3. Beyond those two, the investigation's own heavy-load numbers were n=1
+   (not repeated, "each run costs 60-150s") despite the same investigation's
+   *light*-load data already showing 11-25x run-to-run swings at n=3 — nowhere
+   near enough evidence for the specific multipliers reported.
+
+**Verdict: not ready to promote.** The design itself is a legitimate,
+correctness-sound answer to §3.0's original critique and is worth keeping as
+a starting point — but the measured performance claim needs a clean re-test
+(confirmed `--qos 0`, the now-fixed `broker_bench`, and enough repeats at
+every load level) before it can be trusted either way. The investigation also
+surfaced one real, not-yet-fixed design gap worth carrying forward regardless
+of the numbers: under sustained backlog, a single flusher thread can be
+pinned draining one recipient for an unbounded duration — a different
+monopolization problem than the one §3.0 originally named, and something a
+real implementation would need a bounded-batch-size cap to avoid.
+
+### 4.4 Summary
+
+| Candidate | Design/correctness | Performance claim | Verdict |
+|---|---|---|---|
+| Pooling | N/A (isolated microbench, not integrated) | Real, reproduced independently, cross-checked against real broker numbers | **Worth pursuing** as a Phase 5 candidate |
+| Cache-line padding (`kicked`) | N/A | Real effect exists but at an unrealistic write rate; production write rate is negligible | **Not worth pursuing** |
+| QoS 0 write batching | Sound — avoids all 3 originally-critiqued bugs | Not validated — unconfirmed test config + a real `broker_bench` percentile bug + insufficient repeats | **Design keeper, re-test before trusting any number** |

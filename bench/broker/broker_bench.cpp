@@ -476,6 +476,26 @@ int main(int argc, char** argv) {
         std::printf("latency (ms): min=%.3f p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f (n=%zu)\n",
                     lat.min_ms, lat.p50_ms, lat.p95_ms, lat.p99_ms, lat.max_ms, lat.mean_ms, lat.count);
     }
+    if (total_received < expected_total) {
+        // Percentiles above are computed ONLY over messages that actually arrived before --timeout-s
+        // expired (SubClient::latencies_ns_ is appended to on receipt, nothing else). A run that times out
+        // before every expected message arrives is missing exactly its slowest deliveries (the stragglers
+        // that hadn't landed yet) — so p95/p99/max on an incomplete run are a survivorship-biased sample of
+        // the FASTEST deliveries, not a true tail. This silently makes incomplete runs look BETTER than
+        // complete ones on tail latency, which is backwards. Found via workflow red-team review after it
+        // produced a misleading "better tail latency" reading on a run that was actually the more backed-up
+        // one (017-Native-Broker-Performance-Redesign.md, Phase 4 investigation).
+        std::fprintf(stderr,
+                      "\nWARNING: only %llu/%llu (%.1f%%) expected messages arrived before --timeout-s — "
+                      "the latency percentiles above are SURVIVORSHIP-BIASED (computed only over the "
+                      "fastest-arriving messages) and are NOT comparable to a complete run's percentiles. "
+                      "Re-run with a longer --timeout-s or treat this run's tail latency as untrustworthy.\n",
+                      static_cast<unsigned long long>(total_received),
+                      static_cast<unsigned long long>(expected_total),
+                      expected_total > 0
+                          ? 100.0 * static_cast<double>(total_received) / static_cast<double>(expected_total)
+                          : 100.0);
+    }
 
     return 0;  // informational tool, not a pass/fail gate — the printed numbers are the point
 }
