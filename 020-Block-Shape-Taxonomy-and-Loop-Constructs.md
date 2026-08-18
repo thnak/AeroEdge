@@ -112,6 +112,20 @@ pointless after a terminal sum).
 small, additive schema change (`config_schema.hpp`, `NodeDescriptor`), not a big one, whenever it's
 prioritized.
 
+**Status: backend implemented** (`NodeDescriptor::terminal`, `node.hpp`; `aero.output.sum` is the only
+node flagged so far) — deploy-time enforcement (`validate_terminal_placement`, `flow_compiler.hpp`)
+rejects a terminal node with anything after it, in BOTH linear array-order mode and edges[] graph mode;
+`GET /catalog` now serves the flag (`build_catalog`, `runtime.hpp`). Covered by `tests/core/flow_graph.cpp`
+(reject-not-last / reject-outgoing-edge / accept-non-terminal-mid-chain) and `tests/runtime/catalog.cpp`.
+
+**Studio Cap-shape rendering is deliberately NOT done here.** The catalog's `terminal` flag is typed and
+plumbed through (`catalog.ts`), but actually hiding the bottom tab/handle needs the same
+category-aware-handle + `implicitEdges` fix the (still separate, unmerged) jigsaw-shapes PR
+(`studio/jigsaw-node-shapes`) already built for the analogous Source/target-handle case — doing it again
+here, on `main` without that branch's `jigsawPath`/`bottomTabs` machinery, would either duplicate that
+work or reintroduce the exact react-flow error #008 that work was built to avoid. Natural follow-up once
+that PR lands (or as a small commit on that branch directly).
+
 ## 5. Reporter/Boolean value blocks — the free-text-DSL gap
 
 `aero.rule.expr` and `aero.flow.switch` both take a single free-text `expr` config string (e.g.

@@ -33,6 +33,9 @@ export interface CatalogEntry {
   label: string;
   category: Category;
   fields: FieldSpec[];
+  // 020 §4.3: true for a node type that must be the flow's LAST step (a Cap shape — nothing may follow
+  // it — vs. the default Stack shape). Optional/undefined for driver entries, which don't carry it.
+  terminal?: boolean;
 }
 
 export interface DriverCatalogEntry extends CatalogEntry {
@@ -47,7 +50,7 @@ export interface Catalog {
 
 // The raw `GET /catalog` response shape (runtime.hpp's build_catalog()).
 export interface RawCatalog {
-  nodes: { type_id: string; category: Category; fields: FieldSpec[] }[];
+  nodes: { type_id: string; category: Category; terminal?: boolean; fields: FieldSpec[] }[];
   drivers: { type_id: string; writable: boolean; poll_driven: boolean; fields: FieldSpec[] }[];
 }
 

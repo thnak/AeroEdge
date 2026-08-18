@@ -146,6 +146,31 @@ int main() {
         {"from":"sw","from_port":"true","to":"s1"},{"from":"sw","from_port":"false","to":"s2"},
         {"from":"s1","to":"out"},{"from":"s2","to":"out"}]})");
 
+    // 020 §4.3: aero.output.sum is terminal — nothing may follow it, in EITHER flow shape.
+    expect_reject("terminal-not-last-linear", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"type_id":"aero.source.decode"},
+        {"type_id":"aero.output.sum"},
+        {"type_id":"aero.transform.scale","config":{"factor":2}}]})");
+
+    expect_reject("terminal-has-outgoing-edge", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"id":"src","type_id":"aero.source.decode"},
+        {"id":"sum","type_id":"aero.output.sum"},
+        {"id":"scale","type_id":"aero.transform.scale","config":{"factor":2}}],
+      "edges":[{"from":"src","to":"sum"},{"from":"sum","to":"scale"}]})");
+
+    // A NON-terminal Output (aero.output.mes) staying mid-chain is still legal — the flag must actually
+    // distinguish node types, not blanket-reject anything after any Output.
+    expect_accept("non-terminal-output-mid-chain", R"({
+      "name":"ok","version":"1",
+      "flow":[
+        {"type_id":"aero.source.decode"},
+        {"type_id":"aero.output.mes","config":{"line":"L1"}},
+        {"type_id":"aero.output.sum"}]})");
+
     // Valid graph, no branching — same shape as hello_flow.json but expressed as a graph, proving the
     // edges[] path accepts a well-formed linear graph too, not just the array-order fallback.
     expect_accept("valid-linear-graph", R"({

@@ -35,6 +35,12 @@ struct NodeDescriptor {
     // Default-empty so every existing 2-field `kDesc{...}` brace-init keeps compiling unchanged
     // (same posture as `DriverDescriptor::poll_driven`'s additive default).
     std::span<const FieldSpec> config_fields{};
+    // 020 §4.3: true for a node type that must be the flow's LAST step — a Cap shape (Previous only,
+    // no Next) in the block-taxonomy sense (020 §3), not a Stack. Default-false/additive, same posture
+    // as `config_fields` above — every existing kDesc{...} brace-init keeps compiling unchanged.
+    // aero.output.mes/aero.output.http stay non-terminal (false): they legitimately stay mid-chain as a
+    // non-stopping side effect (012 §4); aero.output.sum is, in practice, always the flow's true end.
+    bool terminal = false;
 };
 
 class INode {

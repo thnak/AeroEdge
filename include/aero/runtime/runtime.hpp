@@ -306,6 +306,7 @@ inline nlohmann::json build_catalog(const NodeRegistry& node_reg, const DriverRe
             case NodeCategory::Rule: j["category"] = "Rule"; break;
             case NodeCategory::Output: j["category"] = "Output"; break;
         }
+        j["terminal"] = d.terminal;  // 020 §4.3: Cap (nothing may follow) vs. Stack shape
         j["fields"] = nlohmann::json::array();
         for (const auto& f : d.config_fields) j["fields"].push_back(field_json(f));
         out["nodes"].push_back(std::move(j));

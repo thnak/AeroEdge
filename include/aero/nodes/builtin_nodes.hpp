@@ -160,7 +160,10 @@ public:
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Output, "aero.output.sum"};  // no config
+    // 020 §4.3: terminal — every real flow so far uses this as the true end of the chain, unlike
+    // aero.output.mes/http which legitimately stay mid-chain (no config, hence the explicit {} before
+    // `true`).
+    static constexpr NodeDescriptor kDesc{NodeCategory::Output, "aero.output.sum", {}, true};
 };
 
 }  // namespace aero::nodes

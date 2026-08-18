@@ -103,6 +103,23 @@ int main() {
                     full_fields ? "ok" : "FAIL");
     }
 
+    // Spot-check (020 §4.3): aero.output.sum is terminal (Cap shape); aero.output.mes/http are NOT
+    // (they legitimately stay mid-chain, 012 §4) — the flag must actually distinguish, not default-true
+    // everywhere.
+    {
+        bool sum_terminal = false, mes_terminal = true, http_terminal = true;
+        for (const auto& n : cat["nodes"]) {
+            const auto id = n.value("type_id", std::string{});
+            if (id == "aero.output.sum") sum_terminal = n.value("terminal", false);
+            else if (id == "aero.output.mes") mes_terminal = n.value("terminal", false);
+            else if (id == "aero.output.http") http_terminal = n.value("terminal", false);
+        }
+        const bool as_expected = sum_terminal && !mes_terminal && !http_terminal;
+        ok &= as_expected;
+        std::printf("[catalog] terminal: sum=%d mes=%d http=%d %s\n", sum_terminal, mes_terminal,
+                    http_terminal, as_expected ? "ok" : "FAIL");
+    }
+
     std::printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

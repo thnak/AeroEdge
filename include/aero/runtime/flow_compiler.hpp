@@ -179,6 +179,36 @@ inline std::expected<void, std::string> validate_tag_writers(
     return {};
 }
 
+// 020 §4.3: a node type flagged NodeDescriptor::terminal (today, only aero.output.sum) must be the
+// flow's LAST step — the Cap shape's "nothing may follow me" (020 §3), enforced here at deploy time for
+// whichever flow shape actually reaches the compiler (both linear array-order and edges[] graph mode).
+inline std::expected<void, std::string> validate_terminal_placement(
+        const schema::Application& app, const std::vector<std::unique_ptr<INode>>& nodes) {
+    if (app.edges.empty()) {
+        // Linear mode: array order IS the DAG — a terminal node may only be the LAST element.
+        for (std::size_t i = 0; i + 1 < nodes.size(); ++i) {
+            if (nodes[i]->descriptor().terminal) {
+                return std::unexpected("node '" + app.flow[i].type_id + "' at flow position " +
+                    std::to_string(i) + " is terminal — nothing may follow it");
+            }
+        }
+        return {};
+    }
+    // Graph mode: a terminal node may not be the source ('from') of any edge.
+    std::unordered_map<std::string, std::size_t> id_to_index;
+    id_to_index.reserve(app.flow.size());
+    for (std::size_t i = 0; i < app.flow.size(); ++i) id_to_index.emplace(app.flow[i].id, i);
+    for (const auto& e : app.edges) {
+        const auto it = id_to_index.find(e.from);
+        if (it == id_to_index.end()) continue;  // unknown-endpoint is order_flow_graph's own error to raise
+        if (nodes[it->second]->descriptor().terminal) {
+            return std::unexpected("node '" + e.from + "' is terminal — nothing may follow it "
+                "(edge to '" + e.to + "')");
+        }
+    }
+    return {};
+}
+
 // The result of ordering a real graph (019 §2): a topological order over app.flow's indices, plus each
 // node's required_label (see CompiledFlow::add) — empty for an unconditional node, or the STATIC
 // "true"/"false" literal for one reached only via a labeled edge from aero.flow.switch.
@@ -336,6 +366,9 @@ inline std::expected<CompiledPlan, std::string> compile_flow(const schema::Appli
     }
     if (!has_output) {
         return std::unexpected("flow has no Output node: the pipeline stages no egress");
+    }
+    if (auto term_ok = validate_terminal_placement(app, plan.nodes); !term_ok) {
+        return std::unexpected(term_ok.error());
     }
 
     if (app.edges.empty()) {
