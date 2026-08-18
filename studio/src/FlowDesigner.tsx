@@ -31,6 +31,7 @@ import { SelfConnectingEdge } from "./SelfConnectingEdge";
 import { SwitchBlockNode, type SwitchBlockNodeData } from "./SwitchBlockNode";
 import { computeCavities, absorbedEdgeIds, attachToCavity, detachFromCavity, type BranchLabel } from "./cavity";
 import { cavityRect, cavityMemberPosition } from "./switchCavityLayout";
+import { parseExpr, collectTagRefs } from "./exprAst";
 
 // 020 §4.2: a switch node renders as a C-block with nested cavities (switchBlock) once a flow has
 // opted into graph mode; in legacy/array-order mode it keeps the plain two-tab jigsaw card (flowNode) —
@@ -104,6 +105,22 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
     setNodes(model.nodes.map((n, idx) => (idx === i ? { ...n, config } : n)));
 
   const app = toApplication(model);
+
+  // 020 §5: tag names to suggest in the expr-tree editor's tag-reference autocomplete. No server-side
+  // tag metadata exists (Modbus/JSON source tag names are payload-dependent, unknowable statically) —
+  // "raw" is the one hardcoded true constant (aero.source.decode's fixed literal tag), plus every tag
+  // name already referenced by some OTHER node's expr in this flow, best-effort and free-text either way.
+  const knownTags = useMemo(() => {
+    const tags = new Set<string>(["raw"]);
+    for (const n of model.nodes) {
+      const expr = n.config?.expr;
+      if (typeof expr === "string") {
+        const parsed = parseExpr(expr);
+        if (parsed.ok) for (const t of collectTagRefs(parsed.tree)) tags.add(t);
+      }
+    }
+    return [...tags].sort();
+  }, [model.nodes]);
 
   // Empty = legacy/array-order mode (same definition toApplication itself uses) — a switch node only
   // gets the C-block treatment once the flow has actually opted into edges[] (020 §4.2).
@@ -301,6 +318,7 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
             entry={catalogEntry(model.nodes[selected].type_id)!}
             config={model.nodes[selected].config ?? {}}
             onChange={(c) => setConfig(selected, c)}
+            knownTags={knownTags}
           />
         ) : (
           <p className="muted">Select a node to configure it.</p>

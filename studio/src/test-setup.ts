@@ -36,13 +36,15 @@ setCatalog({
     { type_id: "aero.rule.expr", category: "Rule",
       fields: [
         { key: "expr", label: "Expression", type: "string", required: true,
-          help: "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop." },
+          help: "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop.",
+          tier2: "expr-tree" },
         { key: "alarm", label: "Alarm event", type: "string", default: "AlarmRaised" },
       ] },
     { type_id: "aero.flow.switch", category: "Rule",
       fields: [
         { key: "expr", label: "Expression", type: "string", required: true,
-          help: "Same DSL as aero.rule.expr. Routes to edges labeled \"true\"/\"false\" — never stops the flow (019 §5)." },
+          help: "Same DSL as aero.rule.expr. Routes to edges labeled \"true\"/\"false\" — never stops the flow (019 §5).",
+          tier2: "expr-tree" },
       ] },
     { type_id: "aero.output.sum", category: "Output", fields: [] },
     { type_id: "aero.output.mes", category: "Output",

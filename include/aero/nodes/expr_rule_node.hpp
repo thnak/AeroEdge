@@ -347,7 +347,8 @@ public:
 
     static constexpr std::array<FieldSpec, 2> kFields{{
         {.key = "expr", .label = "Expression", .type = FieldType::String, .required = true,
-         .help = "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop."},
+         .help = "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop.",
+         .tier2_hint = "expr-tree"},
         {.key = "alarm", .label = "Alarm event", .type = FieldType::String,
          .default_string = "AlarmRaised"},
     }};

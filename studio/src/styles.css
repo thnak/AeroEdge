@@ -154,6 +154,34 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system
 .json { background: #0d141b; border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow: auto; font-size: 12px; max-height: 320px; }
 .regmap table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .regmap th, .regmap td { border: 1px solid var(--line); padding: 2px 4px; }
+
+/* ---- Reporter/Boolean value-block editor (020 §5, ExprTreeEditor.tsx) — Reporter = rounded pill
+   (produces a number), Boolean = hexagon via clip-path (produces true/false), matching Scratch/Blockly's
+   own oval-vs-hexagon shape convention. Colors reuse the existing category palette (no new accent
+   introduced): Reporter borrows cat-transform (arithmetic-flavored), Boolean borrows cat-rule (this
+   feature lives inside aero.rule.expr/aero.flow.switch, both Rule category already amber). ---- */
+.expr-tree { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.expr-block {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+  border: 1.5px solid var(--line); background: #0d141b; font-size: 12px;
+}
+.expr-block-reporter { border-radius: 999px; border-color: var(--cat-transform); }
+.expr-block-boolean {
+  border-color: var(--cat-rule);
+  clip-path: polygon(10px 0%, calc(100% - 10px) 0%, 100% 50%, calc(100% - 10px) 100%, 10px 100%, 0% 50%);
+  padding-left: 16px; padding-right: 16px;
+}
+.expr-block-children { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* Extra ancestor class beats the generic `.field select { width: 100% }` rule (catalog.ts/ConfigForm.tsx's
+   Tier-1 form default), which otherwise wins on specificity and stretches every select/input full-width. */
+.expr-block .expr-kind-select, .expr-block .expr-leaf-input {
+  width: auto; min-width: 44px; padding: 2px 4px; font-size: 12px;
+}
+.expr-block .expr-leaf-input { width: 64px; }
+.expr-tree-actions { margin-top: 2px; }
+.expr-raw { display: flex; flex-direction: column; gap: 6px; }
+.expr-raw-input { width: 100%; font-family: monospace; font-size: 12px; resize: vertical; }
+.expr-raw-actions { display: flex; gap: 6px; }
 .status { display: flex; gap: 18px; flex-wrap: wrap; }
 .status dt { font-size: 11px; color: var(--muted); }
 .status dd { margin: 0; font-size: 16px; }

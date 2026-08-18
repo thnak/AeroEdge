@@ -48,7 +48,8 @@ public:
     static constexpr std::array<FieldSpec, 1> kFields{{
         {.key = "expr", .label = "Expression", .type = FieldType::String, .required = true,
          .help = "Same DSL as aero.rule.expr. Routes to edges labeled \"true\"/\"false\" — never "
-                 "stops the flow (019 §5)."},
+                 "stops the flow (019 §5).",
+         .tier2_hint = "expr-tree"},
     }};
     static constexpr NodeDescriptor kDesc{NodeCategory::Rule, "aero.flow.switch", kFields};
 

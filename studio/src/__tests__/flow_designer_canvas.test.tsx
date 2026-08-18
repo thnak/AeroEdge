@@ -128,3 +128,30 @@ describe("FlowDesigner canvas — graph mode (019 §4)", () => {
     expect(after.edges?.length).toBe(3); // sw->hi and hi->out both dropped
   });
 });
+
+const RULE_APP: Application = {
+  name: "rule-demo",
+  version: "1.0.0",
+  actor: { kind: "edge", key: 1 },
+  flow: [
+    { type_id: "aero.source.decode" },
+    { type_id: "aero.rule.expr", config: { expr: "raw > 50" } },
+    { type_id: "aero.output.sum" },
+  ],
+};
+
+function RuleWrapper() {
+  const [model, setModel] = useState<FlowModel>(() => fromApplication(RULE_APP));
+  return <FlowDesigner model={model} onChange={setModel} />;
+}
+
+describe("FlowDesigner Configure panel — expr-tree editor (020 §5)", () => {
+  it("mounts the block-tree editor, not a plain text input, for a selected rule node's expr field", () => {
+    render(<RuleWrapper />);
+    // Node 0 (Decode) is selected by default; select the rule node's card to see its Configure panel.
+    fireEvent.click(screen.getByText("Expr")); // humanize("aero.rule.expr") -> "Expr"
+    expect(screen.getByText("Greater than (>)")).toBeTruthy(); // the ">" block's kind-select option
+    expect(screen.getByDisplayValue("raw")).toBeTruthy(); // the tag leaf's inline input
+    expect(screen.getByDisplayValue("50")).toBeTruthy(); // the number leaf's inline input
+  });
+});
