@@ -23,7 +23,7 @@
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties deferred, M7.1/M7.2 |
 | M7.1 | MQTT 5 feature properties v1 slice | **Shipped** — Session Expiry Interval TTL, server DISCONNECT reason codes, inbound Topic Alias |
-| M7.2 | MQTT 5 PUBLISH Properties: Message Expiry Interval, Maximum Packet Size, Response Topic, Correlation Data, User Properties, outbound Topic Alias, Shared Subscriptions | **Shipped** — PR A (Message Expiry + Max Packet Size + shared Properties infra), PR B (Response Topic + Correlation Data + User Properties, end-to-end incl. `on_publish()`/`IBridgeSink::publish()` signature changes), PR C (outbound Topic Alias — broker→subscriber compression), PR D (Shared Subscriptions, `$share/<group>/<filter>` round-robin delivery); Enhanced/SASL Auth still deferred |
+| M7.2 | MQTT 5 PUBLISH Properties: Message Expiry Interval, Maximum Packet Size, Response Topic, Correlation Data, User Properties, outbound Topic Alias, Shared Subscriptions, cross-node relay parity | **Shipped** — PR A (Message Expiry + Max Packet Size + shared Properties infra), PR B (Response Topic + Correlation Data + User Properties, end-to-end incl. `on_publish()`/`IBridgeSink::publish()` signature changes), PR C (outbound Topic Alias — broker→subscriber compression), PR D (Shared Subscriptions, `$share/<group>/<filter>` round-robin delivery), PR E (cross-node relay — `BrokerRelayMsg`/`deliver_remote_publish()` now carry the same extras a local delivery does, closing the M6/M7.2 gap PR A-D left); Enhanced/SASL Auth still deferred |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | **Shipped** — RabbitMQ only; Kafka/Pulsar deferred, M8.1/M8.2 |
 | M9 | Multi-protocol southbound (OPC-UA/Modbus) | **Superseded by spec 018** — its own spec, as this row anticipated |
 
@@ -198,7 +198,7 @@ principled exclusions the way v0.1 framed the whole breadth:
 | Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
 | Cluster-link mTLS | **shipped**, opt-in (default disabled) | M5.1, `broker_cluster_security.hpp` over QuarkCpp's ADR-040 `SecureTransport` — no cert rotation/revocation sweep yet |
-| MQTT 5 | **shipped**, protocol negotiation + properties parsing + feature properties through M7.2 PR D | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`/`PropertyWriter`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias; M7.2 PR A adds Message Expiry Interval + Maximum Packet Size enforcement; PR B adds Response Topic + Correlation Data + User Properties end-to-end; PR C adds outbound Topic Alias (compression, broker→subscriber); PR D adds Shared Subscriptions (`$share/<group>/<filter>`, round-robin delivery within a group) — Enhanced/SASL Auth remains deferred |
+| MQTT 5 | **shipped**, protocol negotiation + properties parsing + feature properties through M7.2 PR E | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`/`PropertyWriter`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias; M7.2 PR A adds Message Expiry Interval + Maximum Packet Size enforcement; PR B adds Response Topic + Correlation Data + User Properties end-to-end; PR C adds outbound Topic Alias (compression, broker→subscriber); PR D adds Shared Subscriptions (`$share/<group>/<filter>`, round-robin delivery within a group); PR E extends the SAME extras across a cross-node relay hop (`broker_cluster.hpp`'s `BrokerRelayMsg`), closing a gap M6/M7.2 PR A-D left — Enhanced/SASL Auth remains deferred |
 | RabbitMQ bridge | **shipped** | M8, `RabbitMqBridgeSink` (`broker/rabbitmq_bridge_sink.hpp`) over rabbitmq-c (AMQP 0-9-1); PUBLISH only, no TLS/SASL-EXTERNAL, no publisher confirms |
 | Kafka/Pulsar bridges | backlog | M8.1/M8.2 — needs new third-party deps (librdkafka / pulsar-client-cpp), native-extension-shaped (008) |
 | Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
@@ -367,7 +367,7 @@ adapts to unilaterally. Concretely:
     unestablished alias, gets `0xE0`/`0x94` (Topic Alias invalid) instead of being silently
     dropped or misrouted.
 
-  **M7.2 — PUBLISH Properties (+ Shared Subscriptions), shipped in four PRs:**
+  **M7.2 — PUBLISH Properties (+ Shared Subscriptions, + cross-node relay parity), shipped in five PRs:**
   - **PR A** — shared outbound `PropertyWriter`/`PublishExtras` infra; **Message Expiry Interval**
     (0x02, TTL enforced against `steady_clock` at the `publish_to()` choke point — expired messages
     are dropped instead of delivered, both live and retained-replay paths); **Maximum Packet Size**
@@ -415,6 +415,27 @@ adapts to unilaterally. Concretely:
     independently, i.e. round-robin arbitration only spans LIVE members today — unifying it with the
     offline path is deferred until a real deployment mixes shared subscribers with persistent offline
     sessions.
+
+  - **PR E** — **cross-node relay parity** (017 §4/M6): closes a gap `deliver_remote_publish()`'s own
+    pre-PR-E code comment documented directly — a PUBLISH relayed to another cluster node used to carry
+    only topic/payload/qos, silently dropping Message Expiry Interval, Response Topic, Correlation Data,
+    and User Properties for that hop (PR A already fixed the LOCAL delivery path; the relay path was left
+    behind). `NativeBroker::set_peer_forwarder()`'s callback and `deliver_remote_publish()` both gained a
+    `std::optional<std::chrono::seconds> message_expiry_remaining` parameter (RELATIVE, computed at
+    forward time — an absolute `steady_clock::time_point` would be meaningless once decoded on a peer with
+    a different epoch) plus the existing public `PublishProperties` (Response Topic/Correlation
+    Data/User Properties, already shared with `on_publish()`). `broker_cluster.hpp`'s `BrokerRelayMsg`
+    carries the same fields over the wire — `QUARK_SERIALIZE`'s describe()-based codec has no native
+    `std::optional`/`std::pair` support, so "field present" is threaded as an explicit `has_*` bool
+    alongside its own default, and `user_properties`' (key, value) pairs are wrapped in a small
+    `RelayUserProperty` Described type instead of `std::pair`. **A real constraint found building this**:
+    the richer `BrokerRelayMsg` initially exceeded `quark::detail::MessagePool::kMaxPayload` (192 bytes, a
+    hard per-cell ceiling shared by every actor message type in the process — not something to raise for
+    one broker message) — fixed by reordering the struct's field DECLARATIONS to group the heavy
+    string/vector members together ahead of the small scalars, which minimizes padding without touching
+    wire behavior at all (that's driven entirely by `QUARK_SERIALIZE`'s own listed (tag, member) order, a
+    separate axis from physical struct layout — see `wire.hpp`'s own "tagless bulk-copies fields in the
+    macro's listed order" comment).
 
   **Still deferred:**
   - **Enhanced/SASL Authentication** — the `0xF0` AUTH packet is not implemented; Authentication

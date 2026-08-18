@@ -51,9 +51,11 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -127,14 +129,53 @@ private:
     std::shared_ptr<const std::vector<quark::NodeId>> snapshot_;
 };
 
+// 017 M7.2 PR E: a single MQTT 5 User Property (key, value) — QUARK_SERIALIZE's describe()-based codec
+// (quark/core/wire.hpp) has no native `std::pair` support (only scalars/enums/std::string/std::vector/
+// nested Described types — see wire.hpp's own tagged_value_size()/tagless_value_size() dispatch), so
+// `PublishProperties::user_properties` (a `vector<pair<string,string>>`) is wire-shaped as a
+// `vector<RelayUserProperty>` instead — a nested Described type is exactly the shape wire.hpp's own
+// vector<T> support recurses into for non-trivial elements.
+struct RelayUserProperty {
+    std::string key;
+    std::string value;
+};
+QUARK_SERIALIZE(RelayUserProperty, (1, key), (2, value));
+
 // The cross-node relay message (016): one broadcast PUBLISH, from its originating node to a peer, carrying
 // exactly what `NativeBroker::deliver_remote_publish()` needs to re-run local match-and-deliver there.
+//
+// 017 M7.2 PR E: gained the PUBLISH extras `deliver_remote_publish()`'s OLD banner documented as a known
+// v1 gap (Message Expiry, Response Topic, Correlation Data, User Properties never survived a relay hop).
+// Same `std::pair`-avoidance reasoning as RelayUserProperty above applies to `std::optional<T>` — also
+// unsupported by wire.hpp's describe() codec — so "field present" is threaded as an explicit `has_*` bool
+// alongside its own always-present value/default, rather than `std::optional<T>` itself.
+// `message_expiry_remaining_s` is RELATIVE (seconds remaining as of the moment the ORIGINATING node
+// forwarded it) — an absolute deadline would be meaningless once decoded on a peer with a different
+// `steady_clock` epoch; `NativeBroker::deliver_remote_publish()` re-derives its OWN absolute deadline from
+// this, the same way `handle_publish()` does from an inbound MQTT Message Expiry Interval property.
+// Field DECLARATION order here is a pure sizeof/padding optimization (grouping the heavy
+// string/vector members together, then the small scalars) — it does NOT affect wire behavior, which is
+// driven entirely by QUARK_SERIALIZE's own (tag, member) list below (quark/core/describe.hpp: the
+// tagless fast path bulk-copies fields in the MACRO's listed order, one `ar.field()` call per entry,
+// regardless of the struct's actual physical layout). Kept this way because sizeof(BrokerRelayMsg) is
+// load-bearing: quark::detail::MessagePool::kMaxPayload (192 bytes) is a hard per-cell ceiling shared by
+// every actor message type in the process, not something to raise for one broker message — the field
+// order below is what keeps this struct fitting under that ceiling with the full PUBLISH extras added.
 struct BrokerRelayMsg {
     std::string topic;
     std::vector<std::byte> payload;
+    std::string response_topic;
+    std::vector<std::byte> correlation_data;
+    std::vector<RelayUserProperty> user_properties;
+    std::uint32_t message_expiry_remaining_s = 0;
     std::uint8_t qos = 0;
+    bool has_message_expiry = false;
+    bool has_response_topic = false;
+    bool has_correlation_data = false;
 };
-QUARK_SERIALIZE(BrokerRelayMsg, (1, topic), (2, payload), (3, qos));
+QUARK_SERIALIZE(BrokerRelayMsg, (1, topic), (2, payload), (3, qos), (4, has_message_expiry),
+                (5, message_expiry_remaining_s), (6, has_response_topic), (7, response_topic),
+                (8, has_correlation_data), (9, correlation_data), (10, user_properties));
 
 // The FIXED, well-known ActorId key for the ONE BrokerRelayActor per node (017 M6 brief: not per-topic —
 // the broadcast fanout model means every peer's relay actor is the same target regardless of topic).
@@ -148,7 +189,15 @@ struct BrokerRelayActor : quark::Actor<BrokerRelayActor, quark::Sequential> {
     NativeBroker* broker = nullptr;
 
     void handle(const BrokerRelayMsg& m) noexcept {
-        if (broker) broker->deliver_remote_publish(m.topic, m.payload, m.qos);
+        if (!broker) return;
+        std::optional<std::chrono::seconds> remaining;
+        if (m.has_message_expiry) remaining = std::chrono::seconds{m.message_expiry_remaining_s};
+        PublishProperties props;
+        if (m.has_response_topic) props.response_topic = m.response_topic;
+        if (m.has_correlation_data) props.correlation_data = m.correlation_data;
+        props.user_properties.reserve(m.user_properties.size());
+        for (const RelayUserProperty& p : m.user_properties) props.user_properties.emplace_back(p.key, p.value);
+        broker->deliver_remote_publish(m.topic, m.payload, m.qos, remaining, props);
     }
 };
 
@@ -245,7 +294,11 @@ public:
         }
 
         broker_->set_peer_forwarder([this](std::string_view topic, std::span<const std::byte> payload,
-                                           std::uint8_t qos) { broadcast(topic, payload, qos); });
+                                           std::uint8_t qos,
+                                           std::optional<std::chrono::seconds> message_expiry_remaining,
+                                           const PublishProperties& props) {
+            broadcast(topic, payload, qos, message_expiry_remaining, props);
+        });
         return {};
     }
 
@@ -366,8 +419,31 @@ private:
     // `transport_.send()`. `WireMode::Tagless` is safe here: every node in a static-config cluster runs
     // the same AeroEdge binary, exactly the "matched peer" assumption `DistributedRouter`'s own default
     // peer schema makes (distribution.hpp's `default_peer_schema`).
-    void broadcast(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos) {
-        const BrokerRelayMsg m{std::string(topic), std::vector<std::byte>(payload.begin(), payload.end()), qos};
+    // 017 M7.2 PR E: `message_expiry_remaining`/`props` flatten into BrokerRelayMsg's own has_*-flagged
+    // fields (see that struct's banner for why — no std::optional/std::pair support in the wire codec).
+    void broadcast(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                   std::optional<std::chrono::seconds> message_expiry_remaining,
+                   const PublishProperties& props) {
+        BrokerRelayMsg m;
+        m.topic = std::string(topic);
+        m.payload.assign(payload.begin(), payload.end());
+        m.qos = qos;
+        if (message_expiry_remaining) {
+            m.has_message_expiry = true;
+            m.message_expiry_remaining_s = static_cast<std::uint32_t>(
+                std::max<std::chrono::seconds::rep>(0, message_expiry_remaining->count()));
+        }
+        if (props.response_topic) {
+            m.has_response_topic = true;
+            m.response_topic = *props.response_topic;
+        }
+        if (props.correlation_data) {
+            m.has_correlation_data = true;
+            m.correlation_data = *props.correlation_data;
+        }
+        m.user_properties.reserve(props.user_properties.size());
+        for (const auto& [k, v] : props.user_properties) m.user_properties.push_back(RelayUserProperty{k, v});
+
         const quark::MembershipView v = membership_.view();
         for (quark::NodeId n : v.nodes()) {
             if (n == self_) continue;  // never relay to self — loop prevention starts here too

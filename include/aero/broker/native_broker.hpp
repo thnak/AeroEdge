@@ -224,9 +224,20 @@ public:
     // exactly the loop-prevention invariant). Unset (the default) ⇒ no-op ⇒ single-node behavior is
     // unchanged. `BrokerCluster` (broker_cluster.hpp) is the intended caller: it wires this to broadcast
     // the PUBLISH to every peer node via `DistributedRouter`/`BrokerRelayActor`. Same signature as
-    // `on_publish()` (topic/payload/qos) — no retain flag, mirroring `deliver_remote_publish()` below.
+    // `on_publish()` (topic/payload/qos/props) plus one more parameter — no retain flag, mirroring
+    // `deliver_remote_publish()` below.
+    // 017 M7.2 PR E: gained `message_expiry_remaining` — a RELATIVE duration (seconds remaining as of
+    // THIS call), not the private `PublishExtras::expiry_deadline` absolute time_point (which this public
+    // signature can't even name — `PublishExtras` is a private nested type — and which would be
+    // meaningless on a peer node's own `steady_clock` epoch anyway). `props` (Response Topic/Correlation
+    // Data/User Properties) rides the same public `PublishProperties` shape `on_publish()` already uses.
+    // Before this PR, `deliver_publish()` called the (3-arg) forwarder with none of this — a relayed
+    // PUBLISH silently lost every one of these fields cross-node (see this function's OLD banner, and
+    // `deliver_remote_publish()`'s OLD one below, both now stale/superseded).
     void set_peer_forwarder(std::function<void(std::string_view topic, std::span<const std::byte> payload,
-                                               std::uint8_t qos)> cb) {
+                                               std::uint8_t qos,
+                                               std::optional<std::chrono::seconds> message_expiry_remaining,
+                                               const PublishProperties& props)> cb) {
         peer_forwarder_ = std::move(cb);
     }
 
@@ -240,13 +251,25 @@ public:
     // PUBLISH's retain semantics stay a property of the node the publisher actually dialed — see
     // broker_cluster.hpp's banner for why), or call peer_forwarder_ (the loop-prevention boundary — a
     // relay-delivered PUBLISH is never re-broadcast onward).
-    void deliver_remote_publish(std::string_view topic, std::span<const std::byte> payload,
-                                std::uint8_t qos) {
-        // 017 M7.2 PR B: relayed PUBLISHes never carry Response Topic/Correlation Data/User Properties
-        // yet — same documented v1 cross-node gap PR A already left for Message Expiry (see this
-        // function's own banner above); a future cross-node-relay PR would thread real extras through.
-        if (on_publish_) on_publish_(topic, payload, qos, PublishProperties{});
-        route_publish(std::string(topic), std::vector<std::byte>(payload.begin(), payload.end()), qos);
+    // 017 M7.2 PR E: `message_expiry_remaining`/`props` are the SAME extras `set_peer_forwarder()`'s
+    // callback now hands the sender's own `BrokerCluster::broadcast()` — this is the receiving end.
+    // `message_expiry_remaining` (relative, as forwarded) is turned into a FRESH absolute deadline on
+    // THIS node's own `steady_clock`, exactly like `handle_publish()` does for an inbound MQTT Message
+    // Expiry Interval property — never copies a foreign node's absolute time_point (meaningless here).
+    // Defaulted so a caller that genuinely has nothing more than topic/payload/qos (there are none left
+    // in this tree, but the shape mirrors this file's other extras-optional call sites) still compiles.
+    void deliver_remote_publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                                std::optional<std::chrono::seconds> message_expiry_remaining = std::nullopt,
+                                const PublishProperties& props = {}) {
+        PublishExtras extras;
+        if (message_expiry_remaining) {
+            extras.expiry_deadline = std::chrono::steady_clock::now() + *message_expiry_remaining;
+        }
+        extras.response_topic = props.response_topic;
+        extras.correlation_data = props.correlation_data;
+        extras.user_properties = props.user_properties;
+        if (on_publish_) on_publish_(topic, payload, qos, props);
+        route_publish(std::string(topic), std::vector<std::byte>(payload.begin(), payload.end()), qos, extras);
     }
 
 private:
@@ -1096,7 +1119,19 @@ private:
         route_publish(topic, payload, qos, extras);
         // M6 (017 §4): AFTER local delivery, so a peer's relayed copy can never arrive before this node's
         // own subscribers see it. No-op single-node default (peer_forwarder_ unset) — see set_peer_forwarder().
-        if (peer_forwarder_) peer_forwarder_(topic, payload, qos);
+        // 017 M7.2 PR E: `extras` (Message Expiry, Response Topic, Correlation Data, User Properties) now
+        // rides along too — computed into a RELATIVE remaining duration here (never the absolute
+        // `expiry_deadline` itself, meaningless off this node's own steady_clock) exactly like
+        // publish_to()'s own outbound-wire choke point already does for the MQTT PUBLISH path.
+        if (peer_forwarder_) {
+            std::optional<std::chrono::seconds> remaining;
+            if (extras.expiry_deadline) {
+                const auto delta = std::chrono::duration_cast<std::chrono::seconds>(
+                    *extras.expiry_deadline - std::chrono::steady_clock::now());
+                remaining = delta.count() > 0 ? delta : std::chrono::seconds{0};
+            }
+            peer_forwarder_(topic, payload, qos, remaining, to_publish_properties(extras));
+        }
     }
 
     // Fan out to every connected session with a matching subscription, at min(publish qos, granted
@@ -1405,7 +1440,10 @@ private:
 
     // M6 (017 §4): unset by default (single-node — 100% of Phase 1 through M3 behavior unchanged). Set by
     // BrokerCluster via set_peer_forwarder() to broadcast every locally-originated PUBLISH to peer nodes.
-    std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t)> peer_forwarder_;
+    // 017 M7.2 PR E: signature gained message_expiry_remaining/props — see set_peer_forwarder()'s comment.
+    std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t,
+                       std::optional<std::chrono::seconds>, const PublishProperties&)>
+        peer_forwarder_;
 };
 
 }  // namespace aero::broker
