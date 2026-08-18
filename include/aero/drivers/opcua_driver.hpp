@@ -16,6 +16,31 @@
 // payload — `aero::nodes::JsonParseNode` (nodes/compute_nodes.hpp, "aero.source.json", UNMODIFIED)
 // already decodes exactly that shape into Tags downstream. No new decode node needed.
 //
+// SECURITY POLICIES (M9.4, 018 §8 — the last v1 backlog item): Sign/SignAndEncrypt over a client
+// certificate, i.e. the SecureChannel itself is mutually authenticated by X.509 certs rather than left at
+// MessageSecurityMode::None (the only mode every OTHER PR in this file uses). `OpcUaSecurityConfig`
+// (default-constructed = disabled, `certificate_file` empty) is an OPT-IN, additive fourth constructor
+// argument — every existing call site/deploy config keeps working unchanged. v1 scope, deliberately
+// narrow like every other slice in this file:
+//   - ONE trusted peer certificate (`trusted_server_certificate_file`), not a CA chain/multi-entry trust
+//     store — matches this driver's existing "ONE configured endpoint" posture. A real CA-backed
+//     deployment is backlog, not an oversight.
+//   - Sign or SignAndEncrypt only (both certificate-backed) — MessageSecurityMode::None stays the
+//     zero-config default via the disabled path below; there's no "encrypt but don't authenticate" mode
+//     to opt into, matching how OPC-UA's own SecureChannel security actually works (its cert IS the
+//     channel's identity, not a separate user-auth layer — this is what "cert-based client auth" in the
+//     018 backlog item means: the CLIENT authenticates itself to the server via ITS OWN certificate as
+//     part of establishing the channel, not a session-level X.509 UserIdentityToken, which stays backlog).
+//   - Certificate/key material is loaded from DER files on disk (`certificate_file`/`private_key_file`/
+//     `trusted_server_certificate_file`), mirroring aero/pal/tls.hpp's own `cert_file`/`key_file`
+//     PEM-file convention (mbedTLS's parser auto-detects PEM vs DER) and open62541's own
+//     examples/encryption/client_encryption.c reference client — NOT inline bytes/base64 in deploy JSON,
+//     which would put private key material in a config file that might get logged or committed.
+// REQUIRES the vendored open62541 to be built with UA_ENABLE_ENCRYPTION=MBEDTLS (root CMakeLists.txt) —
+// sharing THIS project's own already-vendored mbedTLS build (017 M5), not a second copy (see
+// cmake/patch_open62541.cmake's banner for why linking two independent mbedTLS static libs into one
+// binary is a real duplicate-symbol hazard, not just wasted size).
+//
 // PAYLOAD BUDGET (006 §4, aero::kMaxFramePayload == 128 — see processing_context.hpp's banner for why):
 // a serialized JSON object of NodeId-string -> number entries is tight against 128 bytes. open() rejects
 // a `node_ids` list whose WORST-CASE serialized size can't fit, using a conservative ~40-bytes-per-entry
@@ -40,6 +65,7 @@
 #include <string>
 #include <vector>
 
+#include "aero/drivers/opcua_security.hpp"
 #include "aero/sdk/driver.hpp"
 #include "nlohmann/json.hpp"
 
@@ -64,11 +90,15 @@ public:
     // `browse_root` (default empty = disabled) switches this instance into BROWSE mode (M9.1 PR G):
     // poll() browses that ONE NodeId's children instead of reading node_ids's scalars. The two modes are
     // mutually exclusive in v1 (open() rejects a config that sets both) — see poll()/browse_once().
-    OpcUaDriver(std::string endpoint, std::vector<std::string> node_ids,
-                std::string browse_root = {}) noexcept
+    // `security` (default-constructed = disabled, see opcua_security.hpp) opts into Sign/SignAndEncrypt
+    // over a client certificate (M9.4, 018 §8) — additive, every existing 3-arg call site keeps working
+    // unchanged at MessageSecurityMode::None.
+    OpcUaDriver(std::string endpoint, std::vector<std::string> node_ids, std::string browse_root = {},
+                OpcUaSecurityConfig security = {}) noexcept
         : endpoint_(std::move(endpoint)),
           node_id_strings_(std::move(node_ids)),
-          browse_root_str_(std::move(browse_root)) {}
+          browse_root_str_(std::move(browse_root)),
+          security_(std::move(security)) {}
 
     ~OpcUaDriver() override { close(); }
 
@@ -96,7 +126,11 @@ public:
 
         client_ = UA_Client_new();
         if (!client_) return DriverStatus::Error;
-        UA_ClientConfig_setDefault(UA_Client_getConfig(client_));
+        if (!apply_security_config(UA_Client_getConfig(client_), security_)) {
+            UA_Client_delete(client_);
+            client_ = nullptr;
+            return DriverStatus::Error;
+        }
 
         backoff_ms_ = kInitialBackoffMs;
         next_attempt_at_ = std::chrono::steady_clock::now();
@@ -509,6 +543,7 @@ private:
     std::string browse_root_str_;   // BROWSE mode (M9.1 PR G): empty == disabled (scalar poll instead)
     bool browse_mode_ = false;      // set from browse_root_str_ in open(), not the constructor
     UA_NodeId browse_root_id_{};    // parsed at open(), cleared at close() — see close()'s guard
+    OpcUaSecurityConfig security_;  // M9.4: empty == disabled (MessageSecurityMode::None)
 
     bool opened_ = false;
     bool connected_ = false;
@@ -529,7 +564,7 @@ namespace aero::drivers {
 class OpcUaDriver final : public IDriver {
 public:
     OpcUaDriver(std::string /*endpoint*/, std::vector<std::string> /*node_ids*/,
-                std::string /*browse_root*/ = {}) noexcept {}
+                std::string /*browse_root*/ = {}, OpcUaSecurityConfig /*security*/ = {}) noexcept {}
 
     DriverStatus open(const DriverConfig& /*cfg*/) noexcept override { return DriverStatus::Error; }
     DriverStatus run(StreamSink<Frame> /*sink*/, StopToken /*stop*/) noexcept override {

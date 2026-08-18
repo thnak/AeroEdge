@@ -47,6 +47,7 @@
 #include <string>
 #include <vector>
 
+#include "aero/drivers/opcua_security.hpp"
 #include "aero/sdk/driver.hpp"
 #include "nlohmann/json.hpp"
 
@@ -64,8 +65,12 @@ namespace aero::drivers {
 
 class OpcUaSubscriptionDriver final : public IDriver {
 public:
-    OpcUaSubscriptionDriver(std::string endpoint, std::vector<std::string> node_ids) noexcept
-        : endpoint_(std::move(endpoint)), node_id_strings_(std::move(node_ids)) {}
+    // `security` (default-constructed = disabled, see opcua_security.hpp) opts into Sign/SignAndEncrypt
+    // over a client certificate (M9.4, 018 §8) — additive, existing 2-arg call sites keep working
+    // unchanged at MessageSecurityMode::None.
+    OpcUaSubscriptionDriver(std::string endpoint, std::vector<std::string> node_ids,
+                             OpcUaSecurityConfig security = {}) noexcept
+        : endpoint_(std::move(endpoint)), node_id_strings_(std::move(node_ids)), security_(std::move(security)) {}
 
     ~OpcUaSubscriptionDriver() override { close(); }
 
@@ -80,7 +85,11 @@ public:
         client_ = UA_Client_new();
         if (!client_) return DriverStatus::Error;
         UA_ClientConfig* client_cfg = UA_Client_getConfig(client_);
-        UA_ClientConfig_setDefault(client_cfg);
+        if (!apply_security_config(client_cfg, security_)) {
+            UA_Client_delete(client_);
+            client_ = nullptr;
+            return DriverStatus::Error;
+        }
         // Shorter than open62541's own 5s defaults for BOTH knobs — a stalled connect/service-call
         // shouldn't eat 5 real seconds before this driver's own bounded backoff (006 §8) even gets a
         // chance to run, and a dead peer that never sends a clean TCP FIN needs an ACTIVE check to be
@@ -315,6 +324,7 @@ private:
     std::string endpoint_;
     std::vector<std::string> node_id_strings_;  // config order; index-paired with node_ids_
     std::uint32_t rate_hz_ = 0;  // unused by this driver (see open())
+    OpcUaSecurityConfig security_;  // M9.4: empty == disabled (MessageSecurityMode::None)
 
     bool opened_ = false;
     UA_Client* client_ = nullptr;
@@ -331,7 +341,8 @@ namespace aero::drivers {
 
 class OpcUaSubscriptionDriver final : public IDriver {
 public:
-    OpcUaSubscriptionDriver(std::string /*endpoint*/, std::vector<std::string> /*node_ids*/) noexcept {}
+    OpcUaSubscriptionDriver(std::string /*endpoint*/, std::vector<std::string> /*node_ids*/,
+                             OpcUaSecurityConfig /*security*/ = {}) noexcept {}
 
     DriverStatus open(const DriverConfig& /*cfg*/) noexcept override { return DriverStatus::Error; }
     DriverStatus run(StreamSink<Frame> /*sink*/, StopToken /*stop*/) noexcept override {

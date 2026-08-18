@@ -70,6 +70,21 @@
 
 namespace aero::runtime {
 
+// M9.4 (018 §8): reads an optional nested "security" JSON object into an OpcUaSecurityConfig — shared by
+// both aero.driver.opcua and aero.driver.opcua_subscribe's factories below. Absent object == every field
+// stays default-constructed == disabled (opcua_security.hpp's own "certificate_file.empty()" gate).
+inline aero::drivers::OpcUaSecurityConfig parse_opcua_security(const nlohmann::json& c) {
+    aero::drivers::OpcUaSecurityConfig sec;
+    const auto it = c.find("security");
+    if (it == c.end() || !it->is_object()) return sec;
+    sec.certificate_file = it->value("certificate_file", std::string{});
+    sec.private_key_file = it->value("private_key_file", std::string{});
+    sec.trusted_server_certificate_file = it->value("trusted_server_certificate_file", std::string{});
+    sec.sign_and_encrypt = it->value("sign_and_encrypt", true);
+    sec.security_policy_uri = it->value("security_policy_uri", std::string{});
+    return sec;
+}
+
 // Populate the registries with the Phase-4 built-in node/driver factories (005 §5). Lives here (not in
 // aero-core/registry.hpp) because it #includes aero-nodes/aero-drivers — the one-way layering (R1)
 // forbids aero-core depending upward on them.
@@ -158,18 +173,24 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // M9b (018 §Multi-protocol southbound): a real OPC-UA client PULL driver (open62541-backed). Config
     // is read straight out of the deploy-time JSON at construction, same reasoning as
     // aero.driver.modbus_tcp above (DriverConfig's narrow fields don't fit this driver's shape either).
+    // M9.4 (018 §8): an optional nested "security" object opts into Sign/SignAndEncrypt over a client
+    // cert (opcua_security.hpp) — absent/empty object == disabled (MessageSecurityMode::None), matching
+    // every deploy config written before M9.4. Cert/key material is loaded from DER FILE PATHS (not
+    // inline bytes in this JSON — see opcua_security.hpp's banner for why).
     driver_reg.register_type("aero.driver.opcua", [](const nlohmann::json& c) {
         return std::make_unique<aero::drivers::OpcUaDriver>(
             c.value("endpoint", std::string{}),
             c.value("node_ids", std::vector<std::string>{}),
-            c.value("browse_root", std::string{}));
+            c.value("browse_root", std::string{}),
+            parse_opcua_security(c));
     });
     // M9.3 (018 §8): OPC-UA Subscriptions/MonitoredItems — the PUSH counterpart to aero.driver.opcua
     // above, a SEPARATE type_id/class (opcua_subscription_driver.hpp's own banner explains why: push vs
     // pull is a different IDriver invocation contract, not a mode flag on one driver).
     driver_reg.register_type("aero.driver.opcua_subscribe", [](const nlohmann::json& c) {
         return std::make_unique<aero::drivers::OpcUaSubscriptionDriver>(
-            c.value("endpoint", std::string{}), c.value("node_ids", std::vector<std::string>{}));
+            c.value("endpoint", std::string{}), c.value("node_ids", std::vector<std::string>{}),
+            parse_opcua_security(c));
     });
     // M9.1 PR H (018 §8): Modbus RTU/serial counterpart to aero.driver.modbus_tcp above — same
     // "register_type" selector and defaults, plus serial-specific fields (port name, baud, parity,
