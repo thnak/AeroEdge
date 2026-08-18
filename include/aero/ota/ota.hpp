@@ -3,22 +3,27 @@
 // UpdateFirmware drives a device through: fetch → VERIFY SIGNATURE → transfer → verify on-device hash →
 // activate → health-check → COMMIT | ROLLBACK (011 §3). Safety invariants made concrete here:
 //   * O1 — no unsigned/unverified image is ever transferred: verify_image() runs BEFORE the first
-//     driver.write(); a tampered image (content changed) or a bad/absent signature is REJECTED, and the
-//     runner returns before ANY byte reaches the device.
+//     driver.write(); a tampered image (content OR claimed version changed) or a bad/absent signature is
+//     REJECTED, and the runner returns before ANY byte reaches the device.
 //   * O2 — every update has a rollback path: the rollback target (the currently-active version) is
 //     recorded + persisted BEFORE activation; a failed health-check auto-invokes driver rollback.
 //   * O4 — OTA progress is durable + resumable: each phase transition is Sync-checkpointed to a Quark
 //     012 Store, so a crash mid-update resumes (resume_ota) rather than bricking the device.
 // THIN-OVER-QUARK (R0): progress durability reuses aero::DurableState over the Quark 012 seam; the
-// device write goes through the fenced IDriver::write() (006 §7 / 011 §5). REAL image signing is a
-// Quark 020 secret/crypto concern (011 §6) and is GATED — verify_image() is a real integrity check (a
-// keyed FNV hash over the content + a checked signature field), NOT production crypto (Ed25519 etc.).
+// device write goes through the fenced IDriver::write() (006 §7 / 011 §5). REAL image signing (011 §6):
+// verify_image()/sign_image() are now REAL ECDSA-P256/SHA-256 asymmetric crypto over mbedTLS's `pk`
+// layer (aero/pal/crypto.hpp) — the same vendored mbedTLS this project already links for TLS — not the
+// keyed-FNV placeholder this file used before that primitive existed. `trust_root` is the PUBLIC key an
+// edge node holds to verify; the matching PRIVATE key (only ever needed offline, at image-build/sign
+// time) never needs to reach a device.
 #pragma once
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "aero/core/persistent_actor.hpp"   // aero::DurableState — Quark 012 durable progress (O4)
+#include "aero/pal/crypto.hpp"              // ecdsa_sign_sha256/ecdsa_verify_sha256 (real asymmetric crypto)
 #include "aero/sdk/driver.hpp"              // IDriver / DeviceCommand — the fenced device-write seam
 #include "quark/core/ids.hpp"
 #include "quark/core/serialize.hpp"
@@ -29,31 +34,36 @@ namespace aero::ota {
 struct OtaImage {
     std::string version;    // firmware version this image installs
     std::string bytes;      // firmware payload
-    std::string signature;  // hex signature over the content, checked before transfer (O1)
+    std::string signature;  // hex-encoded ECDSA-P256/SHA-256 signature, checked before transfer (O1)
 };
 
-// FNV-1a 64: the content hash used for both on-device integrity and signature derivation.
+// FNV-1a 64: STILL used for the on-device transfer-integrity hash (image_hash/device_staged_hash below)
+// — a cheap "did the bytes arrive intact" check, distinct from and unrelated to the cryptographic
+// signature (that job now belongs to aero/pal/crypto.hpp's real ECDSA, not this hash).
 [[nodiscard]] inline std::uint64_t fnv1a64(const std::string& s) noexcept {
     std::uint64_t h = 1469598103934665603ULL;
     for (const unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
     return h;
 }
 
-// A keyed hash "signature" over the image content. GATED stand-in for real asymmetric signing (011 §6,
-// Quark 020): a production adapter verifies an Ed25519/RSA signature against a trust root. This keyed
-// FNV is a REAL, checked integrity+authenticity gate (tamper the bytes or the key and it fails) without
-// pulling a crypto lib offline (R4/R5) — enough to prove O1 end-to-end.
-[[nodiscard]] inline std::string sign_image(const OtaImage& img, std::uint64_t trust_key) noexcept {
-    const std::uint64_t sig = fnv1a64(std::to_string(trust_key) + ":" + std::to_string(fnv1a64(img.bytes)));
-    return std::to_string(sig);
+// Real signature over (version || bytes) — binding the claimed version INTO the signed content so a
+// validly-signed payload can't be replayed under a different claimed version. `signing_key_pem` is the
+// trust root's PRIVATE key (PEM, EC P-256) — an offline/build-time operation. Returns "" on a crypto
+// failure (e.g. AERO_TLS_ENABLED=OFF, or a malformed key), which verify_image() below always rejects.
+[[nodiscard]] inline std::string sign_image(const OtaImage& img, std::string_view signing_key_pem) {
+    auto sig = aero::pal::crypto::ecdsa_sign_sha256(img.version + "\n" + img.bytes, signing_key_pem);
+    return sig.value_or(std::string{});
 }
 
-// Verify the signature against the trust root BEFORE any transfer (O1). Recomputes the content hash
-// from the CURRENT bytes, so a tampered payload no longer matches its signature. A blank/wrong
-// signature also fails. Returns false → the runner rejects the update and transfers nothing.
-[[nodiscard]] inline bool verify_image(const OtaImage& img, std::uint64_t trust_key) noexcept {
-    if (img.signature.empty()) return false;               // unsigned — O1
-    return img.signature == sign_image(img, trust_key);    // tamper/forgery → mismatch — O1
+// Verify the signature against the trust root's PUBLIC key BEFORE any transfer (O1). Recomputes the
+// digest from the CURRENT version + bytes, so a tampered payload OR a claimed-version swap no longer
+// matches its signature. A blank/malformed/wrong signature also fails. Returns false → the runner
+// rejects the update and transfers nothing.
+[[nodiscard]] inline bool verify_image(const OtaImage& img, std::string_view trust_root_public_key_pem) {
+    if (img.signature.empty()) return false;  // unsigned — O1
+    auto ok = aero::pal::crypto::ecdsa_verify_sha256(img.version + "\n" + img.bytes, img.signature,
+                                                       trust_root_public_key_pem);
+    return ok.value_or(false);  // tamper/forgery/malformed → "no match" — O1
 }
 
 // ---- Durable OTA progress (011 §3 idempotent+resumable, O4) --------------------------------------
@@ -139,7 +149,7 @@ private:
 // (O4). Verify runs BEFORE any transfer (O1); the rollback target is persisted BEFORE activation and a
 // failed health-check auto-rolls-back (O2). Returns the outcome + the device's final version.
 template <class Store>
-OtaOutcome run_ota(MockOtaDriver& driver, const OtaImage& image, std::uint64_t trust_key,
+OtaOutcome run_ota(MockOtaDriver& driver, const OtaImage& image, std::string_view trust_root_public_key_pem,
                    Store& store, quark::ActorId id) {
     aero::DurableState<OtaProgress, Store> prog(store, id);
     prog.recover(OtaProgress{});
@@ -153,7 +163,7 @@ OtaOutcome run_ota(MockOtaDriver& driver, const OtaImage& image, std::uint64_t t
     set_phase(OtaPhase::Fetched);
 
     // 2. VERIFY SIGNATURE — before a single byte reaches the device (O1).
-    if (!verify_image(image, trust_key)) {
+    if (!verify_image(image, trust_root_public_key_pem)) {
         set_phase(OtaPhase::Rejected);
         return OtaOutcome{OtaResult::Rejected, driver.current_version(), "", OtaPhase::Rejected};
     }
@@ -202,7 +212,7 @@ OtaOutcome run_ota(MockOtaDriver& driver, const OtaImage& image, std::uint64_t t
 // durable progress makes the update resumable and never leaves the device half-updated with no rollback
 // target. Other mid-phases (pre-activation) safely restart from the top via run_ota.
 template <class Store>
-OtaOutcome resume_ota(MockOtaDriver& driver, std::uint64_t /*trust_key*/, Store& store,
+OtaOutcome resume_ota(MockOtaDriver& driver, std::string_view /*trust_root_public_key_pem*/, Store& store,
                       quark::ActorId id) {
     aero::DurableState<OtaProgress, Store> prog(store, id);
     prog.recover(OtaProgress{});

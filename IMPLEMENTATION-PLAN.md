@@ -186,7 +186,12 @@ Each phase: **Goal · Deliverables · Specs realized · Exit criteria · Quark d
 - **Exit:** a `ProductionFinished` round-trips to a mock MES through the durable outbox (survives an
   MES outage); an OTA rollout canaries → commits with a forced-failure rollback; MQTT/Modbus/OPC UA
   each configurable end-to-end in the Studio and ingesting into a flow.
-- **Quark dep:** delivery/outbox (017), security/secrets (020), governance (022).
+- **Status (011 §7)**: OTA image signing is now REAL asymmetric crypto (ECDSA P-256/SHA-256 over
+  mbedTLS's `pk` layer, `aero/pal/crypto.hpp`) — no longer the keyed-FNV placeholder. The device-side
+  transfer/activate protocol remains `MockOtaDriver` (no specific device family targeted yet); trust-root
+  key custody/rotation is still open (Quark 020).
+- **Quark dep:** delivery/outbox (017), security/secrets (020 — key custody/rotation only; the signing
+  primitive itself is now real, built directly against vendored mbedTLS per 011 §7), governance (022).
 
 ## 5. Cross-cutting workstreams (run continuously, not a phase)
 

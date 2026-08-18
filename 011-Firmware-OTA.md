@@ -87,19 +87,40 @@ Rules:
 |---|---|
 | OTA orchestration state machine (Flow + FleetActor) | **AeroEdge** |
 | Device-side transfer/activate protocol | **AeroEdge driver** (006), per device family |
-| Image signing/verification keys, secrets | Quark 020 (security, secrets, at-rest) |
+| Image signing/verification (asymmetric crypto) | **AeroEdge** (`aero/pal/crypto.hpp`, over the same vendored mbedTLS as TLS — Quark 020 hasn't productionized a primitive yet, same precedent as `aero/pal/tls.hpp`) |
+| Trust-root key custody, rotation, distribution | Quark 020 (security, secrets, at-rest) — still open, §7 |
 | Durable OTA progress | Quark 012 (persistence) |
 | Rate limiting / bandwidth control | Quark 022 (governance) |
 | Fenced single-controller guarantee | Quark 021 (fenced hand-off) |
 | Metrics/tracing of a rollout | Quark 009 (observability) |
 
-## 7. Open questions
+## 7. Implementation status (updated as work ships)
+
+- **Real image signing — shipped.** O1's "signed images only" is now enforced with REAL asymmetric
+  crypto: `aero::ota::sign_image()`/`verify_image()` (`include/aero/ota/ota.hpp`) call
+  `aero::pal::crypto::ecdsa_sign_sha256()`/`ecdsa_verify_sha256()` (`include/aero/pal/crypto.hpp`) — ECDSA
+  P-256 over SHA-256, via mbedTLS's `pk` layer, the SAME vendored mbedTLS this project already links for
+  TLS (`aero/pal/tls.hpp`) — not a second crypto library. This replaces the earlier keyed-FNV-1a hash
+  stand-in. The signed content is `version || bytes` (the claimed version is bound INTO the signature, so
+  a validly-signed payload can't be replayed under a different claimed version — a small hardening beyond
+  the FNV placeholder's scope). `FleetConfig::ota_signing_key_pem`/`ota_trust_root_public_key_pem`
+  (`include/aero/runtime/runtime.hpp`) carry the keypair — PEM, EC P-256 — defaulting to checked-in
+  TEST-ONLY material (same convention as every other `*_TEST_CERTS_DIR` in this tree) that a real
+  deployment overrides. **Still open**: key custody/rotation/distribution itself (§7 below) — this ships
+  the cryptographic PRIMITIVE, not a key-management system.
+- **Device-side transfer/activate protocol — still `MockOtaDriver`, not real.** §3's A/B-slot state
+  machine and §5's safety invariants are proven against a fully-deterministic in-memory mock device
+  (`aero::ota::MockOtaDriver`), not a real firmware-capable driver talking to physical hardware — there is
+  no specific device family in scope to build one against yet (§6, "per device family").
+
+## 8. Open questions
 
 - **Device capability model** — how a driver advertises `supports=ab-slots`, max image
   size, transfer protocol; ties to the device→capability registry (010 §5).
 - **Delta updates** — whether to support binary-delta images to cut transfer size; a driver
   capability + a Transform node, deferred.
-- **Trust root distribution** — how signing keys/roots reach edge nodes and rotate; align
-  with Quark 020/021 bootstrap.
+- **Trust root key custody, rotation, and distribution** — §6/§7's crypto PRIMITIVE is real
+  (ECDSA P-256/SHA-256); how the signing key is generated/held offline and how a fleet's public
+  trust root reaches/rotates on edge nodes is still open — align with Quark 020/021 bootstrap.
 - **MES-initiated vs operator-initiated rollouts** — the `DeployFirmware` entry point may
   originate from MES (012); authorization model TBD with 012.

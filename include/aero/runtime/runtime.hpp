@@ -635,7 +635,8 @@ public:
     // a config-driven list, one call at daemon start (mirrors configure_mes()). Builds a ClusterView
     // scoped to what ONE daemon can honestly see (016 §2.1 — real multi-node membership stays gated on
     // Quark 019/021) and a FleetActor over per-device MockOtaDriver instances (016 §2.2 — real
-    // orchestration policy, but no real firmware-push driver/crypto exists yet, R5).
+    // orchestration policy + real ECDSA-P256 image signing (011 §6, aero/pal/crypto.hpp), but no real
+    // firmware-push DEVICE driver exists yet, R5 — MockOtaDriver's A/B-slot protocol stands in for one).
     struct FleetDeviceConfig {
         std::string id;
         std::string initial_version;
@@ -673,6 +674,23 @@ public:
         std::uint32_t tick_interval_ms = 200;  // real wall-clock cadence for SwimMembership::tick()
     };
 
+    // TEST-ONLY EC P-256 keypair (011 §3/§6, aero/pal/crypto.hpp) — a default so every existing
+    // configure_fleet() caller keeps compiling/working unchanged; NEVER used in production (same
+    // convention as every other checked-in *_TEST_CERTS_DIR material in this tree — generated with
+    // `openssl ecparam -name prime256v1 -genkey -noout` / `openssl ec -pubout`). A real deployment
+    // overrides FleetConfig::ota_signing_key_pem/ota_trust_root_public_key_pem with its own keypair.
+    static constexpr const char* kDefaultOtaSigningKeyPem =
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "MHcCAQEEIOI8Hgmq+AGZP7mjSfqsxVBRsXuC/ffSUOzWnaSYOj9coAoGCCqGSM49\n"
+        "AwEHoUQDQgAEQVB6J9oo1Z+/PPaYwJuwXSUmrZv5+U21d34+EsXvO9IyOx0sTSqv\n"
+        "XyET1vSUqgc71FfeYkXkVbum6q9pUDzoMg==\n"
+        "-----END EC PRIVATE KEY-----\n";
+    static constexpr const char* kDefaultOtaTrustRootPublicKeyPem =
+        "-----BEGIN PUBLIC KEY-----\n"
+        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQVB6J9oo1Z+/PPaYwJuwXSUmrZv5\n"
+        "+U21d34+EsXvO9IyOx0sTSqvXyET1vSUqgc71FfeYkXkVbum6q9pUDzoMg==\n"
+        "-----END PUBLIC KEY-----\n";
+
     struct FleetConfig {
         std::vector<std::string> node_flags;
         std::vector<FleetDeviceConfig> devices;
@@ -680,9 +698,14 @@ public:
         std::size_t ota_canary = 1;
         std::size_t ota_staged = 1;
         std::size_t ota_rate_limit = 1;
-        // A keyed-hash trust root (011 §3, GATED stand-in for real asymmetric signing — see ota.hpp
-        // sign_image()'s own comment). Never a real secret; a production adapter uses Quark 020.
-        std::uint64_t ota_trust_key = 0xA1B2C3D4ULL;
+        // Real ECDSA-P256/SHA-256 trust root (011 §3/§6, aero/pal/crypto.hpp): start_rollout() signs
+        // with ota_signing_key_pem (the trust root's PRIVATE key — an operator/CI posture collapsed
+        // into the daemon for this scope, never sent over the wire) and FleetActor/run_ota verify with
+        // ota_trust_root_public_key_pem (the PUBLIC key, O1). Defaults below are TEST-ONLY material
+        // (generated for this repo, never used in production — same convention as every other
+        // *_TEST_CERTS_DIR in this tree) — a real deployment supplies its own keypair via Quark 020.
+        std::string ota_signing_key_pem = kDefaultOtaSigningKeyPem;
+        std::string ota_trust_root_public_key_pem = kDefaultOtaTrustRootPublicKeyPem;
         ClusterMembershipConfig membership;  // listen_port==0 (default) == single-node mode, unchanged
     };
 
@@ -727,7 +750,8 @@ public:
                 std::vector<aero::cluster::NodeSpec>{aero::cluster::NodeSpec{self_node_id_, node_caps}});
         }
 
-        ota_trust_key_ = cfg.ota_trust_key;
+        ota_signing_key_pem_ = cfg.ota_signing_key_pem;
+        ota_trust_root_public_key_pem_ = cfg.ota_trust_root_public_key_pem;
         ota_ = std::make_unique<aero::ota::FleetActor>(cfg.ota_threshold, cfg.ota_canary, cfg.ota_staged,
                                                        cfg.ota_rate_limit);
 
@@ -863,8 +887,8 @@ public:
             return std::unexpected("fleet not configured");
         }
         aero::ota::OtaImage image{image_version, image_bytes, ""};
-        image.signature = aero::ota::sign_image(image, ota_trust_key_);
-        last_waves_ = ota_->run(image, ota_trust_key_);
+        image.signature = aero::ota::sign_image(image, ota_signing_key_pem_);
+        last_waves_ = ota_->run(image, ota_trust_root_public_key_pem_);
         return {};
     }
 
@@ -1020,7 +1044,8 @@ private:
     aero::cluster::PlacementPlan placement_;
     std::vector<std::unique_ptr<aero::ota::MockOtaDriver>> ota_drivers_;
     std::unique_ptr<aero::ota::FleetActor> ota_;
-    std::uint64_t ota_trust_key_ = 0;
+    std::string ota_signing_key_pem_;
+    std::string ota_trust_root_public_key_pem_;
     std::vector<aero::ota::WaveResult> last_waves_;
 
     // Real multi-node membership (010 §5 follow-up, opt-in via FleetConfig::membership) — all null/

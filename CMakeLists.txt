@@ -367,9 +367,12 @@ add_library(aero::mes ALIAS aero-mes)
 # aero-ota — Firmware OTA (011): the per-device state machine + mock OTA driver (ota.hpp) and the
 # FleetActor staged-rollout policy (fleet.hpp). Durable OTA progress reuses aero-core's DurableState over
 # the Quark 012 seam; the device write goes through the fenced IDriver::write (aero-sdk). No httplib.
+# aero-thirdparty-tls: ota.hpp's real image-signature verify/sign (O1) is aero/pal/crypto.hpp's ECDSA-
+# P256/SHA-256 over mbedTLS's `pk` layer — the SAME vendored mbedTLS aero-drivers/aero-broker already
+# link (one build, not a duplicate); AERO_TLS_ENABLED off compiles crypto.hpp's honest stub instead.
 add_library(aero-ota INTERFACE)
 target_include_directories(aero-ota INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-ota INTERFACE aero-core aero-sdk quark::quark)
+target_link_libraries(aero-ota INTERFACE aero-core aero-sdk quark::quark aero-thirdparty-tls)
 add_library(aero::ota ALIAS aero-ota)
 
 # aero-ext — the HOST side of the extension model (008): the Native `.so` loader (dlopen + INode
