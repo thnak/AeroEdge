@@ -174,6 +174,23 @@ public:
     // as opposed to the fan-out path (already non-blocking even before that fix).
     [[nodiscard]] bool ping_no_wait() { return mqtt::write_packet(fd_, std::byte{0xC0}, {}); }
 
+    // Writes a DISCONNECT and closes the fd immediately after, with no pause in between — races the
+    // broker's own recv() dispatch of this connection's already-written burst against the peer's FIN,
+    // mirroring a real fire-and-forget device that disconnects right after publishing. Deliberately closes
+    // the fd BEFORE stopping/joining the reader thread (unlike close()) — joining first would add a
+    // poll-interval-sized delay between the last write() and the actual close_fd(), which is enough time
+    // for the broker to already drain the burst and never race the FIN against pending data at all.
+    void send_disconnect_and_close() {
+        std::vector<std::byte> disc;
+        (void)mqtt::write_packet(fd_, std::byte{0xE0}, disc);
+        if (fd_ != quark::pal::invalid_fd) {
+            quark::pal::close_fd(fd_);
+            fd_ = quark::pal::invalid_fd;
+        }
+        running_.store(false, std::memory_order_release);
+        if (reader_.joinable()) reader_.join();
+    }
+
     void close() {
         running_.store(false, std::memory_order_release);
         if (reader_.joinable()) reader_.join();
@@ -622,6 +639,57 @@ bool test_stalled_reactor_client_does_not_block_others() {
     return ok;
 }
 
+// (4) Phase 7c regression: a QoS-0 publisher that fires a burst of PUBLISHes back-to-back and then
+// disconnects+closes immediately after (the ordinary shape of a fire-and-forget device) must not lose any
+// of them. Direct regression test for a real bug found via bench/broker/broker_bench.cpp during 7c's own
+// measurement work: on_reactor_ready() treated EPOLLERR/EPOLLHUP as an immediate short-circuit BEFORE
+// draining EPOLLIN. The Windows WSAPoll backend (pal/windows_x86_64/net.hpp) reports POLLHUP alongside
+// POLLRDNORM exactly when a peer writes a final burst and closes right after — the short-circuit discarded
+// data that was already fully received into the kernel socket buffer, silently and permanently. A tiny
+// 1-publisher/1-subscriber QoS-0 burst of 10-50 messages reproduced 20-70% loss well within any timeout
+// before the fix; 100% delivery after. Repeated across several reconnect cycles (not just one shot) since
+// whether a given close races the broker's recv() dispatch depends on OS thread scheduling.
+bool test_burst_then_immediate_disconnect_no_loss() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    static constexpr const char* kTopic = "burst/topic";
+    static constexpr int kMessages = 50;
+    static constexpr int kIterations = 20;
+
+    PlainClient sub;
+    ok &= sub.connect(port, "burst-sub");
+    ok &= sub.subscribe(kTopic, /*qos=*/0);
+
+    for (int iter = 0; iter < kIterations && ok; ++iter) {
+        PlainClient pub;
+        ok &= pub.connect(port, "burst-pub-" + std::to_string(iter));
+        const std::string payload(64, 'x');
+        for (int i = 0; i < kMessages; ++i) ok &= pub.publish(kTopic, payload, /*qos=*/0);
+        pub.send_disconnect_and_close();  // no pause between the last write and close, by design
+
+        int received = 0;
+        for (int i = 0; i < kMessages; ++i) {
+            auto m = sub.wait_publish(2000);
+            if (!m || m->first != kTopic) break;
+            ++received;
+        }
+        if (received != kMessages) {
+            std::fprintf(stderr,
+                         "test_burst_then_immediate_disconnect_no_loss: iter %d got %d/%d (lost %d)\n",
+                         iter, received, kMessages, kMessages - received);
+            ok = false;
+        }
+    }
+
+    sub.close();
+    broker.stop();
+    if (!ok) std::fprintf(stderr, "test_burst_then_immediate_disconnect_no_loss: FAILED\n");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -629,6 +697,7 @@ int main() {
     ok &= test_reactor_roundtrip_qos012();
     ok &= test_mixed_mode_reactor_and_tls();
     ok &= test_stalled_reactor_client_does_not_block_others();
+    ok &= test_burst_then_immediate_disconnect_no_loss();
     std::printf("reactor_migration: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

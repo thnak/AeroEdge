@@ -1328,5 +1328,164 @@ rather than kept as a separate slice — both are "get real throughput/latency n
 reactor path," better done together once `broker_bench` itself is extended to drive reactor sessions
 through a deliberately slow-but-alive subscriber shape.
 
-No further implementation is planned without explicit direction, per this engagement's established
-discipline.
+## Phase 7c — benchmark-grade before/after numbers, and a real message-loss bug found along the way
+
+Took on 7a/7b's last named follow-on: real `broker_bench` numbers for the reactor path, plus 7b.3's
+folded-in benchmark-grade slow-subscriber measurement. Extending the bench tool to actually drive that
+scenario surfaced a genuine, previously-undetected correctness bug in the shipped Phase 7a/7b code — found
+and fixed as part of this round, not a hypothetical caught by inspection.
+
+### 7c.0 Critical fix: `on_reactor_ready()` discarded already-received data on EPOLLHUP
+
+**What broke.** `bench/broker_bench.cpp` was extended with `--slow-subscribers`/`--slow-delay-us` (a real
+recipient that pauses between reads — see 7c.2) to get the benchmark-grade numbers 7b.3 deferred here. The
+very first sanity run — a plain 1 publisher : 1 subscriber, QoS 0, no slow subscriber at all — showed only
+20-80% of a small burst (10-50 messages) ever arriving, **permanently missing, not delayed**: a 60-second
+wait still left 10/50 messages unaccounted for, while the ones that DID arrive had sub-millisecond latency.
+Not a throughput/tuning question — a correctness regression, found by the numbers looking wrong before any
+"before vs after" comparison was even attempted.
+
+**Root cause.** `on_reactor_ready()` (native_broker.hpp) treated `EPOLLERR|EPOLLHUP` as an unconditional
+short-circuit BEFORE ever draining `EPOLLIN`:
+```cpp
+if (events & (EPOLLERR | EPOLLHUP)) {
+    schedule_reactor_teardown(s, /*clean_disconnect=*/false);
+    return;
+}
+...
+if (!(events & EPOLLIN)) return;
+// (read + parse loop below never runs when HUP/ERR was set)
+```
+Traced with targeted `fprintf` instrumentation (added, used to pin down the exact call sequence, then fully
+removed — same throwaway-diagnostic discipline as every prior phase's scratch experiments): a QoS-0
+publisher that fires a burst of PUBLISHes back-to-back and disconnects immediately after (the ordinary shape
+of a fire-and-forget device, and exactly what `bench/broker/broker_bench.cpp`'s own `publish_worker()` does)
+routinely has its **final readiness event report `EPOLLHUP` alongside `EPOLLIN`** — the peer already sent
+its FIN, but there is still unread data sitting in the kernel receive buffer. The Windows `WSAPoll` backend
+(`pal/windows_x86_64/net.hpp`) is more eager to surface this combination than Linux's `epoll` typically is
+for the same condition, but the code's ordering was wrong regardless of platform: short-circuiting on
+HUP/ERR before attempting the read silently discarded real, already-delivered data still sitting in the
+socket buffer, then tore the session down before it could ever be parsed.
+
+**Fix.** Read first; let `recv_some()`'s own return value be authoritative. `EPOLLHUP`/`EPOLLERR` no longer
+skip the read — they only force a teardown when the *subsequent* `recv_some()` call finds nothing left (a
+`would_block()` on a HUP/ERR-flagged dispatch means the peer really is gone; a HUP-flagged dispatch that
+still had data was, correctly, just processed). A HUP/ERR event with real data behind it now gets drained
+exactly as if it had arrived as a plain `EPOLLIN` event; the teardown only fires once there is provably
+nothing left to read.
+
+**Proven discriminating, not just fixed.** `tests/broker/reactor_migration.cpp` gained
+`test_burst_then_immediate_disconnect_no_loss()` — 20 reconnect cycles, each publishing a 50-message,
+64-byte-payload QoS-0 burst and closing the fd immediately (no pause, no reader-thread join first — see the
+test's own comment on why that ordering matters: joining the publisher's reader thread before closing, as
+the client helper's own general-purpose `close()` does, adds just enough delay that the race stopped
+reproducing). Per this engagement's standing "prove the test is discriminating" discipline: the fix was
+temporarily reverted, and the test failed immediately and reliably — 5/5 runs, losing 1 to 15 of 50 messages
+per run on the very first iteration. Restored, re-verified clean 5/5. Full existing suite re-run clean
+afterward: `concurrency_stress` 20x, `reactor_migration` 7x (both via a background run), full project
+`ctest` 45/45.
+
+### 7c.1 `broker_bench` before/after: 1:1, fan-out, and independent-pairs
+
+With the bug fixed, real before/after numbers — "before" is `e188147` (the last commit before Phase 7,
+still thread-per-connection for every session) built in a separate `git worktree` with the exact same
+(extended) `bench/broker_bench.cpp`; "after" is this branch's current head. Same machine, same tool, 3
+rounds per scenario (raw per-round numbers kept below, not just an average, per this doc's own §5.1 action
+item about preserving raw data) — this machine's own noise floor is visible in the round-to-round spread,
+so treat single-round differences smaller than that spread as noise, not signal.
+
+**1 publisher : 1 subscriber, QoS 0, 5,000 messages** (no fan-out, no sharding pressure — the closest thing
+to an apples-to-apples read/write-path comparison):
+
+| | before (msg/s) | after (msg/s) |
+|---|---|---|
+| round 1 | 72,022 | 64,259 |
+| round 2 | 80,595 | 70,277 |
+| round 3 | 62,047 | 65,403 |
+
+No real difference — both land in the same 62-80K msg/s band, consistent with Phase 3's own ~63K msg/s
+QoS-0 ceiling for a single pair. Expected: a single pair has no fan-out and no reactor-vs-thread scheduling
+pressure to speak of; this is the same `try_parse_packet()`/socket-primitive machinery either way.
+
+**1 publisher : 1 subscriber, QoS 1, 5,000 messages** (round-trip-bound — PUBACK pacing means this measures
+per-message latency, not backlog throughput):
+
+| | before (msg/s) | after (msg/s) |
+|---|---|---|
+| round 1 | 10,831 | 15,489 |
+| round 2 | 10,888 | 13,996 |
+| round 3 | 9,286 | 15,584 |
+
+A real, consistent ~40-50% improvement — the reactor path's genuinely non-blocking PUBACK write (Critical
+fix #1, 7a) has less per-message overhead than the old thread's blocking `write_packet()` call even when
+there's no backpressure to speak of.
+
+**Fan-out: 20 subscribers, 4 publishers, 2,000 messages/publisher, QoS 0 (160,000 total deliveries)**:
+
+| | before | after |
+|---|---|---|
+| round 1 | 1.809s, p50=862ms | 3.546s, p50=1772ms |
+| round 2 | 2.087s, p50=903ms | 2.712s, p50=1279ms |
+| round 3 | 2.085s, p50=1032ms | 3.313s, p50=1511ms |
+
+**Real, honest regression at this scale — the single-shard reactor is slower than thread-per-connection for
+aggregate fan-out throughput.** Not a surprise in hindsight: the old model had 4 publisher OS threads each
+doing their own inline fan-out concurrently (real multi-core parallelism, even though each individual write
+was a blocking call); the new model funnels every publisher's inbound reads AND every subscriber's outbound
+writes through the ONE reactor thread — single-core-bound by construction. This is the exact, already-named
+trade this doc's own §2.2 made explicit going in ("default shard count 1-2, single shard used this round")
+and Phase 7a/7b's own scope notes named as deferred ("`IoContext` sharding beyond 1 — explicitly deferred").
+This round makes that trade's cost concrete instead of theoretical: roughly 1.5-2x slower aggregate fan-out
+delivery at this shape. The correctness win (7c.2 below) is real and was previously entirely missing; the
+throughput cost of not yet sharding is now a measured number, not a guess, and is the natural next
+justification for a sharded `IoContext` pool if fan-out throughput at this scale becomes a real requirement.
+
+**Independent pairs (1/2/4/8 pairs, 2,000 msgs/pair, QoS 0)** — models "many concurrent, non-overlapping
+client pairs" rather than shared-topic broadcast:
+
+| pairs | before throughput | before p50 delivery | after throughput | after p50 delivery |
+|---|---|---|---|---|
+| 1 | 49,609 msg/s | 9.4ms | 76,918 msg/s | 7.8ms |
+| 2 | 79,265 msg/s | 9.4ms | 95,309 msg/s | 17.4ms |
+| 4 | 87,362 msg/s | 13.0ms | 203,172 msg/s | 60.7ms |
+| 8 | 112,645 msg/s | 6.0ms (p95=53.8ms) | 294,886 msg/s | 129.2ms (p95=229.2ms) |
+
+Same story as fan-out, from a different angle: publish-side throughput (dominated by each publisher's own
+client-side loop, only indirectly touching broker scheduling) scales BETTER after — the reactor's
+non-blocking inbound absorption keeps up with more concurrent publishers than the old blocking accept path
+did. But delivery latency grows faster after, for the same single-shard reason as the fan-out case above:
+even logically-independent pairs all still funnel through the one reactor thread's total delivery volume.
+
+### 7c.2 The slow-subscriber scenario: the actual point of Phase 6→7, with real numbers
+
+This is the one that matters most — Experiment B's own shape (§2.4), now measured against real production
+code instead of an isolated prototype, using a payload/volume large enough to genuinely exceed default OS
+socket buffers (2048 bytes × 1,500 messages ≈ 3MB — `reactor_migration.cpp`'s own corrected scale; a smaller
+burst was tried first and, exactly as that test file's own comment warns, never actually triggered
+backpressure at all, silently "passing" on both before and after code without testing anything real). 1
+publisher, 5 healthy subscribers, 1 slow subscriber pausing 3ms after every message it receives, same topic.
+
+| | before (thread-per-connection) | after (reactor, this branch) |
+|---|---|---|
+| publish-side throughput | **76 msg/s** (19.674s to publish 1,500 messages) | **10,833 msg/s** (0.138s) — 142x |
+| healthy subscribers' delivery | p50=1,964ms, p99=1,972ms (100% delivered, but throttled to the publisher's own crawl) | p50=9.7ms, p99=11.5ms (100% delivered) — ~200x |
+| slow subscriber's own backlog | p50=3,606ms — 100% delivered | p50=11,637ms — 100% delivered |
+
+This is Phase 6's exact disproven failure mode, reproduced with real numbers against the pre-Phase-7 code: a
+single slow-but-alive recipient throttles the PUBLISHER's own thread (route_publish()'s fan-out loop calls
+the blocking `write_packet()` inline, so it can't return to publish the next message until the slow
+recipient's write finally succeeds), which in turn throttles every OTHER subscriber sharing that publish
+call — 76 msg/s publish-side, ~2-second median delivery latency for subscribers that did nothing wrong.
+After the fix: the publisher is never blocked (142x), healthy subscribers see no measurable effect from the
+slow one (~200x latency improvement, landing at the same few-milliseconds baseline every other scenario in
+this doc shows), and the slow subscriber's own backlog — now genuinely unthrottled by anything except its
+own artificial per-message delay — still arrives 100% complete, proving delayed-not-dropped with real numbers
+instead of only a pass/fail assertion.
+
+### 7c.3 What's still open
+
+`IoContext` sharding beyond 1 remains deferred, now with a real measured cost (7c.1's fan-out/independent-
+pairs numbers) rather than a guess, as its concrete justification if/when aggregate fan-out throughput at
+scale becomes a real requirement. TLS reactor integration (non-blocking handshake step-machine) remains
+unverified and out of scope. No further implementation is planned without explicit direction, per this
+engagement's established discipline.

@@ -608,24 +608,34 @@ private:
     void on_reactor_ready(const std::shared_ptr<Session>& s, std::uint32_t events) {
         if (s->teardown_scheduled.load(std::memory_order_acquire)) return;  // already going away
 
-        if (events & (EPOLLERR | EPOLLHUP)) {
-            schedule_reactor_teardown(s, /*clean_disconnect=*/false);
-            return;
-        }
-
         if (events & EPOLLOUT) {
             std::lock_guard<std::mutex> g(s->io_mu);
             try_drain_reactor_send(s);
         }
         if (s->teardown_scheduled.load(std::memory_order_acquire)) return;  // a hard write error above
 
-        if (!(events & EPOLLIN)) return;
+        // Phase 7c fix: EPOLLHUP/EPOLLERR must NOT short-circuit before draining EPOLLIN. The Windows
+        // WSAPoll backend (pal/windows_x86_64/net.hpp) reports POLLHUP alongside POLLRDNORM whenever a
+        // peer writes a final burst and closes immediately after (the ordinary shape of a QoS-0
+        // fire-and-forget publisher) — tearing down on that combination before reading discarded data
+        // that was already fully received into the kernel socket buffer, a real message-loss bug found via
+        // broker_bench (017 Phase 7c), not a hypothetical: a 1-publisher/1-subscriber QoS-0 burst of just
+        // 10 messages lost ~20-70% of them, permanently, well within any timeout. recv_some()'s own return
+        // value is the authoritative signal (0 = EOF, error = real fault, would-block = nothing left) —
+        // EPOLLHUP/EPOLLERR alone must never skip a read that might still have data behind it.
+        if (!(events & (EPOLLIN | EPOLLHUP | EPOLLERR))) return;
 
         std::byte recv_scratch[4096];
         auto got = std::visit(
             [&](auto& ch) { return ch.recv_some(recv_scratch, sizeof(recv_scratch)); }, s->channel);
         if (!got) {
-            if (got.error() == quark::pal::would_block()) return;  // spurious readiness — nothing to do
+            if (got.error() == quark::pal::would_block()) {
+                // Nothing readable right now. A HUP/ERR-flagged dispatch with genuinely no data left means
+                // the peer is gone — tear down. A HUP flagged alongside IN that we already fully drained
+                // in an earlier call (or a spurious HUP with no IN at all) just waits for the next event.
+                if (events & (EPOLLHUP | EPOLLERR)) schedule_reactor_teardown(s, false);
+                return;
+            }
             schedule_reactor_teardown(s, false);
             return;
         }
