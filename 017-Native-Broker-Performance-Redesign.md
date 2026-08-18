@@ -1051,3 +1051,102 @@ how auditable it is. Specifics:
   framing was checked against §4.1's original text and holds up — the 10-20%
   figure was labeled an estimate with the same dilution hedge *before* any
   real measurement existed, so this isn't retroactive softening.
+
+## Phase 6 — QoS-0 outbound write batching: attempted, reverted, root cause found
+
+§4.3's correctness-sound design (dedicated `outbox_mu`, queuing the logical
+message so choke points re-run at flush time, single-flusher FIFO) was turned
+into a real implementation this round, with a Plan-agent critique run on the
+draft first (matching Phase 3/5's precedent). The critique found and the
+implementation fixed a real bug — a naive item-count cap
+(`kQos0FlushBatchCap`) that clears `flushing` when hit, with nothing resuming
+the drain, would silently strand a backlog forever once traffic to that
+recipient went quiet. The fix: `session_loop()`'s own ~200ms idle-poll
+heartbeat resumes a stalled drain, guaranteeing eventual delivery. The
+critique also accepted a narrow, documented cross-QoS ordering-inversion
+limitation (only manifests under an existing backlog) as out of scope for
+this round.
+
+**Implemented, built, tests passed — then a real regression test (not a
+microbenchmark) revealed the fix doesn't deliver its intended benefit.**
+
+A new broker-integration test drove a realistic scenario: one publisher, one
+healthy (fast-draining) subscriber, one **genuinely slow but alive** subscriber
+(reads continuously, ~8ms artificial delay per message — not a dead
+connection) on the same topic, backlog sized to exceed `kQos0FlushBatchCap`
+several times over. First attempt used a subscriber that never reads its
+socket at all, to force real TCP backpressure — that reproducibly triggered a
+**~90-second stall**, after which the connection permanently stopped
+receiving anything, even once draining started. Verified this is **not** a
+regression from this round's code: the identical test against the pre-Phase-6
+baseline (unmodified, purely synchronous `publish_to()`) showed the exact
+same ~90s-stall-then-permanent-loss symptom. This is a real, pre-existing
+NativeBroker/OS-interaction characteristic under a peer that never drains at
+all — `write_packet()`'s retry loop (`mqtt_codec.hpp`) has no overall
+deadline, only a per-attempt 200ms poll that keeps retrying indefinitely as
+long as the poll itself doesn't error — out of scope for Phase 6 (no queue
+depth helps a peer that will never read again; that needs its own dead-peer
+detection, a separate concern) and not investigated further this round.
+
+The test was corrected to model what Phase 6 actually targets: a subscriber
+slower than the publish rate but genuinely draining. With a small payload
+(256B), the corrected test passed — but so did the **unmodified baseline**,
+meaning it wasn't exercising real backpressure at all (the payload was small
+enough that the OS socket buffer absorbed everything regardless of send
+timing). Scaling the payload up (2048B, ~1MB total burst — enough to
+genuinely exceed typical default OS socket buffers before the slow
+subscriber's ~120 msg/s absorption rate can keep up) produced the real
+result: **the healthy subscriber took 5.9 seconds — almost as long as the
+slow subscriber's 7.8 seconds — with Phase 6's batching code active.** The
+identical test against the unmodified baseline produced statistically
+identical numbers (5.9s / 7.8s). **Batching provided no measurable
+improvement.**
+
+**Root cause, found empirically, not just theoretically:** the
+`kQos0FlushBatchCap` item-count cap bounds how many items a flusher thread
+drains per lap, but does **not** bound the *wall-clock time* of getting
+through even one item when that item's underlying `publish_to()` →
+`write_packet()` call must itself wait for the slow recipient's socket buffer
+to free up. Whichever thread's `enqueue_qos0()` call finds the recipient idle
+— in a single-publisher scenario, this is *every* call, since the same
+thread clears `flushing` at the end of its own drain — becomes the flusher
+and performs the actual blocking send itself. Bounding the *count* of blocking
+sends per lap does nothing to bound their cumulative *duration* when each one
+must wait on the same slow consumer. This is the same fundamental problem
+§4.3's design was meant to solve, re-emerging through the mechanism the fix
+was supposed to close, not the one originally named.
+
+**Why this isn't fixable as a small, provable slice on top of this codebase's
+current thread-per-connection, synchronous-I/O model:** truly decoupling a
+publisher from a slow recipient's drain pace requires a send path that never
+blocks the enqueuing thread — either (a) genuinely non-blocking sends with
+partial-write state tracked per queued item (a real state machine: not-
+started / N-bytes-sent / done, needed because a partial `send_some()` can't
+be un-sent, so a "try once, non-blocking" attempt must track and resume from
+an exact byte offset), or (b) never letting the enqueuing thread send at all,
+relying entirely on the recipient's own session thread — which reintroduces a
+~200ms latency floor for **every** QoS 0 message, healthy recipients
+included, a regression against Phase 3's already-shipped low-latency win.
+Option (a) is real, non-trivial complexity in the same spirit as the
+`IoContext` reactor migration this doc has repeatedly deferred as a separate,
+larger initiative (§1.0, §3.0's own scoping decision) — not something an
+item-count cap can approximate. Option (b) trades one shipped win for another.
+
+**Decision: reverted.** `include/aero/broker/native_broker.hpp` is back to
+its pre-Phase-6 (Phase 5) state; the regression test that found this is not
+carried forward (it doesn't protect anything currently shipped). This is the
+same discipline applied earlier this session to the reverted `std::latch`
+fan-out-pool experiment: when real testing — not just a pre-implementation
+critique — surfaces a design that doesn't deliver its intended benefit,
+revert cleanly and document why, rather than ship something that doesn't
+work or keep patching around a fundamental gap. The critique-agent process
+did its job (caught a real starvation bug before any code shipped); what it
+could not catch, because it was reasoning about the design rather than
+running it, was that the bounded-cap fix itself doesn't bound the dimension
+(wall-clock time, not item count) that actually matters once a slow consumer
+is real rather than hypothetical. **The correctness-sound §4.3 design remains
+a valid starting point for a future round that takes on genuinely
+non-blocking per-item sends** — not a small slice, a real design effort in
+its own right, most naturally scoped together with (or after) the `IoContext`
+reactor migration this doc has named as the eventual right home for
+non-blocking I/O in this broker.
