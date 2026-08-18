@@ -61,6 +61,7 @@
 #include "nlohmann/json.hpp"
 #include "quark/core/actor_ref.hpp"
 #include "quark/core/activation.hpp"
+#include "quark/core/cluster.hpp"  // SwimMembership (021) — configure_fleet()'s optional real membership
 #include "quark/core/engine.hpp"
 #include "quark/core/engine_config.hpp"
 #include "quark/core/ids.hpp"
@@ -225,6 +226,15 @@ public:
         // subsystem was never configured / already stopped).
         if (broker_) broker_->stop();
         if (broker_cluster_) broker_cluster_->stop();
+        // Real cluster membership (010 §5 follow-up): stop the tick thread BEFORE the transport it
+        // drives SwimMembership over — swim_tick_running_ false + join() guarantees no further tick()/
+        // refresh() call can start touching cluster_transport_/cluster_/swim_ once this returns, so
+        // tearing those down after is race-free (mirrors BrokerCluster::stop()'s own ordering rationale).
+        if (swim_tick_thread_.joinable()) {
+            swim_tick_running_.store(false, std::memory_order_release);
+            swim_tick_thread_.join();
+        }
+        if (cluster_transport_) cluster_transport_->stop();
     }
 
     Runtime(const Runtime&) = delete;
@@ -632,6 +642,37 @@ public:
         std::vector<std::string> required_flags;
         std::vector<std::string> preferred_flags;
     };
+    // A known OTHER cluster member this node joins the real SWIM membership through (010 §5 follow-up).
+    // `flags` is that peer's OWN advertised capability set — config-declared, same posture as this
+    // node's own `FleetConfig::node_flags` (capabilities are NOT gossiped; only ALIVENESS is real —
+    // see cluster.hpp's own banner for why that split is the honest v1 scope).
+    struct ClusterMember {
+        quark::NodeId id{};
+        std::string host;
+        std::uint16_t port = 0;
+        std::vector<std::string> flags;
+    };
+
+    // Opt-in real multi-node membership (010 §5 follow-up, Phase-8): swaps `fleet_status()`'s single-
+    // hardcoded-node `ClusterView` for one backed by a real `quark::SwimMembership` (021) — a genuine
+    // SWIM failure detector over a real `TcpTransport`, so "which nodes are alive" becomes an honest,
+    // live answer instead of a config-time fiction. `listen_port == 0` (the default) means disabled:
+    // `configure_fleet()` keeps its exact pre-existing single-node behavior, unchanged.
+    //
+    // WHAT THIS DOES NOT DO (honest scope, matching cluster.hpp's own banner): no capability gossip
+    // (peer flags are config-declared here, not discovered), and — the actually hard part — no cross-
+    // node actor state hand-off. Real fenced migration (010 §3) needs the OLD and NEW node's durable
+    // stores to be the SAME store; neither Quark nor AeroEdge ships a networked/shared store today, so
+    // an actor's placement can be recomputed live but nothing here ever MOVES a running actor or its
+    // state across nodes. This is real-time membership OBSERVABILITY, not migration.
+    struct ClusterMembershipConfig {
+        quark::NodeId self{};
+        std::uint16_t listen_port = 0;  // this node's own SWIM listener (0 == disabled)
+        std::uint64_t cluster_id = 0;
+        std::vector<ClusterMember> seeds;  // other known members to join through
+        std::uint32_t tick_interval_ms = 200;  // real wall-clock cadence for SwimMembership::tick()
+    };
+
     struct FleetConfig {
         std::vector<std::string> node_flags;
         std::vector<FleetDeviceConfig> devices;
@@ -642,6 +683,7 @@ public:
         // A keyed-hash trust root (011 §3, GATED stand-in for real asymmetric signing — see ota.hpp
         // sign_image()'s own comment). Never a real secret; a production adapter uses Quark 020.
         std::uint64_t ota_trust_key = 0xA1B2C3D4ULL;
+        ClusterMembershipConfig membership;  // listen_port==0 (default) == single-node mode, unchanged
     };
 
     std::expected<void, std::string> configure_fleet(const FleetConfig& cfg) {
@@ -653,8 +695,37 @@ public:
         node_flags_ = cfg.node_flags;
         quark::NodeCapabilities node_caps;
         for (const auto& f : cfg.node_flags) node_caps.add(quark::Flag{f});
-        cluster_ = std::make_unique<aero::cluster::ClusterView>(
-            std::vector<aero::cluster::NodeSpec>{aero::cluster::NodeSpec{quark::NodeId{1}, node_caps}});
+
+        if (cfg.membership.listen_port != 0) {
+            // Real multi-node membership (010 §5 follow-up) — see ClusterMembershipConfig's own banner
+            // for exactly what this does and does not provide.
+            self_node_id_ = cfg.membership.self;
+            cluster_transport_ = std::make_unique<aero::transport::TcpTransport>(
+                aero::transport::TcpTransport::Config{self_node_id_, "0.0.0.0", cfg.membership.listen_port, {}});
+            auto tr = cluster_transport_->start();
+            if (!tr) {
+                return std::unexpected("configure_fleet: cluster membership transport failed to start: " +
+                                       tr.error());
+            }
+
+            quark::SwimMembership::Config swim_cfg;
+            swim_cfg.cluster_id = quark::ClusterId{cfg.membership.cluster_id};
+            swim_ = std::make_unique<quark::SwimMembership>(self_node_id_, *cluster_transport_, swim_cfg);
+
+            std::vector<aero::cluster::NodeSpec> nodes;
+            nodes.push_back(aero::cluster::NodeSpec{self_node_id_, node_caps});
+            for (const auto& seed : cfg.membership.seeds) {
+                cluster_transport_->add_peer(seed.id, seed.host, seed.port);
+                quark::NodeCapabilities seed_caps;
+                for (const auto& f : seed.flags) seed_caps.add(quark::Flag{f});
+                nodes.push_back(aero::cluster::NodeSpec{seed.id, seed_caps});
+                swim_->request_join(seed.id);
+            }
+            cluster_ = std::make_unique<aero::cluster::ClusterView>(std::move(nodes), *swim_);
+        } else {
+            cluster_ = std::make_unique<aero::cluster::ClusterView>(
+                std::vector<aero::cluster::NodeSpec>{aero::cluster::NodeSpec{self_node_id_, node_caps}});
+        }
 
         ota_trust_key_ = cfg.ota_trust_key;
         ota_ = std::make_unique<aero::ota::FleetActor>(cfg.ota_threshold, cfg.ota_canary, cfg.ota_staged,
@@ -680,6 +751,37 @@ public:
         }
         placement_ = aero::cluster::place_actors(devs, *cluster_);
         device_actors_ = std::move(devs);
+
+        if (swim_) {
+            // Deferred to here (not started above, before device_actors_/placement_ existed) so the
+            // FIRST tick has real data to recompute placement over — see the loop body's own comment.
+            // SwimMembership::tick() itself does no sleeping ("NO sleeping, NO wall-clock wait" — its
+            // own doc comment); driving the real SWIM protocol period at a real cadence is this
+            // caller's job. 20ms wake-up slices (mirrors Deployment::poller's own pattern, M9.2) so
+            // stop() is observed promptly rather than blocking on the full tick_interval_ms.
+            swim_tick_running_.store(true, std::memory_order_release);
+            swim_tick_thread_ = std::thread([this, interval_ms = cfg.membership.tick_interval_ms] {
+                while (swim_tick_running_.load(std::memory_order_acquire)) {
+                    {
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        swim_->tick();
+                        if (cluster_) {
+                            cluster_->refresh();
+                            // Placement is a pure function of the current view (cluster.hpp) — cheap to
+                            // recompute every tick so a node joining/leaving is reflected in
+                            // fleet_status()'s device assignments, not just its node list.
+                            placement_ = aero::cluster::place_actors(device_actors_, *cluster_);
+                        }
+                    }
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(interval_ms);
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        if (!swim_tick_running_.load(std::memory_order_acquire)) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                }
+            });
+        }
         return {};
     }
 
@@ -692,10 +794,21 @@ public:
             return j;
         }
         j["configured"] = true;
-        nlohmann::json node;
-        node["id"] = 1;
-        node["flags"] = node_flags_;
-        j["nodes"] = nlohmann::json::array({std::move(node)});
+        // `real_membership`: honest flag for WHICH kind of node list follows — a live quark::SwimMembership
+        // view (010 §5 follow-up: genuinely alive/reachable right now) vs. the single-node stand-in
+        // (always just self, unconditionally "alive" by definition).
+        j["real_membership"] = swim_ != nullptr;
+        nlohmann::json nodes = nlohmann::json::array();
+        const quark::MembershipView view = cluster_->membership();
+        for (const quark::NodeId n : view.nodes()) {
+            nlohmann::json nj;
+            nj["id"] = n.value;
+            nj["alive"] = true;  // MembershipView only ever lists currently-alive members (021)
+            if (n.value == self_node_id_.value) nj["flags"] = node_flags_;
+            nodes.push_back(std::move(nj));
+        }
+        j["nodes"] = std::move(nodes);
+        j["epoch"] = view.epoch();
 
         nlohmann::json devices = nlohmann::json::array();
         for (const auto& d : device_actors_) {
@@ -901,6 +1014,7 @@ private:
 
     // Fleet/OTA/placement lifetime (daemon-scoped, set by configure_fleet() above).
     std::vector<std::string> node_flags_;
+    quark::NodeId self_node_id_{1};  // NodeId{1}: matches the pre-M5.1-follow-up single-node default
     std::unique_ptr<aero::cluster::ClusterView> cluster_;
     std::vector<aero::cluster::DeviceActor> device_actors_;
     aero::cluster::PlacementPlan placement_;
@@ -908,6 +1022,13 @@ private:
     std::unique_ptr<aero::ota::FleetActor> ota_;
     std::uint64_t ota_trust_key_ = 0;
     std::vector<aero::ota::WaveResult> last_waves_;
+
+    // Real multi-node membership (010 §5 follow-up, opt-in via FleetConfig::membership) — all null/
+    // idle unless configure_fleet() was given a non-zero listen_port. See ~Runtime() for stop ordering.
+    std::unique_ptr<aero::transport::TcpTransport> cluster_transport_;
+    std::unique_ptr<quark::SwimMembership> swim_;
+    std::thread swim_tick_thread_;
+    std::atomic<bool> swim_tick_running_{false};
 
     // Native MQTT broker lifetime (daemon-scoped, set by configure_broker() above).
     std::unique_ptr<aero::broker::NativeBroker> broker_;

@@ -361,6 +361,17 @@ target_link_libraries(runtime_fleet_wiring PRIVATE aero::api)
 add_test(NAME runtime_fleet_wiring COMMAND runtime_fleet_wiring)
 set_tests_properties(runtime_fleet_wiring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# Phase-8 follow-up gate (010 §10): Runtime::configure_fleet()'s optional REAL multi-node membership
+# (FleetConfig::membership) over a genuine quark::SwimMembership (021) + real loopback TCP — two real
+# Runtime instances converge to seeing each other alive, live device placement follows the real node
+# set, and killing one is detected by the survivor's real SWIM failure detector (not a crash/hang, not
+# a false "still alive" forever). Real (not virtual) SWIM clock, so this test genuinely waits on real
+# ack/suspicion timeouts — not instant, but bounded.
+add_executable(runtime_cluster_membership runtime/runtime_cluster_membership.cpp)
+target_link_libraries(runtime_cluster_membership PRIVATE aero::api)
+add_test(NAME runtime_cluster_membership COMMAND runtime_cluster_membership)
+set_tests_properties(runtime_cluster_membership PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-10 breadth gate (005 §2): the new compute nodes each transform correctly and malformed input is
 # handled without a crash (odd Modbus frame → Error; bad JSON → Error; CRC/mean/minmax/sum values).
 add_executable(breadth_nodes nodes/breadth_nodes.cpp)
