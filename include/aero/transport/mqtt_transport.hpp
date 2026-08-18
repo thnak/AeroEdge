@@ -52,6 +52,14 @@ public:
         int qos = 1;                                       // C3: QoS >= 1, never 0
         std::string topic_prefix = "aero/xport/";          // inbox topic per node: <prefix><toNodeId> (§5)
         std::size_t reorder_window = Resequencer<MessageFrame>::kDefaultWindow;  // §5 shim bound
+        // QoS-1 sender-side retransmit-on-missing-PUBACK (MqttClientTransport only — NullMqttTransport
+        // never sends anything, so these are simply unread there). Defaults match what shipped before
+        // these were configurable; a test wanting fast, deterministic retry/give-up timing (rather than
+        // waiting out the real ~15s default give-up window) sets smaller values, same idea as
+        // `reorder_window` above being tunable rather than a hardcoded constant.
+        int puback_timeout_ms = 3000;       // resend (with DUP set) if no PUBACK within this long
+        int max_publish_retries = 5;        // then give up: 1 initial send + this many retries
+        int retry_check_interval_ms = 250;  // how often the retry thread wakes to scan for stale sends
     };
 
     explicit MqttTransport(Config cfg) : cfg_(std::move(cfg)) {}

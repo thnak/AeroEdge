@@ -296,6 +296,17 @@ target_compile_definitions(mqtt_transport PRIVATE
 add_test(NAME mqtt_transport COMMAND mqtt_transport)
 set_tests_properties(mqtt_transport PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL" TIMEOUT 120)
 
+# 014 §5: MqttClientTransport's QoS-1 sender-side retransmit-on-missing-PUBACK (closes that file's former
+# TODO) — a hand-rolled fake broker (real loopback TCP, no uv/amqtt dependency, always runs) withholds/
+# never-sends PUBACK on demand to prove: a withheld first ack triggers a DUP-flagged retransmit that then
+# succeeds, and a never-acked PUBLISH is retried exactly Config::max_publish_retries times before being
+# abandoned. Deterministic; Config's retry timings are tuned down for fast CI runtime (real defaults would
+# make the give-up case take ~15s).
+add_executable(mqtt_transport_retry transport/mqtt_transport_retry.cpp)
+target_link_libraries(mqtt_transport_retry PRIVATE aero::transport)
+add_test(NAME mqtt_transport_retry COMMAND mqtt_transport_retry)
+set_tests_properties(mqtt_transport_retry PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-7 REAL-gRPC gate (014 §6, X2): the hand-written GrpcClientTransport (its OWN HTTP/2 + gRPC framing,
 # no gRPC library linked) exchanges genuine MessageFrames with a REAL grpcio bidi server (spawned via uv)
 # over an actual HTTP/2 stream — the server decodes each frame with AeroEdge's codec + echoes swapped,

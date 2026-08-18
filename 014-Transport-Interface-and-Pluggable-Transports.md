@@ -119,6 +119,13 @@ networks) but can all reach a broker, actor frames tunnel through MQTT:
   reconnect / clean-session. The adapter therefore stamps a per-`(from→to)` sequence number and
   **resequences** on receive, dropping duplicates — restoring the FIFO Quark demands. This shim is
   mandatory, not optional.
+- **QoS-1 sender-side retransmit — shipped** (`MqttClientTransport`, `mqtt_client_transport.hpp`).
+  Every QoS-1 PUBLISH is tracked until its PUBACK arrives; a dedicated retry thread resends
+  (DUP-flagged, MQTT 3.1.1 §3.3.1.1) anything unacked past `Config::puback_timeout_ms`, and gives up
+  after `Config::max_publish_retries` — never retrying forever against a peer that isn't going to ack.
+  Deliberately narrow: this resends over the SAME still-connected socket only — no reconnect-and-
+  resume; persistent-session recovery (and TLS, and MQTT 5) remain separate, unshipped concerns for
+  this adapter, noted at their sites in `mqtt_client_transport.hpp`'s own file banner.
 - **The broker is untrusted for authz.** TLS to the broker (C5) protects the hop; actor-level
   authorization is still Quark 020 principal propagation carried in the frame — a compromised broker
   can delay/replay (mitigated by seq + dedup) but cannot forge an authorized actor message.

@@ -21,14 +21,30 @@
 //
 // SCOPE (honest): a compact, correct MQTT 3.1.1 client — enough control packets to connect, subscribe,
 // and exchange QoS-1 PUBLISHes reliably against a conforming broker on a healthy link. It does NOT
-// implement QoS-1 sender-side retransmit-on-missing-PUBACK, TLS, MQTT 5, or persistent-session recovery
-// (all real-build concerns noted at their sites). The wire framing, topic scheme, QoS, and the C1 shim —
-// the parts this phase is about — are real and exercised end-to-end.
+// implement TLS, MQTT 5, or persistent-session recovery (all real-build concerns noted at their sites —
+// see mqtt_transport.hpp's own §5 writeup). The wire framing, topic scheme, QoS, and the C1 shim — the
+// parts this phase is about — are real and exercised end-to-end.
+//
+// QoS-1 SENDER-SIDE RETRANSMIT (closes this file's own former TODO, `send()`'s old comment): every QoS-1
+// PUBLISH this node sends is tracked in `inflight_` (packet id -> the exact bytes sent + when) until its
+// PUBACK arrives (handled in reader_loop(), which erases the entry). A dedicated `retry_thread_` — NOT
+// piggybacked on reader_loop(), which blocks INSIDE the shared mqtt_codec.hpp::read_n()'s own internal
+// poll-and-retry loop with no hook to run other work between polls (that loop is shared with NativeBroker
+// and deliberately not touched here) — wakes every `cfg_.retry_check_interval_ms`, resends (with the DUP
+// flag set, MQTT 3.1.1 §3.3.1.1) any entry older than `cfg_.puback_timeout_ms`, and after
+// `cfg_.max_publish_retries` failed attempts gives up: drops the entry and counts it via
+// `send_errors()`/`publish_gaveup()` rather than retrying forever against a peer that's never going to ack
+// (a dead/misbehaving broker, not a reachability blip). Timings are Config knobs, not hardcoded constants
+// (mqtt_transport.hpp), the same way `reorder_window` already is — a test trades the real ~15s default
+// give-up window for a fast, deterministic one instead of waiting it out. Scoped narrowly, matching the
+// file's own honest-subset posture: this resends over the SAME still-connected socket only — no
+// reconnect-and-resume (that stays persistent-session recovery, still explicitly out of scope above).
 //
 // OFF THE HOT PATH (R0): optional aero-transport backend; std threads/containers, no 0-alloc discipline.
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -88,10 +104,12 @@ public:
         if (auto e = mqtt_subscribe_inbox(); !e) return e;  // SUBSCRIBE(inbox) → SUBACK
 
         reader_thread_ = std::thread([this] { reader_loop(); });
+        retry_thread_ = std::thread([this] { retry_loop(); });
         return {};
     }
 
-    // Graceful teardown: stop the reader, DISCONNECT, close the socket, join. Idempotent; run by dtor.
+    // Graceful teardown: stop the reader/retry threads, DISCONNECT, close the socket, join. Idempotent;
+    // run by dtor.
     void stop() {
         if (!running_.exchange(false, std::memory_order_acq_rel)) return;
         if (fd_ != quark::pal::invalid_fd) {
@@ -100,6 +118,7 @@ public:
             (void)quark::pal::send_some(fd_, disc, sizeof(disc));
         }
         if (reader_thread_.joinable()) reader_thread_.join();
+        if (retry_thread_.joinable()) retry_thread_.join();
         if (fd_ != quark::pal::invalid_fd) {
             quark::pal::close_fd(fd_);
             fd_ = quark::pal::invalid_fd;
@@ -123,16 +142,37 @@ public:
         put_u16_be(vh, pid);                             // QoS 1 ⇒ packet identifier present
         vh.insert(vh.end(), payload.begin(), payload.end());
 
-        // fixed header: PUBLISH (0x30) | QoS1 (0x02). No retransmit-on-missing-PUBACK (real-build TODO).
-        if (write_packet(std::byte{0x32}, vh))
+        // fixed header: PUBLISH (0x30) | QoS1 (0x02). Tracked in inflight_ BEFORE the write so a PUBACK
+        // that (implausibly, but not impossibly on a fast loopback broker) arrives before this function
+        // returns can never race ahead of its own bookkeeping — retry_thread_ finding a not-yet-actually-
+        // sent entry just means its first resend attempt is a no-op-equivalent (the write already
+        // succeeded), never a missed retransmit.
+        {
+            std::lock_guard<std::mutex> g(inflight_mu_);
+            inflight_.emplace(pid, InFlightPublish{vh, std::chrono::steady_clock::now(), 0});
+        }
+        if (write_packet(std::byte{0x32}, vh)) {
             frames_sent_.fetch_add(1, std::memory_order_relaxed);
-        else
+        } else {
             send_errors_.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> g(inflight_mu_);
+            inflight_.erase(pid);  // never wrote — nothing to retry, and no PUBACK will ever name this pid
+        }
     }
 
     void on_receive(std::function<void(MessageFrame)> cb) override { cb_ = std::move(cb); }
 
     // --- diagnostics -----------------------------------------------------------------------------------
+    // Successful QoS-1 retransmits (a resend that eventually got PUBACK'd or is still in flight) and
+    // permanently-abandoned ones (kMaxPublishRetries exhausted with no PUBACK ever — folded into
+    // send_errors() too, since it IS a send that ultimately failed, but broken out here for tests/ops that
+    // want to distinguish "never even got a first ack cycle" from "actually gave up after retrying").
+    [[nodiscard]] std::uint64_t publish_retransmits() const noexcept {
+        return retransmits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t publish_gaveup() const noexcept {
+        return gaveup_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] std::uint64_t frames_sent() const noexcept { return frames_sent_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t frames_received() const noexcept { return frames_recv_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t send_errors() const noexcept { return send_errors_.load(std::memory_order_relaxed); }
@@ -223,9 +263,24 @@ private:
             const std::uint8_t type = pkt->type_flags & 0xF0;
             if (type == 0x30) {
                 handle_publish(*pkt);
+            } else if (type == 0x40) {
+                handle_puback(*pkt);
             }
-            // 0x40 PUBACK (our QoS-1 ack), 0xD0 PINGRESP, others: nothing to do on this reduced client.
+            // 0xD0 PINGRESP, others: nothing to do on this reduced client.
         }
+    }
+
+    // The far side of send()'s QoS-1 handshake: our own PUBLISH got acked, so it needs no more retries.
+    // A PUBACK for a pid NOT in inflight_ (already acked, or already given-up-on by retry_thread_) is a
+    // harmless no-op — MQTT 3.1.1 doesn't forbid a redundant/late PUBACK, and this client never re-sends
+    // a stale packet id (packet_id_ is monotonic-with-wraparound, not reused within any plausible in-
+    // flight window).
+    void handle_puback(const Packet& pkt) {
+        if (pkt.body.size() < 2) return;
+        const std::uint16_t pid = (std::to_integer<std::uint8_t>(pkt.body[0]) << 8) |
+                                   std::to_integer<std::uint8_t>(pkt.body[1]);
+        std::lock_guard<std::mutex> g(inflight_mu_);
+        inflight_.erase(pid);
     }
 
     // Parse an inbound PUBLISH: [topic][packet-id if QoS>0][ 8B seq | frame bytes ]. PUBACK if QoS 1,
@@ -291,23 +346,85 @@ private:
         return id == 0 ? packet_id_.fetch_add(1, std::memory_order_relaxed) : id;  // MQTT packet id != 0
     }
 
+    // ===== QoS-1 sender-side retransmit (see this file's own banner) ==================================
+    // Timings live in cfg_ (mqtt_transport.hpp's Config — puback_timeout_ms/max_publish_retries/
+    // retry_check_interval_ms), not hardcoded constants, so a test can trade the real ~15s default
+    // give-up window for a fast, deterministic one — same reasoning as `reorder_window` already being
+    // tunable there.
+
+    struct InFlightPublish {
+        std::vector<std::byte> vh;  // the exact variable-header+payload bytes send() built (never DUP'd)
+        std::chrono::steady_clock::time_point last_sent_at;
+        int retry_count = 0;
+    };
+
+    // Wakes every cfg_.retry_check_interval_ms (sleep-based, not tied to any socket event — this class
+    // has no other periodic-tick mechanism: reader_loop() blocks INSIDE mqtt_codec.hpp's shared
+    // read_n(), which has no hook to interleave other work between its own internal polls, see this
+    // file's banner). Resends anything stale with the DUP flag set; abandons anything that's exhausted
+    // its retry budget.
+    void retry_loop() {
+        while (running_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.retry_check_interval_ms));
+            if (!running_.load(std::memory_order_acquire)) break;
+
+            const auto now = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::uint16_t, std::vector<std::byte>>> to_resend;
+            std::vector<std::uint16_t> to_abandon;
+            {
+                std::lock_guard<std::mutex> g(inflight_mu_);
+                for (auto& [pid, entry] : inflight_) {
+                    if (now - entry.last_sent_at < std::chrono::milliseconds(cfg_.puback_timeout_ms)) continue;
+                    if (entry.retry_count >= cfg_.max_publish_retries) {
+                        to_abandon.push_back(pid);
+                        continue;
+                    }
+                    ++entry.retry_count;
+                    entry.last_sent_at = now;
+                    to_resend.emplace_back(pid, entry.vh);
+                }
+                for (std::uint16_t pid : to_abandon) inflight_.erase(pid);
+            }
+
+            // Actual socket I/O happens OUTSIDE inflight_mu_ — write_packet() takes io_mu_ instead, and
+            // holding both at once is never necessary (this loop never needs io_mu_ to touch inflight_).
+            for (auto& [pid, vh] : to_resend) {
+                (void)pid;
+                // fixed header: PUBLISH (0x30) | QoS1 (0x02) | DUP (0x08) — MQTT 3.1.1 §3.3.1.1: DUP MUST
+                // be set on a redelivery of an unacknowledged QoS-1 PUBLISH.
+                if (write_packet(std::byte{0x3A}, vh)) retransmits_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!to_abandon.empty()) {
+                gaveup_.fetch_add(to_abandon.size(), std::memory_order_relaxed);
+                send_errors_.fetch_add(to_abandon.size(), std::memory_order_relaxed);
+            }
+        }
+    }
+
     NodeId self_;
     quark::pal::fd_t fd_ = quark::pal::invalid_fd;
     std::atomic<bool> running_{false};
     std::function<void(MessageFrame)> cb_;  // set once, before start()
 
     std::thread reader_thread_;
+    std::thread retry_thread_;
     std::mutex io_mu_;   // serializes all socket writes (packet atomicity)
 
     std::mutex seq_mu_;  // guards next_seq_ + resequencers_
     std::unordered_map<std::uint64_t, std::uint64_t> next_seq_;                 // per-dest send counter
     std::unordered_map<std::uint64_t, Resequencer<MessageFrame>> resequencers_; // per-source reorder buffer
 
+    std::mutex inflight_mu_;  // guards inflight_ — touched by send() (insert), reader_loop() (erase on
+                              // PUBACK), and retry_thread_ (resend/erase-on-give-up)
+    std::unordered_map<std::uint16_t, InFlightPublish> inflight_;
+
     std::atomic<std::uint16_t> packet_id_{1};
     std::atomic<std::uint64_t> frames_sent_{0};
     std::atomic<std::uint64_t> frames_recv_{0};
     std::atomic<std::uint64_t> send_errors_{0};
     std::atomic<std::uint64_t> dupes_{0};
+    std::atomic<std::uint64_t> retransmits_{0};
+    std::atomic<std::uint64_t> gaveup_{0};
 };
 
 }  // namespace aero::transport
