@@ -97,6 +97,14 @@ public:
         if (reader_.joinable()) reader_.join();
     }
 
+    // Companion to stop_reading(): restarts draining on the SAME still-open connection. Used to prove the
+    // eventual-delivery half of the head-of-line-blocking fix (Experiment B's own two-part shape) — a
+    // backed-up recipient's queued backlog must not be silently dropped, only delayed.
+    void resume_reading() {
+        running_.store(true, std::memory_order_release);
+        reader_ = std::thread([this] { reader_loop(); });
+    }
+
     [[nodiscard]] bool subscribe(const std::string& filter, std::uint8_t qos = 1) {
         std::vector<std::byte> vh;
         mqtt::put_u16_be(vh, next_id());
@@ -588,6 +596,23 @@ bool test_stalled_reactor_client_does_not_block_others() {
     // A healthy PUBLISHER's own subsequent traffic must also stay unaffected (route_publish()'s fan-out
     // loop itself must not have stalled on the backed-up recipient either).
     ok &= pub.publish(kTopic, "tail-message", 0);
+
+    // Experiment B's OTHER half (§2.4): a backed-up recipient must be slow, not starved — its queued
+    // backlog must eventually arrive in full once it resumes draining, not be silently dropped. Proves
+    // the non-blocking outbound queue (out_queue/out_current, try_drain_reactor_send()) actually delivers
+    // everything it accepted, it just does so asynchronously across however many EPOLLOUT events it takes.
+    stalled.resume_reading();
+    int stalled_received = 0;
+    for (int i = 0; i < kBurstCount + 1; ++i) {  // +1 for the tail-message above
+        auto m = stalled.wait_publish(5000);
+        if (!m || m->first != kTopic) break;
+        ++stalled_received;
+    }
+    if (stalled_received != kBurstCount + 1) {
+        std::fprintf(stderr, "test_stalled_reactor_client_does_not_block_others: stalled recipient got %d/%d (backlog was dropped, not just delayed)\n",
+                     stalled_received, kBurstCount + 1);
+        ok = false;
+    }
 
     stalled.close();
     for (auto& h : healthy) h.close();

@@ -1254,5 +1254,79 @@ a p50/p99 latency measurement). Two follow-on slices remain explicitly open, mat
   multi-core scaling), machine-noise controlled, raw per-round data preserved (closing §5.1's own
   documented action item).
 
+## Phase 7b — bounded/chained fan-out continuation: measured necessary, shipped, and delivery-completeness
+proven
+
+Took on the first of 7a's two named follow-ons — the second (7c's full `broker_bench` before/after
+numbers) remains open.
+
+### 7b.0 "Prove before building": is the continuation even needed?
+
+Rather than assume `voice_channel.hpp`'s bounded/chained-`post()` pattern was necessary at whatever scale
+this broker actually sees, a throwaway scratch measurement (not part of the shipped suite, removed after
+concluding) answered it directly first: M reactor sessions subscribed to a fan-out topic, one unrelated
+"bystander" reactor session on a different topic pinging continuously, a publisher (itself dispatched on
+the reactor thread) fanning out to the M sessions while the bystander's PINGREQ→PINGRESP latency was
+measured throughout.
+
+**Result: real, measurable degradation at large fan-out, negligible at small.** Bystander ping latency has
+a noisy ~14-16ms baseline on this machine/harness (client-side polling granularity, not a broker property —
+irrelevant to the comparison, which is baseline-vs-during-fanout on the SAME harness). At N=10-1,000
+fan-out recipients, during-fanout max stayed within that same ~16ms baseline band — no measurable
+degradation, `enqueue_reactor_publish()`'s own per-item cost is genuinely cheap. At **N=3,000, max spiked
+to 79.3ms; at N=8,000, max spiked to 62.5ms** — both well above the ~16ms baseline ceiling, consistent with
+thousands of uninterrupted per-item mutex-lock-plus-one-non-blocking-syscall operations (each on the order
+of microseconds) accumulating into tens of milliseconds of uninterrupted reactor-thread work, during which
+no OTHER reactor session's readiness (including the bystander's own PINGREQ arriving) could be serviced.
+**Conclusion: real at large fan-out, not a theoretical concern — worth building.**
+
+### 7b.1 What shipped
+
+`route_publish()` now branches on the calling thread up front (`caller_on_reactor_thread`, computed once):
+- **Reactor-thread callers** (a reactor session's own PUBLISH, dispatched inline from its `ReadyHandler`):
+  build the flat delivery list once (unchanged `topic_index_candidates()` + `subs_mu` scan — every
+  candidate still scanned exactly as before, delivery semantics unchanged), then hand it to
+  `route_publish_reactor_batch()` — processes up to `kMaxFanoutInlinePerCall` (256) deliveries inline, and
+  if more remain, chains via `reactor_io_.post()` instead of continuing the loop, letting other reactor
+  sessions' readiness interleave between batches. `deliveries` (holding `shared_ptr<Session>` per entry)
+  moves through the chain rather than being copied at each hop — the same "snapshot, hold for the fan-out's
+  duration" idiom `topic_index_candidates()` itself already uses, just possibly spanning more than one
+  reactor loop iteration. A session torn down mid-chain is not a race: `enqueue_reactor_publish()`/
+  `enqueue_legacy_handoff()` both already treat a closed fd as an ordinary send error (schedules teardown,
+  never crashes) — unchanged from 7a.
+- **Any other calling thread**: the original 7a inline loop, completely unbounded/unchained — a legacy
+  thread's own fan-out only ever blocks its own dedicated thread, so there was never anything to bound
+  there, and 7b doesn't touch that path.
+
+256 was chosen directly from 7b.0's own measurement: a single item's cost sits in the low-microseconds
+range, so a 256-item inline batch stays in the tens-of-microseconds range — small enough that even several
+back-to-back batches (a very large fan-out, chained across many `post()` hops) never individually
+reproduces the tens-of-milliseconds spike the unbounded version showed.
+
+### 7b.2 Verification
+
+Re-ran the SAME scratch measurement from 7b.0 against the shipped code: **N=3,000 max dropped from 79.3ms
+to 16.8ms; N=8,000 max dropped from 62.5ms to 16.0ms** — both now sitting right at the same ~14-16ms
+baseline-noise ceiling every other fan-out size already showed, i.e. no measurable degradation at any
+tested scale from 10 to 8,000 recipients. Full existing broker suite green; `concurrency_stress` run 20x
+clean (this change touches new concurrency surface — moving a `shared_ptr<Session>`-holding delivery list
+through a chain of posted continuations — so this repeat was not skipped); full project `ctest` (45/45)
+green.
+
+`tests/broker/reactor_migration.cpp`'s stalled-client test was extended to prove the OTHER half of
+Experiment B's claim, not just "healthy stays fast": after asserting all 5 healthy subscribers receive the
+full 500-message burst promptly, the stalled client resumes draining and must receive its own full backlog
+(500 messages + 1 tail message) — proving a backed-up reactor recipient's queued items are delayed, never
+silently dropped. Re-run 7x clean.
+
+### 7b.3 What's still open
+
+The benchmark-grade "slow-but-alive subscriber, real p50/p99 numbers against healthy subscribers" half of
+Experiment B's own shape (as opposed to this round's pass/fail correctness assertions) remains unmeasured
+against production code, and is folded into **7c**'s scope (real `broker_bench` before/after numbers)
+rather than kept as a separate slice — both are "get real throughput/latency numbers out of the shipped
+reactor path," better done together once `broker_bench` itself is extended to drive reactor sessions
+through a deliberately slow-but-alive subscriber shape.
+
 No further implementation is planned without explicit direction, per this engagement's established
 discipline.

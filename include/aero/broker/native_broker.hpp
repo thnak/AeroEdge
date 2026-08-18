@@ -1537,11 +1537,23 @@ private:
     // filter), so delivery semantics — including per-session duplicate delivery for overlapping
     // subscriptions — are byte-for-byte unchanged; only which sessions get scanned at all has changed.
     //
-    // 017 Phase 7: the fan-out dispatch is now a 3-way split by (recipient kind, calling thread) — the
-    // 4th cell of the design doc's dispatch table ("any non-reactor-loop thread" -> legacy recipient) IS
-    // this function's original unchanged inline publish_to() call, so it collapses into the `else` below.
-    // `caller_on_reactor_thread` is computed ONCE per route_publish() call, not per-candidate: the calling
-    // thread doesn't change mid-loop. The 3 kinds:
+    // 017 Phase 7b: bounds how many recipients a single reactor-thread call processes inline before
+    // yielding the reactor loop to other ready fds via a chained reactor_io_.post() continuation — mirrors
+    // quark::net::voice_channel.hpp's own cited rule ("bounded, chained IoContext::post() continuation —
+    // never inline", proven there by ADR-030's negative control). A real measurement this round (a
+    // throwaway scratch experiment, not part of the shipped suite) showed an UNBOUNDED inline fan-out loop
+    // causes a genuine latency spike for an unrelated reactor session sharing the thread once fan-out size
+    // reaches the thousands (max ping latency ~16ms baseline -> ~60-80ms at 3,000-8,000 recipients) — each
+    // item's own work (a mutex lock + one non-blocking syscall attempt) is cheap, but thousands of them in
+    // one uninterrupted call add up to tens of milliseconds the reactor loop can't service anyone else
+    // during. 256 keeps a worst-case inline batch in the same tens-of-microseconds range this round's
+    // measurement put a single item at, times a couple hundred. Only applies when the CALLING thread is
+    // the reactor thread — a legacy thread's own inline loop only ever blocks its own thread, unaffected.
+    static constexpr std::size_t kMaxFanoutInlinePerCall = 256;
+
+    // 017 Phase 7: the fan-out dispatch is a 3-way split by (recipient kind, calling thread) — the 4th
+    // cell of the design doc's dispatch table ("any non-reactor-loop thread" -> legacy recipient) IS this
+    // function's original unchanged inline publish_to() call for that case. The 3 kinds:
     //   - reactor-managed recipient (any calling thread): enqueue_reactor_publish() — never blocks.
     //   - legacy recipient, caller IS the reactor thread: MUST NOT call blocking publish_to() inline (would
     //     freeze every other reactor session) — hands off to the bounded, persistent worker pool instead
@@ -1550,24 +1562,40 @@ private:
     //   - legacy recipient, caller is any other thread (a legacy session's own thread, or the
     //     BrokerRelayActor cluster-relay worker thread — both grouped here since neither is the reactor
     //     loop thread): today's unchanged inline blocking publish_to() call, exactly as before this phase.
+    //
+    // When the calling thread IS the reactor thread, the delivery list is built once (same
+    // topic_index_candidates() + subs_mu scan as before — every candidate still scanned exactly as
+    // before, so delivery semantics are unchanged) and then handed to route_publish_reactor_batch() below
+    // for the bounded/chained dispatch (7b). A non-reactor-thread caller's own inline loop is left
+    // completely unbounded/unchained, exactly as in 7a — it only ever blocks its own dedicated thread.
     void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
                        const PublishExtras& extras = {}) {
         const bool caller_on_reactor_thread = is_on_reactor_thread();
-        for (const auto& session : topic_index_candidates(topic)) {
-            std::vector<Subscription> matches;
-            {
+        if (caller_on_reactor_thread) {
+            std::vector<std::pair<std::shared_ptr<Session>, std::uint8_t>> deliveries;
+            for (const auto& session : topic_index_candidates(topic)) {
                 std::lock_guard<std::mutex> g(session->subs_mu);
                 for (const Subscription& sub : session->subs)
-                    if (topic_matches(sub.filter, topic)) matches.push_back(sub);
+                    if (topic_matches(sub.filter, topic))
+                        deliveries.emplace_back(session, qos < sub.qos ? qos : sub.qos);
             }
-            for (const Subscription& sub : matches) {
-                const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
-                if (session->is_reactor_session) {
-                    enqueue_reactor_publish(session, topic, payload, deliver_qos, /*retain=*/false, extras);
-                } else if (caller_on_reactor_thread) {
-                    enqueue_legacy_handoff(session, topic, payload, deliver_qos, /*retain=*/false, extras);
-                } else {
-                    (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false, extras);
+            route_publish_reactor_batch(topic, payload, extras, std::move(deliveries), /*offset=*/0);
+        } else {
+            for (const auto& session : topic_index_candidates(topic)) {
+                std::vector<Subscription> matches;
+                {
+                    std::lock_guard<std::mutex> g(session->subs_mu);
+                    for (const Subscription& sub : session->subs)
+                        if (topic_matches(sub.filter, topic)) matches.push_back(sub);
+                }
+                for (const Subscription& sub : matches) {
+                    const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
+                    if (session->is_reactor_session) {
+                        enqueue_reactor_publish(session, topic, payload, deliver_qos, /*retain=*/false,
+                                                extras);
+                    } else {
+                        (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false, extras);
+                    }
                 }
             }
         }
@@ -1583,6 +1611,38 @@ private:
                 break;  // one queued copy per client-id even if multiple subs match the same topic
             }
         }
+    }
+
+    // 017 Phase 7b: processes up to kMaxFanoutInlinePerCall deliveries starting at `offset`, then — if
+    // more remain — chains via reactor_io_.post() rather than continuing the loop inline, so a large
+    // fan-out interleaves with other reactor sessions' readiness events instead of hogging the loop for
+    // its entire duration. Always runs on the reactor thread (the only caller, route_publish() above,
+    // only reaches here when already on it; each chained continuation is itself a posted task, which also
+    // always runs on the reactor thread) — so `enqueue_reactor_publish()`'s and `enqueue_legacy_handoff()`'s
+    // own thread-safety doesn't even need marshaling here specifically, though both remain safe to call
+    // from any thread regardless (unchanged from 7a). `deliveries` is captured by value / moved through
+    // the chain (shared_ptr<Session> entries — the same "snapshot, hold for the fan-out's duration" idiom
+    // topic_index_candidates() itself already uses, just spanning possibly more than one reactor loop
+    // iteration here); a session torn down mid-chain is safe, not a race — enqueue_reactor_publish() and
+    // the legacy hand-off path both tolerate a closed fd/already-torn-down session as an ordinary send
+    // error, never a crash (see try_drain_reactor_send()'s hard-error handling).
+    void route_publish_reactor_batch(const std::string& topic, const std::vector<std::byte>& payload,
+                                     const PublishExtras& extras,
+                                     std::vector<std::pair<std::shared_ptr<Session>, std::uint8_t>> deliveries,
+                                     std::size_t offset) {
+        const std::size_t end = std::min(offset + kMaxFanoutInlinePerCall, deliveries.size());
+        for (std::size_t i = offset; i < end; ++i) {
+            const auto& [session, deliver_qos] = deliveries[i];
+            if (session->is_reactor_session) {
+                enqueue_reactor_publish(session, topic, payload, deliver_qos, /*retain=*/false, extras);
+            } else {
+                enqueue_legacy_handoff(session, topic, payload, deliver_qos, /*retain=*/false, extras);
+            }
+        }
+        if (end >= deliveries.size()) return;  // done
+        reactor_io_.post([this, topic, payload, extras, deliveries = std::move(deliveries), end]() mutable {
+            route_publish_reactor_batch(topic, payload, extras, std::move(deliveries), end);
+        });
     }
 
     // Best-effort server->client DISCONNECT (MQTT 5 §3.14) — v5 only; a v4 session has no such packet, so
