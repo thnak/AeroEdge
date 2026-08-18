@@ -949,7 +949,7 @@ was quiesced and the comparison re-run clean:
 |---|---|---|---|
 | QoS 0, 1:1, 300K msgs | mean ≈63,046 msg/s | mean ≈64,957 msg/s (1 early outlier run excluded from the tighter read: ≈66,478 msg/s) | **+3% to +5%** |
 | QoS 1, 1:1, 50K msgs (3 rounds) | mean ≈8,922 msg/s | mean ≈8,727 msg/s | ~flat (within noise, as expected — round-trip-bound) |
-| Shared-topic fan-out, 8 subs × 2 pubs, 5 rounds | mean ≈12,209 msg/s | mean ≈11,971 msg/s | **inconclusive** — noisy in both directions at this scale, no signal either way |
+| Shared-topic fan-out, 8 subs × 2 pubs, 16 rounds (12 after excluding noise-spike rounds) | mean ≈11,339 msg/s (clean subset) | mean ≈11,609 msg/s (clean subset) | **~+2.4%, directionally positive but not statistically confident** |
 
 QoS 0's single-connection win is real and directionally consistent (pooled
 ahead in 9 of 10 clean rounds) but **landed at the low end of §4.1's own
@@ -959,11 +959,32 @@ flagged this as an *estimate*, not a measurement, and correctly anticipated
 "the real hot path is dominated by mutex locks, topic matching, and the
 actual socket write" diluting the allocation-only ratio — the real number
 just landed lower within that already-acknowledged range than the midpoint
-suggested. The fan-out scenario, where the `vh`-pooling win should scale with
-recipient count, showed no clear signal at this small scale (8 subscribers) —
-plausibly because subscriber-side receive/dispatch cost dominates at this
-size, or because the effect is real but too small to separate from noise in
-a handful of runs; not chased further this round.
+suggested.
+
+**Fan-out follow-up (16 total interleaved rounds, run after the QoS 0 result
+above):** the hypothesis going in was that `publish_to()`'s `vh` pooling
+should show a *bigger* win here than the 1:1 case, since `vh` is rebuilt once
+per recipient — 8 subscribers should amplify the effect roughly 8x versus
+1:1. That hypothesis did not hold up. 4 of the 16 rounds were clearly hit by
+an external system-wide slowdown (both baseline and pooled — or, in two
+rounds, only one side — dropped to roughly half their surrounding
+throughput; not attributable to either binary, most likely a background OS/
+disk event, since the *which* side got hit alternated between baseline and
+pooled across the affected rounds rather than consistently favoring one).
+Excluding those 4, the remaining 12 clean rounds show pooled ahead in 9 of
+12, mean delta ≈+270 msg/s (+2.4%) — same direction as the 1:1 result, but
+**roughly the same magnitude, not amplified**, and a rough paired-difference
+check (mean delta ≈270, standard deviation of the per-round deltas ≈794,
+giving a t-statistic ≈1.18 against 11 degrees of freedom) does **not** clear
+a conventional significance threshold — unlike the 1:1 QoS 0 result, this one
+should be read as "consistent with a small real effect, not proof of one."
+Best-guess explanation: at only 8 subscribers, the per-recipient cost `vh`
+pooling removes is still a small fraction of that recipient's total handling
+cost (socket write, `wait_writable` retry loop, subs_mu lock, topic-match
+check) — the allocation isn't the dominant cost even when repeated 8x, so it
+doesn't compound into a proportionally bigger win. A wider fan-out (dozens to
+hundreds of matching subscribers) might show more separation, but wasn't
+tested this round.
 
 **Bottom line**: real, positive, shipped — but a good reminder that an
 isolated microbenchmark's ratio is a ceiling, not a prediction, for the
