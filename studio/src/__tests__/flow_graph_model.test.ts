@@ -41,6 +41,19 @@ describe("implicitEdges", () => {
     const chain = implicitEdges([{ id: "a", type_id: "x" }, { id: "b", type_id: "y" }]);
     expect(chain).toEqual([{ id: "implicit-0", from: "a", to: "b" }]);
   });
+
+  // 019 §4 jigsaw slice: a Source card has no target handle (nothing can plug into it), so drawing
+  // that implicit edge would hit the same react-flow error the earlier Output-hiding bug did — skip
+  // it instead. A Source node also genuinely ignores upstream context (it decodes ctx.payload, not
+  // ctx.tags), so this is the semantically honest choice too, not just a rendering workaround.
+  it("skips the implicit edge into a Source-category node, wherever it sits in the array", () => {
+    const chain = implicitEdges([
+      { id: "a", type_id: "aero.transform.scale" },
+      { id: "b", type_id: "aero.source.decode" }, // Source, not at index 0 — unusual but not forbidden
+      { id: "c", type_id: "aero.output.sum" },
+    ]);
+    expect(chain).toEqual([{ id: "implicit-1", from: "b", to: "c" }]); // a->b skipped, b->c kept
+  });
 });
 
 describe("withEdge / withoutEdge — materialize-on-first-edit", () => {
@@ -180,6 +193,39 @@ describe("validateGraph — instant client feedback mirroring flow_compiler.hpp'
       ],
     };
     expect(validateGraph(app).some((e) => e.includes("more than one branch-producing node"))).toBe(true);
+  });
+
+  // The "Sum before Decode" root case (from the puzzle-piece design discussion): a flow whose root
+  // isn't Source-category is rejected outright, mirroring order_flow_graph exactly.
+  it("rejects a root node that isn't Source-category", () => {
+    const app: Application = {
+      name: "n", version: "1", actor: { kind: "edge", key: 1 },
+      flow: [{ id: "sum", type_id: "aero.output.sum" }, { id: "out", type_id: "aero.output.sum" }],
+      edges: [{ from: "sum", to: "out" }],
+    };
+    expect(validateGraph(app).some((e) => e.includes("must be a Source node"))).toBe(true);
+  });
+
+  // NOTE on scope: a node several hops downstream of the root (e.g. Source -> Sum -> Decode ->
+  // Output) is NOT independently checkable beyond the root check above. Once "exactly one root, and
+  // it's Source" holds, topological order already guarantees the root runs before every other node —
+  // so every node is provably reachable from it (a finite acyclic graph's single indegree-0 node is
+  // the sole terminus of every predecessor chain). Whether a specific downstream node's actual FIELD
+  // prerequisites have been populated by the time it runs is a different, richer question that would
+  // need typed ports to answer — deliberately out of scope (019 §2). An earlier draft of this file
+  // added a redundant ancestor-BFS to "catch" that case; it never actually fired once the root check
+  // passed, so it was removed rather than kept as decoration.
+
+  it("rejects more than one root, even when both roots are Source-category", () => {
+    const app: Application = {
+      name: "n", version: "1", actor: { kind: "edge", key: 1 },
+      flow: [
+        { id: "src1", type_id: "aero.source.decode" }, { id: "src2", type_id: "aero.source.json" },
+        { id: "out", type_id: "aero.output.sum" },
+      ],
+      edges: [{ from: "src1", to: "out" }], // src2 is disconnected — a second, unreachable root
+    };
+    expect(validateGraph(app).some((e) => e.includes("exactly one root"))).toBe(true);
   });
 
   it("accepts a valid fan-out + switch graph", () => {

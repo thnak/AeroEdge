@@ -27,8 +27,12 @@ import { toApplication, implicitEdges, withEdge, withoutEdge, removeNodeAndEdges
 import { Panel } from "./components";
 import { ConfigForm } from "./ConfigForm";
 import { FlowCanvasNode, type FlowCanvasNodeData } from "./FlowCanvasNode";
+import { SelfConnectingEdge } from "./SelfConnectingEdge";
 
 const nodeTypes = { flowNode: FlowCanvasNode };
+// Registered as the "default" edge type (react-flow's own documented pattern) so every edge routes
+// through it; it only special-cases rendering when source === target, otherwise it's a plain bezier.
+const edgeTypes = { default: SelfConnectingEdge };
 
 // Layered topological auto-layout: depth = longest path from a root (BFS-memoized), x spread by
 // column within each depth layer. Purely a rendering default — `positions` (drag results) always
@@ -60,7 +64,7 @@ function autoLayout(nodes: FlowNode[], edges: GraphEdge[]): Record<string, { x: 
     const d = depth.get(id) ?? 0;
     const col = perLayer.get(d) ?? 0;
     perLayer.set(d, col + 1);
-    positions[id] = { x: col * 220, y: d * 140 };
+    positions[id] = { x: col * 220, y: d * 180 };
   }
   return positions;
 }
@@ -178,6 +182,7 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
               nodes={rfNodes}
               edges={rfEdges}
               nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
               nodesDraggable
               nodesConnectable
               edgesReconnectable

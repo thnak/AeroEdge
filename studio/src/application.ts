@@ -2,6 +2,7 @@
 // This MUST match include/aero/schema/application.hpp and examples/hello_flow.json exactly: the
 // runtime is the authority, so what the Flow Designer emits here has to deploy unchanged. The
 // round-trip test (src/__tests__/application.test.ts) locks that alignment.
+import { catalogEntry } from "./catalog";
 
 export type NodeConfig = Record<string, number | string | boolean>;
 
@@ -125,9 +126,15 @@ export function fromApplication(app: Application): FlowModel {
 
 // The `n[i] -> n[i+1]` chain implied by array order — today's v0.1 behavior (004), and the seed used
 // to materialize `model.edges` the first time the user edits the graph (see `withEdge`/`withoutEdge`).
+// Skips any edge whose TARGET is a Source-category node: a Source node ignores upstream context
+// anyway (it decodes `ctx.payload`, not `ctx.tags`), and — now that FlowCanvasNode renders no target
+// handle on a Source card (019 §4 jigsaw slice: a Source is a "hat" piece, nothing plugs into it) —
+// drawing that edge would hit react-flow's "couldn't create edge for target handle" error the same
+// way an Output's hidden source handle once did (found and reverted during the first canvas slice).
 export function implicitEdges(nodes: FlowNode[]): GraphEdge[] {
   const edges: GraphEdge[] = [];
   for (let i = 0; i < nodes.length - 1; i++) {
+    if (catalogEntry(nodes[i + 1].type_id)?.category === "Source") continue;
     edges.push({ id: `implicit-${i}`, from: nodeId(nodes[i], i), to: nodeId(nodes[i + 1], i + 1) });
   }
   return edges;
@@ -220,6 +227,30 @@ export function validateGraph(app: Application): string[] {
     }
   }
   if (visited !== ids.size) errs.push("flow graph contains a cycle");
+
+  // Root check, mirroring order_flow_graph: exactly one node with no incoming edge, and it must be
+  // Source-category. This is the ONLY reachability-style check needed, not one of several: for a
+  // finite acyclic graph (cycles are already rejected above), "exactly one indegree-0 node" implies a
+  // single connected component (>=2 components would mean >=2 indegree-0 nodes, one per component),
+  // and every node's predecessor chain in a single-rooted acyclic graph provably terminates at that
+  // one root. So once this check passes, every node is necessarily reachable from the Source root —
+  // a separate "does every node have a Source ancestor" BFS would be correct but always vacuously
+  // true here, dead code kept only for its own sake. (An earlier draft of this check added exactly
+  // that BFS to catch a hypothetical "Source -> Sum -> Decode -> Output" case a few hops from a
+  // mistake; on reflection it can't actually fire once root-checking passes, per the proof above — the
+  // real remaining limitation is that topological order guarantees Source runs before its
+  // descendants, but says nothing about whether a specific downstream node's semantic PREREQUISITE
+  // data has been populated by then. That's a per-field data-dependency question, which needs typed
+  // ports to answer — deliberately out of scope, 019 §2.)
+  const roots = [...ids].filter((id) => (indeg.get(id) ?? 0) === 0);
+  if (roots.length !== 1) {
+    errs.push(`flow must have exactly one root (a node with no incoming edge); found ${roots.length}`);
+  } else {
+    const rootIdx = app.flow.findIndex((n, i) => nodeId(n, i) === roots[0]);
+    if (rootIdx < 0 || catalogEntry(app.flow[rootIdx].type_id)?.category !== "Source") {
+      errs.push(`flow's root node '${roots[0]}' must be a Source node`);
+    }
+  }
 
   // A node reached by edges with more than one distinct branch label (including the empty
   // "unconditional" label) can't be scheduled consistently — same rule as order_flow_graph.
