@@ -501,6 +501,27 @@ the Studio-side loop block shape on top of it are still real, unstarted implemen
 last in §9 for the reasons given there — but "don't build a shape for a capability that doesn't exist
 yet" no longer applies verbatim, since the capability is now fully specified, just not yet coded.
 
+**Status: backend implemented** (`ProcessingContext::loop_continue`/`loop_iterations_remaining`/
+`loop_deadline`, `sdk/processing_context.hpp`; `CompiledFlow::Step::loop_back_target` +
+`execute()`'s jump-back, `core/compiled_flow.hpp`; `LoopStartNode`/`LoopBackNode`,
+`nodes/loop_nodes.hpp`; the `"loop_back"` `from_port` exclusion from Kahn's adjacency/in-degree plus the
+loop-nested-in-branch and array-order-mode rejections, `order_flow_graph`/`compile_flow`,
+`flow_compiler.hpp`). Three corrections found during implementation, not left as silent drift: (1)
+`NodeCategory::Rule` is NOT "the same bucket as `aero.flow.switch` AND `aero.transform.set`" as this
+section claimed — `set` is actually `Transform`; loop nodes are `Rule` on `switch`'s own merits, not
+that false shared-bucket premise. (2) No reusable `SingleSourceTracker` type exists anywhere in this
+codebase (the "one branch source" check is two plain local variables inline in `order_flow_graph`) — the
+simpler, fully sufficient v1 rule actually shipped is "at most one edge in the whole flow may carry
+`from_port == "loop_back"`," a flat boolean, not a cloned tracker struct. (3) A gap this section didn't
+call out: linear/array-order mode has no `from_port` concept at all, so a loop pair placed there without
+`edges[]` is now an explicit deploy-time rejection, not a silently-non-looping "loop." §8.9's
+`ProcessingContext::reserve()` gap and MES/HTTP staging-budget mechanism are deliberately deferred — real
+but independent of loops (no production code calls `reserve()` at all today) — and the Studio-side loop
+C-block shape remains separate, unstarted work. Covered by `tests/core/flow_graph.cpp` (max_iterations<1
+/ missing max_duration_ms / two-loop-back-edges / nested-in-branch / linear-mode rejections, plus a
+10-pass accumulate-loop execution test and a runaway-safety-path test) and a new loop case in
+`tests/core/flow_zero_alloc.cpp` (~1000 loop_back passes in one Command, 0 allocations).
+
 ### 8.1 The core mechanism — a side-channel jump signal, not a `NodeResult`/`INode` change
 
 The single biggest design constraint: **do not touch the `INode`/`NodeResult` contract.** Every

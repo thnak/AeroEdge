@@ -8,8 +8,10 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -102,6 +104,16 @@ struct ProcessingContext {
     // exactly one active switch point per flow, per 004's existing "linear + single switch" precedent).
     std::string_view active_branch;
 
+    // Loop side-channel state (020 §8.1) — same shape/reasoning as active_branch above: a plain scalar
+    // a loop node sets, that CompiledFlow::execute() reads, not a new NodeResult/INode capability.
+    // loop_continue: does aero.flow.loop_back want another pass? loop_iterations_remaining: the
+    // fresh-per-Command safety budget aero.flow.loop_start initializes and aero.flow.loop_back
+    // decrements. loop_deadline: a SECOND, independent safety cap on wall-clock time — iteration count
+    // alone doesn't bound an expensive body (020 §8.9).
+    bool loop_continue = false;
+    std::size_t loop_iterations_remaining = 0;
+    std::optional<std::chrono::steady_clock::time_point> loop_deadline;
+
     // --- flow status ---
     bool failed = false;
     std::size_t failed_step = 0;
@@ -120,6 +132,12 @@ struct ProcessingContext {
         mes_reports.clear();
         http_requests.clear();
         active_branch = {};
+        // Explicitly listing all three loop fields here, not just referencing "same as active_branch" —
+        // this codebase has already been burned once by a field added to the struct but forgotten in
+        // reset() (active_branch's own history, 020 §8.1's own warning), worth being over-explicit about.
+        loop_continue = false;
+        loop_iterations_remaining = 0;
+        loop_deadline.reset();
         failed = false;
         failed_step = 0;
     }

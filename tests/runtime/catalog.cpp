@@ -33,7 +33,7 @@ int main() {
         "aero.output.sum", "aero.rule.expr", "aero.transform.mean", "aero.transform.minmax",
         "aero.transform.sum", "aero.transform.crc", "aero.source.modbus", "aero.source.modbus_bits",
         "aero.source.json", "aero.output.mes", "aero.source.mes_order", "aero.output.http",
-        "aero.flow.switch", "aero.transform.set",
+        "aero.flow.switch", "aero.transform.set", "aero.flow.loop_start", "aero.flow.loop_back",
     };
     const std::set<std::string> expected_drivers = {
         "aero.driver.generator", "aero.driver.modbus_tcp", "aero.driver.modbus_rtu",
@@ -100,6 +100,25 @@ int main() {
         const bool full_fields = has_field(n["fields"], "tag") && has_field(n["fields"], "expr");
         ok &= full_fields;
         std::printf("[catalog] aero.transform.set full_fields=%d %s\n", full_fields,
+                    full_fields ? "ok" : "FAIL");
+    }
+
+    // Spot-check: 020 §8 loop nodes carry their full config surface.
+    for (const auto& n : cat["nodes"]) {
+        if (n.value("type_id", std::string{}) != "aero.flow.loop_start") continue;
+        const bool full_fields = has_field(n["fields"], "counter_tag") && has_field(n["fields"], "start_expr") &&
+                                  has_field(n["fields"], "max_iterations") &&
+                                  has_field(n["fields"], "max_duration_ms");
+        ok &= full_fields;
+        std::printf("[catalog] aero.flow.loop_start full_fields=%d %s\n", full_fields,
+                    full_fields ? "ok" : "FAIL");
+    }
+    for (const auto& n : cat["nodes"]) {
+        if (n.value("type_id", std::string{}) != "aero.flow.loop_back") continue;
+        const bool full_fields = has_field(n["fields"], "counter_tag") && has_field(n["fields"], "step_expr") &&
+                                  has_field(n["fields"], "end_expr");
+        ok &= full_fields;
+        std::printf("[catalog] aero.flow.loop_back full_fields=%d %s\n", full_fields,
                     full_fields ? "ok" : "FAIL");
     }
 
