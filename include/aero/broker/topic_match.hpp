@@ -8,6 +8,7 @@
 // CODE, TEMPORARY") is the deferred duplicate this extraction was always meant to pay off.
 #pragma once
 
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -48,6 +49,35 @@ namespace aero::broker {
 // Topic Name rather than a subscribable Topic Filter.
 [[nodiscard]] inline bool topic_name_has_wildcard(std::string_view topic) noexcept {
     return topic.find('+') != std::string_view::npos || topic.find('#') != std::string_view::npos;
+}
+
+// MQTT 5 §4.8.2 Shared Subscriptions: a SUBSCRIBE filter of the form `$share/<ShareName>/<TopicFilter>`
+// puts this subscriber into a named group — the broker delivers each matching message to exactly ONE
+// member of the group (round-robin/random/whatever it likes), not to every member the way a regular
+// subscription would. `ShareName` MUST NOT contain `/`, `+`, or `#` (§4.8.2) since it isn't itself a
+// topic-filter level; a violation is a Protocol Error, same as a malformed filter with no ShareName or
+// no TopicFilter after it — the caller is expected to reject the SUBSCRIBE in that case, not silently
+// treat it as a literal (non-shared) filter.
+struct SharedSubscription {
+    std::string_view group;
+    std::string_view filter;  // the real Topic Filter, with the "$share/<group>/" prefix stripped
+};
+
+[[nodiscard]] inline std::optional<SharedSubscription> parse_shared_subscription(
+    std::string_view raw_filter) noexcept {
+    constexpr std::string_view kPrefix = "$share/";
+    if (raw_filter.substr(0, kPrefix.size()) != kPrefix) return std::nullopt;
+    const auto rest = raw_filter.substr(kPrefix.size());
+    const auto slash = rest.find('/');
+    if (slash == std::string_view::npos) return std::nullopt;  // no TopicFilter after the ShareName
+    const auto group = rest.substr(0, slash);
+    const auto filter = rest.substr(slash + 1);
+    if (group.empty() || filter.empty()) return std::nullopt;
+    if (group.find('+') != std::string_view::npos || group.find('#') != std::string_view::npos ||
+        group.find('/') != std::string_view::npos) {
+        return std::nullopt;
+    }
+    return SharedSubscription{group, filter};
 }
 
 }  // namespace aero::broker

@@ -253,6 +253,13 @@ private:
     struct Subscription {
         std::string filter;
         std::uint8_t qos = 0;  // granted QoS (v1: min(requested, 1))
+        // 017 M7.2 PR D: nullopt for a regular subscription. Set to the ShareName when this filter was a
+        // MQTT 5 §4.8.2 `$share/<group>/<filter>` SUBSCRIBE — `filter` above is already the REAL Topic
+        // Filter with that prefix stripped (topic_matches()/the topic index both operate on it exactly as
+        // if it were a plain subscription), so this field is consulted ONLY at route_publish()'s delivery-
+        // arbitration step (a shared subscription still matches, indexes, and gets an ACL check exactly
+        // like a regular one — the only difference is who among the group actually receives each message).
+        std::optional<std::string> share_group;
     };
 
     // 017 M7.2: carries the subset of MQTT 5 PUBLISH properties this broker acts on end-to-end, from
@@ -847,14 +854,34 @@ private:
             pos += 1;
             const std::uint8_t qos = requested_qos > 1 ? 1 : requested_qos;  // v1 ceiling: QoS 1
 
+            // 017 M7.2 PR D — Shared Subscriptions (MQTT 5 §4.8.2): v5-only, same posture as this file's
+            // other v5-only Properties (a v4 session's "$share/..." filter is just a literal, oddly-shaped
+            // Topic Filter — no real topic will ever start with '$', so it's effectively inert, not an
+            // error). A malformed share (`parse_shared_subscription` returns nullopt: no ShareName, no
+            // TopicFilter after it, or a ShareName containing '/'/'+'/'#') is a Protocol Error (§4.8.2) —
+            // the whole SUBSCRIBE is rejected via DISCONNECT 0x82, mirroring handle_publish()'s own
+            // Response-Topic-wildcard Protocol Error handling.
+            std::optional<std::string> share_group;
+            if (s->protocol_version == 5 && filter.starts_with("$share/")) {
+                auto shared = parse_shared_subscription(filter);
+                if (!shared) {
+                    send_disconnect(*s, 0x82);  // Protocol Error
+                    return false;
+                }
+                share_group = std::string(shared->group);
+                filter = std::string(shared->filter);
+            }
+
             // M5 ACL gate: unset Config::authorizer ⇒ unchanged Phase-1 behavior (everything granted). A
             // denied filter still gets a SUBACK byte (3.9.3 requires one per filter) but it's 0x80
             // (failure) and the filter is NOT added to `added` — so it never enters s.subs and can never
-            // match in route_publish()/the retained-replay loop below.
+            // match in route_publish()/the retained-replay loop below. The ACL check runs against the REAL
+            // (post-share-prefix-stripped) filter — a client's read authorization is a property of the
+            // topic it's asking to read, not of the group-membership syntax wrapping the request.
             const bool allowed =
                 !cfg_.authorizer || cfg_.authorizer->allow(s->principal, filter, AclAction::Subscribe);
             if (allowed) {
-                added.push_back(Subscription{filter, qos});
+                added.push_back(Subscription{filter, qos, share_group});
                 granted.push_back(static_cast<std::byte>(qos));
             } else {
                 // 3.9.3 (v4): 0x80 SUBACK failure. MQTT 5 §3.9.3: 0x87 Not Authorized is the v5-specific
@@ -888,8 +915,17 @@ private:
         // immediately, at the subscription's granted QoS. M7.2 PR A: msg.extras carries the retained
         // message's own Message Expiry through — publish_to()'s choke point re-checks it at replay time,
         // so a long-stale retained message is silently dropped instead of replayed as if fresh.
+        //
+        // 017 M7.2 PR D: a Shared Subscription is skipped here — §4.8.2's own non-normative note is that
+        // retained delivery to a shared group has "no guarantee that all members ... will eventually
+        // receive a copy", i.e. it's expected to ride the SAME one-member-of-the-group arbitration as any
+        // other PUBLISH, not an unconditional per-subscriber replay. Replaying it to every member here
+        // (this loop runs once per member's own SUBSCRIBE) would defeat that — the new member instead
+        // picks it up via the ordinary route_publish() arbitration the next time this topic is published
+        // (or a future PR could fold retained backfill into that same arbitration; not needed yet).
         std::lock_guard<std::mutex> rg(retained_mu_);
         for (const Subscription& sub : added) {
+            if (sub.share_group) continue;
             for (const auto& [topic, msg] : retained_) {
                 if (topic_matches(sub.filter, topic)) {
                     if (!publish_to(*s, topic, msg.payload, sub.qos, /*retain=*/true, msg.extras)) return false;
@@ -1080,8 +1116,22 @@ private:
     // filter), so delivery semantics — including per-session duplicate delivery for overlapping
     // subscriptions — are byte-for-byte unchanged; only which sessions get scanned at all has changed.
     //
+    // 017 M7.2 PR D — Shared Subscriptions (§4.8.2): a matching Subscription with a `share_group` set does
+    // NOT fan out here like a regular one — it's bucketed by (group, filter) identity (see §4.8.2's own
+    // note that the pair, not the ShareName alone, identifies a shared subscription: two different groups
+    // can independently share a ShareName as long as their filters differ) into `shared_groups`, and after
+    // every live candidate has been scanned, exactly ONE member of each bucket is chosen — round-robin via
+    // shared_group_cursor_, a small piece of state that outlives any single route_publish() call so
+    // successive PUBLISHes to the same shared subscription actually rotate across members instead of
+    // always picking whichever session happened to sort first.
     void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
                        const PublishExtras& extras = {}) {
+        struct ShareCandidate {
+            std::shared_ptr<Session> session;
+            Subscription sub;
+        };
+        std::unordered_map<std::string, std::vector<ShareCandidate>> shared_groups;
+
         for (const auto& session : topic_index_candidates(topic)) {
             std::vector<Subscription> matches;
             {
@@ -1090,12 +1140,33 @@ private:
                     if (topic_matches(sub.filter, topic)) matches.push_back(sub);
             }
             for (const Subscription& sub : matches) {
+                if (sub.share_group) {
+                    shared_groups[*sub.share_group + '\x1f' + sub.filter].push_back(
+                        ShareCandidate{session, sub});
+                    continue;
+                }
                 const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
                 (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false, extras);
             }
         }
+        for (auto& [key, candidates] : shared_groups) {
+            std::size_t idx;
+            {
+                std::lock_guard<std::mutex> g(shared_group_cursor_mu_);
+                idx = shared_group_cursor_[key]++ % candidates.size();
+            }
+            const ShareCandidate& chosen = candidates[idx];
+            const std::uint8_t deliver_qos = qos < chosen.sub.qos ? qos : chosen.sub.qos;
+            (void)publish_to(*chosen.session, topic, payload, deliver_qos, /*retain=*/false, extras);
+        }
 
         if (qos == 0) return;
+        // 017 M7.2 PR D scope note: shared-subscription arbitration above applies to the LIVE fan-out only
+        // — an offline (clean_session=0) stored session with a shared-subscription filter is queued into
+        // exactly like a regular one here, independently of whatever other members of its group are doing.
+        // Round-robin fairness across a mix of online and offline group members would need unifying this
+        // loop with the live one above; deferred until a real deployment actually mixes shared subscribers
+        // with persistent offline sessions (not exercised by anything today).
         std::lock_guard<std::mutex> g(stored_sessions_mu_);
         for (auto& [client_id, stored] : stored_sessions_) {
             for (const Subscription& sub : stored.subs) {
@@ -1232,6 +1303,15 @@ private:
         }
         if (had_wildcard) std::erase(wildcard_subscribers_, s);
     }
+
+    // 017 M7.2 PR D: round-robin cursor for Shared Subscription delivery arbitration (route_publish()'s
+    // own banner covers the key shape — (ShareName, TopicFilter), NOT ShareName alone). Deliberately never
+    // pruned when a group's last member disconnects — a stale entry just means the NEXT client to (re)join
+    // that exact (group, filter) pair resumes the rotation instead of restarting at 0, which is harmless
+    // (the modulo in route_publish() re-scales it to however many candidates exist at delivery time) and
+    // avoids adding a second removal path to keep in sync with remove_session()'s existing bookkeeping.
+    std::mutex shared_group_cursor_mu_;
+    std::unordered_map<std::string, std::size_t> shared_group_cursor_;
 
     // Topic index (post-benchmark addition — see route_publish()'s own banner for why this exists).
     //

@@ -23,7 +23,7 @@
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties deferred, M7.1/M7.2 |
 | M7.1 | MQTT 5 feature properties v1 slice | **Shipped** — Session Expiry Interval TTL, server DISCONNECT reason codes, inbound Topic Alias |
-| M7.2 | MQTT 5 PUBLISH Properties: Message Expiry Interval, Maximum Packet Size, Response Topic, Correlation Data, User Properties, outbound Topic Alias | **Shipped** — PR A (Message Expiry + Max Packet Size + shared Properties infra), PR B (Response Topic + Correlation Data + User Properties, end-to-end incl. `on_publish()`/`IBridgeSink::publish()` signature changes), PR C (outbound Topic Alias — broker→subscriber compression); Shared Subscriptions, Enhanced/SASL Auth still deferred |
+| M7.2 | MQTT 5 PUBLISH Properties: Message Expiry Interval, Maximum Packet Size, Response Topic, Correlation Data, User Properties, outbound Topic Alias, Shared Subscriptions | **Shipped** — PR A (Message Expiry + Max Packet Size + shared Properties infra), PR B (Response Topic + Correlation Data + User Properties, end-to-end incl. `on_publish()`/`IBridgeSink::publish()` signature changes), PR C (outbound Topic Alias — broker→subscriber compression), PR D (Shared Subscriptions, `$share/<group>/<filter>` round-robin delivery); Enhanced/SASL Auth still deferred |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | **Shipped** — RabbitMQ only; Kafka/Pulsar deferred, M8.1/M8.2 |
 | M9 | Multi-protocol southbound (OPC-UA/Modbus) | **Superseded by spec 018** — its own spec, as this row anticipated |
 
@@ -198,11 +198,10 @@ principled exclusions the way v0.1 framed the whole breadth:
 | Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
 | Cluster-link mTLS | **shipped**, opt-in (default disabled) | M5.1, `broker_cluster_security.hpp` over QuarkCpp's ADR-040 `SecureTransport` — no cert rotation/revocation sweep yet |
-| MQTT 5 | **shipped**, protocol negotiation + properties parsing + feature properties through M7.2 PR C | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`/`PropertyWriter`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias; M7.2 PR A adds Message Expiry Interval + Maximum Packet Size enforcement; PR B adds Response Topic + Correlation Data + User Properties end-to-end; PR C adds outbound Topic Alias (compression, broker→subscriber) — Shared Subscriptions and Enhanced/SASL Auth remain deferred |
+| MQTT 5 | **shipped**, protocol negotiation + properties parsing + feature properties through M7.2 PR D | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`/`PropertyWriter`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias; M7.2 PR A adds Message Expiry Interval + Maximum Packet Size enforcement; PR B adds Response Topic + Correlation Data + User Properties end-to-end; PR C adds outbound Topic Alias (compression, broker→subscriber); PR D adds Shared Subscriptions (`$share/<group>/<filter>`, round-robin delivery within a group) — Enhanced/SASL Auth remains deferred |
 | RabbitMQ bridge | **shipped** | M8, `RabbitMqBridgeSink` (`broker/rabbitmq_bridge_sink.hpp`) over rabbitmq-c (AMQP 0-9-1); PUBLISH only, no TLS/SASL-EXTERNAL, no publisher confirms |
 | Kafka/Pulsar bridges | backlog | M8.1/M8.2 — needs new third-party deps (librdkafka / pulsar-client-cpp), native-extension-shaped (008) |
 | Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
-| Shared subscriptions | not yet scheduled | no current AeroEdge/AeroMes use case; revisit on demand |
 
 ## 7. MES integration — defined here, not borrowed from AeroMes as-is
 
@@ -368,7 +367,7 @@ adapts to unilaterally. Concretely:
     unestablished alias, gets `0xE0`/`0x94` (Topic Alias invalid) instead of being silently
     dropped or misrouted.
 
-  **M7.2 — PUBLISH Properties, shipped in three PRs:**
+  **M7.2 — PUBLISH Properties (+ Shared Subscriptions), shipped in four PRs:**
   - **PR A** — shared outbound `PropertyWriter`/`PublishExtras` infra; **Message Expiry Interval**
     (0x02, TTL enforced against `steady_clock` at the `publish_to()` choke point — expired messages
     are dropped instead of delivered, both live and retained-replay paths); **Maximum Packet Size**
@@ -397,12 +396,31 @@ adapts to unilaterally. Concretely:
     every `publish_to()` call site (live fanout, retained replay, offline-queue flush, Will delivery)
     since they all share this one choke point.
 
+  - **PR D** — **Shared Subscriptions** (`$share/<ShareName>/<TopicFilter>`, §4.8.2): `handle_subscribe()`
+    recognizes the `$share/` prefix (v5 only — a v4 session's literal "$share/..." filter is just an
+    inert, oddly-shaped Topic Filter, same posture as every other v5-only Properties feature in this
+    milestone), strips it to the real filter for indexing/ACL/matching (`Subscription::share_group`), and
+    rejects a structurally malformed share (missing ShareName, missing TopicFilter after it, or a
+    ShareName containing `/`/`+`/`#`) with DISCONNECT 0x82 (Protocol Error) — the whole SUBSCRIBE, not
+    just that filter. `route_publish()` buckets matching shared subscribers by (ShareName, TopicFilter)
+    identity (not ShareName alone — §4.8.2 explicitly allows two independent groups to reuse a ShareName
+    over different filters) and delivers to exactly ONE member per bucket per PUBLISH, round-robin via a
+    small per-(group,filter) cursor (`shared_group_cursor_`) that outlives any single publish so
+    successive messages actually rotate. A regular (non-shared) subscriber to the same topic is completely
+    unaffected — full fan-out, unchanged. **v1 scope, deliberately narrow**: retained-message replay on
+    SUBSCRIBE is skipped for a shared member (§4.8.2's own "no guarantee that all members ... will
+    eventually receive a copy" — a fresh member instead picks up the next real PUBLISH via the same
+    arbitration, rather than every member replaying the same retained message unconditionally); the
+    offline/persistent-session queue (`stored_sessions_`) still queues into every matching stored session
+    independently, i.e. round-robin arbitration only spans LIVE members today — unifying it with the
+    offline path is deferred until a real deployment mixes shared subscribers with persistent offline
+    sessions.
+
   **Still deferred:**
-  - **Shared Subscriptions** (`$share/...`) — no special-cased SUBSCRIBE filter handling.
   - **Enhanced/SASL Authentication** — the `0xF0` AUTH packet is not implemented; Authentication
     Method/Data (0x15/0x16) are parsed-and-skipped on CONNECT.
-  Revisit any of these once a real device/integration actually needs it — same "don't build
-  ahead of demand" posture M7's own predecessor entry held, now narrowed to what's left.
+  Revisit once a real device/integration actually needs it — same "don't build ahead of demand" posture
+  M7's own predecessor entry held, now narrowed to what's left.
 - **M8.1/M8.2 — Kafka and Pulsar bridges.** M8 ships `RabbitMqBridgeSink` (rabbitmq-c, AMQP 0-9-1)
   as the one bridge in the Kafka/Pulsar/RabbitMQ family this milestone actually vendors — RabbitMQ
   was picked first because it needed no new build-system machinery beyond the FetchContent pattern
