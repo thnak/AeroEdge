@@ -364,6 +364,21 @@ private:
         // this session's own reader thread ever touches it, via handle_publish).
         std::unordered_map<std::uint16_t, std::string> topic_aliases;
 
+        // 017 M7.2 PR C: outbound Topic Alias (compression, broker→client direction, MQTT 5 §3.3.2.3.4).
+        // client_topic_alias_max is the client's own CONNECT Topic Alias Maximum (0x22) — nullopt/0 means
+        // the client never advertised one, so §3.1.2.11.2 forbids the broker from sending ANY Topic Alias
+        // to it (unchanged pre-M7.2-PR-C behavior: every PUBLISH carries its full topic name). Set ONCE in
+        // handle_connect, same discipline as max_packet_size above. outbound_topic_aliases is THIS
+        // session's own topic -> broker-assigned-alias table, mutated only from publish_to() — every
+        // publish_to() call for a given session runs on that session's own send path under io_mu (see
+        // send_packet), so no separate lock is needed here (mirrors topic_aliases' own no-lock rationale).
+        // Aliases 1..client_topic_alias_max are assigned on first use per topic and never reassigned or
+        // reclaimed for the life of the connection (MQTT 5 §3.3.2.3.4 — an alias, once mapped, stays
+        // mapped); a topic seen after every slot is taken just gets its full name again (a legal,
+        // uncompressed fallback), never treated as an error.
+        std::optional<std::uint16_t> client_topic_alias_max;
+        std::unordered_map<std::string, std::uint16_t> outbound_topic_aliases;
+
         bool send_packet(std::byte type_flags, const std::vector<std::byte>& body) {
             std::lock_guard<std::mutex> g(io_mu);
             return std::visit(
@@ -607,11 +622,13 @@ private:
         // other property in the table is recognized only so read_properties() can correctly skip past it.
         std::optional<std::uint32_t> connect_session_expiry;
         std::optional<std::uint32_t> connect_max_packet_size;
+        std::optional<std::uint16_t> connect_topic_alias_max;
         if (is_v5) {
             auto props = aero::transport::mqtt::read_properties(b, pos);
             if (!props) return false;  // malformed CONNECT properties
             connect_session_expiry = props->session_expiry_interval;
             connect_max_packet_size = props->maximum_packet_size;
+            connect_topic_alias_max = props->topic_alias_maximum;  // 017 M7.2 PR C — 0x22
         }
 
         if (pos + 2 > b.size()) return false;
@@ -724,6 +741,7 @@ private:
         s->clean_session = clean_session;
         s->session_expiry_interval = connect_session_expiry;  // M7.1: nullopt for v4 / v5-without-property
         s->max_packet_size = connect_max_packet_size;  // M7.2 PR A: nullopt for v4 / v5-without-property
+        s->client_topic_alias_max = connect_topic_alias_max;  // M7.2 PR C: nullopt => no outbound aliasing
         s->last_activity = std::chrono::steady_clock::now();
         if (will_flag) {
             s->has_will = true;
@@ -1115,12 +1133,35 @@ private:
             return true;
         }
 
+        // 017 M7.2 PR C — outbound Topic Alias (compression): only for v5 sessions that advertised a
+        // nonzero Topic Alias Maximum in CONNECT (§3.1.2.11.2 — absent/0 means "never send me one").
+        // `alias_to_send`: set when this delivery carries a Topic Alias property (either establishing a
+        // NEW mapping, alongside the full topic name, or reusing an established one). `send_full_topic`:
+        // false only on reuse — an empty Topic Name field is how the client is told "resolve via alias"
+        // (§3.3.2.3.4). Session::outbound_topic_aliases's own comment covers the assignment policy.
+        std::optional<std::uint16_t> alias_to_send;
+        bool send_full_topic = true;
+        if (s.protocol_version == 5 && s.client_topic_alias_max && *s.client_topic_alias_max > 0) {
+            if (auto it = s.outbound_topic_aliases.find(topic); it != s.outbound_topic_aliases.end()) {
+                alias_to_send = it->second;
+                send_full_topic = false;  // already established — Topic Alias alone resolves it
+            } else if (s.outbound_topic_aliases.size() < *s.client_topic_alias_max) {
+                const auto new_alias =
+                    static_cast<std::uint16_t>(s.outbound_topic_aliases.size() + 1);
+                s.outbound_topic_aliases.emplace(topic, new_alias);
+                alias_to_send = new_alias;  // establishing — full topic name still goes out this once
+            }
+            // else: every alias slot is already taken by other topics — fall through with no alias, full
+            // topic name, exactly pre-PR-C behavior for this one delivery (a legal, uncompressed fallback).
+        }
+
         std::vector<std::byte> vh;
-        aero::transport::mqtt::put_str(vh, topic);
+        aero::transport::mqtt::put_str(vh, send_full_topic ? std::string_view{topic} : std::string_view{});
         if (qos > 0) aero::transport::mqtt::put_u16_be(vh, next_packet_id());
 
         if (s.protocol_version == 5) {
             aero::transport::mqtt::PropertyWriter pw;
+            if (alias_to_send) pw.put_u16(0x23, *alias_to_send);
             if (extras.expiry_deadline) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
                     *extras.expiry_deadline - std::chrono::steady_clock::now())

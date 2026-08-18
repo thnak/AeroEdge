@@ -23,7 +23,7 @@
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties deferred, M7.1/M7.2 |
 | M7.1 | MQTT 5 feature properties v1 slice | **Shipped** — Session Expiry Interval TTL, server DISCONNECT reason codes, inbound Topic Alias |
-| M7.2 | MQTT 5 PUBLISH Properties: Message Expiry Interval, Maximum Packet Size, Response Topic, Correlation Data, User Properties | **Shipped** — PR A (Message Expiry + Max Packet Size + shared Properties infra), PR B (Response Topic + Correlation Data + User Properties, end-to-end incl. `on_publish()`/`IBridgeSink::publish()` signature changes); outbound Topic Alias, Shared Subscriptions, Enhanced/SASL Auth deferred |
+| M7.2 | MQTT 5 PUBLISH Properties: Message Expiry Interval, Maximum Packet Size, Response Topic, Correlation Data, User Properties, outbound Topic Alias | **Shipped** — PR A (Message Expiry + Max Packet Size + shared Properties infra), PR B (Response Topic + Correlation Data + User Properties, end-to-end incl. `on_publish()`/`IBridgeSink::publish()` signature changes), PR C (outbound Topic Alias — broker→subscriber compression); Shared Subscriptions, Enhanced/SASL Auth still deferred |
 | M8 | Kafka/Pulsar/RabbitMQ bridges (needs new third-party deps, native-extension-shaped) | **Shipped** — RabbitMQ only; Kafka/Pulsar deferred, M8.1/M8.2 |
 | M9 | Multi-protocol southbound (OPC-UA/Modbus) | **Superseded by spec 018** — its own spec, as this row anticipated |
 
@@ -198,7 +198,7 @@ principled exclusions the way v0.1 framed the whole breadth:
 | Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
 | Cluster-link mTLS | **shipped**, opt-in (default disabled) | M5.1, `broker_cluster_security.hpp` over QuarkCpp's ADR-040 `SecureTransport` — no cert rotation/revocation sweep yet |
-| MQTT 5 | **shipped**, protocol negotiation + properties parsing + a v1 slice of feature properties | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias — outbound Topic Alias (compression), Shared Subs, Request/Response, User Properties end-to-end, Message Expiry/Max Packet Size enforcement, and Enhanced Auth remain deferred |
+| MQTT 5 | **shipped**, protocol negotiation + properties parsing + feature properties through M7.2 PR C | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`/`PropertyWriter`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias; M7.2 PR A adds Message Expiry Interval + Maximum Packet Size enforcement; PR B adds Response Topic + Correlation Data + User Properties end-to-end; PR C adds outbound Topic Alias (compression, broker→subscriber) — Shared Subscriptions and Enhanced/SASL Auth remain deferred |
 | RabbitMQ bridge | **shipped** | M8, `RabbitMqBridgeSink` (`broker/rabbitmq_bridge_sink.hpp`) over rabbitmq-c (AMQP 0-9-1); PUBLISH only, no TLS/SASL-EXTERNAL, no publisher confirms |
 | Kafka/Pulsar bridges | backlog | M8.1/M8.2 — needs new third-party deps (librdkafka / pulsar-client-cpp), native-extension-shaped (008) |
 | Multi-protocol gateways (CoAP/LwM2M/OCPP), OPC-UA/Modbus southbound | backlog, likely a separate spec | M9 |
@@ -368,7 +368,7 @@ adapts to unilaterally. Concretely:
     unestablished alias, gets `0xE0`/`0x94` (Topic Alias invalid) instead of being silently
     dropped or misrouted.
 
-  **M7.2 — PUBLISH Properties, shipped in two PRs:**
+  **M7.2 — PUBLISH Properties, shipped in three PRs:**
   - **PR A** — shared outbound `PropertyWriter`/`PublishExtras` infra; **Message Expiry Interval**
     (0x02, TTL enforced against `steady_clock` at the `publish_to()` choke point — expired messages
     are dropped instead of delivered, both live and retained-replay paths); **Maximum Packet Size**
@@ -383,11 +383,21 @@ adapts to unilaterally. Concretely:
     three in its JSON body, `MqttBridgeSink`/`RabbitMqBridgeSink` accept-but-ignore since neither
     wire protocol has an equivalent concept today). Also closes a pre-existing gap: Will Properties
     now capture the same three fields (Will and regular PUBLISH share one delivery path).
+  - **PR C** — **outbound Topic Alias** (compression, the broker→subscriber direction M7.1's inbound
+    slice didn't cover): `publish_to()` now assigns a fresh alias (Topic Alias property + full topic
+    name) the FIRST time it delivers a given topic to a v5 session that advertised a nonzero Topic
+    Alias Maximum (0x22) in its own CONNECT (`Session::client_topic_alias_max`,
+    `mqtt_codec.hpp::ParsedProperties::topic_alias_maximum`), then REUSES it (empty topic name +
+    the same Topic Alias property, the actual byte savings) on every later delivery of that same
+    topic to that same session (`Session::outbound_topic_aliases`). Aliases are assigned once per
+    topic and never reassigned/reclaimed for the connection's life (§3.3.2.3.4); once every slot up
+    to the advertised maximum is taken, a further new topic just gets its full name with no alias — a
+    legal uncompressed fallback, not an error. A session that never advertised a Topic Alias Maximum
+    (nullopt, the pre-PR-C CONNECT shape) never receives one, per §3.1.2.11.2. Applies uniformly to
+    every `publish_to()` call site (live fanout, retained replay, offline-queue flush, Will delivery)
+    since they all share this one choke point.
 
   **Still deferred:**
-  - **Topic Alias** (compression, i.e. the *outbound* broker→subscriber direction) — the broker
-    never assigns/uses an alias of its own when delivering a PUBLISH; `publish_to()`'s wire shape
-    is unchanged. (Inbound/client→broker Topic Alias shipped in M7.1.)
   - **Shared Subscriptions** (`$share/...`) — no special-cased SUBSCRIBE filter handling.
   - **Enhanced/SASL Authentication** — the `0xF0` AUTH packet is not implemented; Authentication
     Method/Data (0x15/0x16) are parsed-and-skipped on CONNECT.

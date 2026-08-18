@@ -155,6 +155,7 @@ struct ParsedProperties {
     std::optional<std::string> response_topic;                // 017 M7.2 PR B — 0x08
     std::optional<std::vector<std::byte>> correlation_data;    // 017 M7.2 PR B — 0x09
     std::vector<std::pair<std::string, std::string>> user_properties;  // 017 M7.2 PR B — 0x26, repeatable
+    std::optional<std::uint16_t> topic_alias_maximum;        // 017 M7.2 PR C — 0x22 (CONNECT, outbound cap)
 };
 
 // Reads a Property Length varint, then walks exactly that many bytes as a sequence of
@@ -188,11 +189,13 @@ inline std::optional<ParsedProperties> read_properties(const std::vector<std::by
                 break;
             case PropWireType::TwoByteInt: {
                 if (pos + 2 > end) return std::nullopt;
-                if (*id == 0x23) {  // Topic Alias
-                    const std::uint16_t v = static_cast<std::uint16_t>(
-                        (std::to_integer<std::uint8_t>(body[pos]) << 8) |
-                        std::to_integer<std::uint8_t>(body[pos + 1]));
+                const std::uint16_t v = static_cast<std::uint16_t>(
+                    (std::to_integer<std::uint8_t>(body[pos]) << 8) |
+                    std::to_integer<std::uint8_t>(body[pos + 1]));
+                if (*id == 0x23) {          // Topic Alias (PUBLISH)
                     result.topic_alias = v;
+                } else if (*id == 0x22) {   // Topic Alias Maximum (CONNECT, 017 M7.2 PR C)
+                    result.topic_alias_maximum = v;
                 }
                 pos += 2;
                 break;
@@ -292,6 +295,11 @@ public:
     void put_u32(std::uint8_t id, std::uint32_t v) {
         records_.push_back(static_cast<std::byte>(id));
         put_u32_be(v);
+    }
+    // 017 M7.2 PR C: outbound Topic Alias (0x23) — the only TwoByteInt property this writer needs.
+    void put_u16(std::uint8_t id, std::uint16_t v) {
+        records_.push_back(static_cast<std::byte>(id));
+        put_u16_be(records_, v);  // unqualified free function — no member of that name to shadow it
     }
     void put_str(std::uint8_t id, std::string_view v) {
         records_.push_back(static_cast<std::byte>(id));
