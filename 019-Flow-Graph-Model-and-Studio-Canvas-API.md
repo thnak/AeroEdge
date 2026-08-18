@@ -112,28 +112,40 @@ conscious, recorded choice, not something left undecided), not a bug.
 
 ## 4. Studio canvas — turning the existing React Flow instance into a real editor
 
-`FlowDesigner.tsx` already depends on `@xyflow/react`; this is a mode change, not a new dependency:
+`FlowDesigner.tsx` already depends on `@xyflow/react`; this was a mode change, not a new dependency.
+**Delivered** (frontend-only slice — the backend already accepted everything this emits, since
+`load_application` silently ignores unknown top-level keys):
 
-- Flip `nodesDraggable`/`nodesConnectable`/`edgesReconnectable` to `true`; wire `onConnect` to append
-  an `EdgeSpec`, `onNodesChange`(drag) to update layout (next bullet), `onNodeClick` keeps today's
-  select-to-configure behavior.
+- `nodesDraggable`/`nodesConnectable`/`edgesReconnectable` flipped to `true`; `onConnect` appends a
+  `GraphEdge` (`application.ts`), `onEdgesDelete` removes one, `onNodesChange` tracks drag position,
+  `onNodeClick`(via the card's own `onSelect`) keeps the existing select-to-configure behavior.
+- A flow with no manually-drawn connection stays in **legacy mode**: `model.edges` is empty, array
+  order is still the DAG, and `toApplication` emits the exact historical minimal shape (no `id`, no
+  `edges` key) — the hello_flow round-trip test is untouched. The first drawn/deleted connection
+  **materializes** `model.edges` from the current implicit `n[i]->n[i+1]` chain plus the edit, and the
+  model stays in graph mode from then on (mirrors this section's own §6 G6 migration story, applied
+  symmetrically client-side).
 - `FlowCanvasNode` grows from one Top/Bottom `Handle` pair to **named handles per branch label** —
   NOT a `NodeDescriptor.ports` concept (§2 cut that: nodes have no real per-input slot to advertise).
-  Handles are a Studio-only presentation detail derived from a node's possible outgoing `from_port`
-  values — today that means exactly `aero.flow.switch` gets a "true"/"false" pair of handles, every
-  other node gets one generic output handle. Node-RED-style, but thinner: the backend doesn't route
-  distinct data per handle, only a branch label (§3).
-- **Node position is UI-only state, never runtime input.** Store it as a Studio-side sidecar the
-  runtime never parses — e.g. `application.studio_meta.layout: {[nodeId]: {x, y}}` — a field the
-  Flow Compiler explicitly ignores. This keeps 013 T3 ("Studio and runtime cannot drift") true: a
-  layout change alone must never be a redeploy-worthy diff.
-- Palette: today's `<select>` "+ Add node…" becomes a proper category sidebar (Source/Transform/
-  Rule/Output, matching `NodeCategory` from `node.hpp`), drag-to-canvas instead of dropdown-to-append
-  — same catalog data, different affordance.
-- Node-RED-style **inject/debug node**: a way to push one sample payload at a chosen node and see it
-  propagate, without a full deploy. Needs a runtime hook — flagged, not committed, in §5/§10.
-- EMQX-style **live trace overlay**: while `/metrics/stream` is open, highlight the last-active
-  step/edge on canvas. Needs per-step trace data the runtime doesn't expose yet — new endpoint, §5.
+  Handles are a Studio-only presentation detail — every node gets one generic target + one generic
+  source handle, except `aero.flow.switch`, which trades its one generic source handle for a labeled
+  "true"/"false" pair. Node-RED-style, but thinner: the backend doesn't route distinct data per
+  handle, only a branch label (§3). (Category-based handle-hiding — e.g. no source handle on an
+  Output node — was tried and reverted: it broke the implicit-chain fallback whenever an Output node
+  sits mid-array, a legal legacy-mode pattern, e.g. `aero.output.mes` as a side-effect that doesn't
+  stop the flow.)
+- **Node position is session-only client state (`FlowDesigner`'s own `positions`), never part of
+  `FlowModel`/the wire `Application`** — not the `application.studio_meta.layout` sidecar this section
+  originally proposed. Reasoning: nothing in the Studio re-fetches a deployed Application to
+  repopulate the Designer today (no `GET /apps/{name}` load-back path exists), so a persisted layout
+  would never be read back; worse, if `toApplication` emitted *any* layout — even a freshly
+  auto-computed one — it would break `application.test.ts`'s exact-shape round-trip guarantee. A
+  layered topological auto-layout (depth = longest path from a root) is the position default;
+  dragging overrides it for the session. Revisit the sidecar approach if/when a load-back path exists.
+- **Not delivered, still out of scope** (unchanged from this section's original text): the palette
+  stays today's `<select>` "+ Add node…" dropdown rather than a category sidebar with drag-to-canvas;
+  the Node-RED-style inject/debug node and the EMQX-style live trace overlay both still need runtime
+  hooks this slice didn't build (§5/§10).
 
 ## 5. New `aero-api` surface (extends 013 §9's REST+JSON / SSE decision, mirrors 016's route style)
 

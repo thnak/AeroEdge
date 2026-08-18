@@ -7,7 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import { FlowDesigner } from "../FlowDesigner";
 import { Panel, Button } from "../components";
 import { AeroApi, type StatusSnapshot } from "../api";
-import { toApplication, validateApplication, fromApplication, type FlowModel, type Application } from "../application";
+import { toApplication, validateApplication, validateGraph, fromApplication, type FlowModel, type Application } from "../application";
 import { sourceIds, outputIds } from "../catalog";
 
 const HELLO: Application = {
@@ -31,7 +31,7 @@ export function FlowsPage() {
   const [deployed, setDeployed] = useState(false);
 
   const app = toApplication(model);
-  const errors = validateApplication(app, sourceIds(), outputIds());
+  const errors = [...validateApplication(app, sourceIds(), outputIds()), ...validateGraph(app)];
 
   const say = (m: string) => setLog((l) => [m, ...l].slice(0, 20));
 
