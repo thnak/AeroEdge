@@ -393,6 +393,18 @@ target_compile_definitions(native_broker_security PRIVATE
 add_test(NAME native_broker_security COMMAND native_broker_security)
 set_tests_properties(native_broker_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 Phase 7 gate: the IoContext reactor migration for plaintext connections — mixed-mode fan-out
+# (one reactor/plaintext + one legacy/TLS recipient on the same topic) and the direct regression test for
+# Critical fix #1 (a stalled reactor client must not block other reactor sessions sharing the same reactor
+# thread). Needs aero-thirdparty-tls for the same reason native_broker_security does (a real mbedTLS
+# client-role TLS leg for the mixed-mode test).
+add_executable(reactor_migration broker/reactor_migration.cpp)
+target_link_libraries(reactor_migration PRIVATE aero::broker aero-thirdparty-tls)
+target_compile_definitions(reactor_migration PRIVATE
+  AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
+add_test(NAME reactor_migration COMMAND reactor_migration)
+set_tests_properties(reactor_migration PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # 017 Phase 2 Experiment C gate (redesign doc §1.5 gap #1 / §2.3 Experiment C): does a concurrent
 # publish-vs-teardown race already exist in the CURRENT SHIPPED NativeBroker? Unlike every other
 # tests/broker/*.cpp test (which deliberately sleeps to AVOID this race), this one runs straight at it

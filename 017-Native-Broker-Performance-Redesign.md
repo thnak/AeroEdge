@@ -1150,3 +1150,109 @@ non-blocking per-item sends** — not a small slice, a real design effort in
 its own right, most naturally scoped together with (or after) the `IoContext`
 reactor migration this doc has named as the eventual right home for
 non-blocking I/O in this broker.
+
+## Phase 7 — IoContext reactor migration for plaintext connections: 7a shipped, real fix for Phase 6's gap
+
+Phase 6 closed with the real fix identified but explicitly deferred: genuinely non-blocking, partial-send-
+aware writes, "most naturally scoped together with (or after) the `IoContext` reactor migration." This
+round took that on directly, at the user's explicit request for the broad-scope version rather than
+another narrow patch.
+
+### 7.0 Scope and process
+
+Plaintext connections are now reactor-managed (`accept_loop()` hands each accepted `Session` to a shared
+`quark::pal::IoContext` via `reactor_io_.post()` instead of spawning a `session_threads_` entry). TLS
+connections (`accept_loop_tls()`) are **unchanged** — they keep the pre-existing thread-per-connection
+`session_loop()` path this round, a deliberate scope cut: `TlsServerContext::accept()`'s handshake is
+still a blocking poll loop, and whether `mbedtls_ssl_handshake()` tolerates a non-blocking step machine
+was flagged as unverified every time this doc has touched TLS (§1.3, §2.3, §2.4) — forcing it into scope
+now would reintroduce exactly the kind of unvalidated risk this project has avoided everywhere else.
+
+A draft plan went through the same critique-before-code pass this doc's every prior phase has used
+(Phase 3/5/6). The critique caught one **severe** issue before any code shipped: the original draft only
+routed `route_publish()`'s fan-out through the new non-blocking path, leaving `Session::send_packet()`
+(the choke point every CONNACK/SUBACK/PINGRESP/PUBACK/PUBREC/PUBCOMP/DISCONNECT already calls directly)
+on the old unconditional blocking `write_packet()` call — meaning a single reactor client that stopped
+draining its own socket and then sent so much as a PINGREQ would have frozen the *entire* reactor thread,
+strictly worse than today's thread-per-connection model. This is the same failure shape that sank
+Phase 6 — "looks non-blocking at the layer being reviewed, still blocks through an unexamined call path"
+— caught THIS time by a pre-implementation critique instead of a post-implementation regression test.
+Three other must-fix issues (an unbounded reactor→legacy hand-off pool reproducing Phase 6's exact failure
+mode on a different edge of the dispatch table; a `del_fd`/`close_fd` ordering race; a post-construction
+data race on `is_reactor_session`) were also caught and fixed before implementation — full detail in the
+approved plan (now superseded by this section as the durable record).
+
+### 7.1 What shipped (7a)
+
+- **`Session::send_packet()` reactor-aware** (the critique's fix): branches on `is_reactor_session`.
+  Reactor sessions never block here, from any calling thread — a hard I/O error discovered later during
+  the actual non-blocking send tears the session down asynchronously instead of through this function's
+  return value.
+- **`enqueue_reactor_publish()`/`try_drain_reactor_send()`**: a genuinely non-blocking, partial-send-aware
+  outbound path — queues the *logical* message (topic/payload/qos/retain/extras, not pre-serialized
+  bytes, preserving Phase 6's own correctness fix for Message-Expiry re-checking at actual send time),
+  serializes on demand, tracks a byte offset across however many `EPOLLOUT` events a backed-up recipient
+  needs (mirrors `quark::net::tcp_transport.hpp`'s `Conn::out`/`out_sent` shape exactly). This is the
+  actual fix for the wall-clock-time problem that sank Phase 6: no send ever blocks the calling thread at
+  all, so an item-count cap has nothing left to bound.
+- **Mixed-mode fan-out dispatch** in `route_publish()`: a 3-way split (reactor-managed recipient from any
+  thread → `enqueue_reactor_publish()`; legacy recipient from the reactor thread → a bounded, persistent
+  2-worker hand-off pool with a per-send deadline, reusing `write_packet_bounded()`, new in
+  `mqtt_codec.hpp`; legacy recipient from any other thread → today's unchanged inline blocking
+  `publish_to()` call).
+- **`teardown_session()`'s `close_fd`/`io_mu` race fix**: a pre-existing, independent-of-this-phase race
+  (fan-out could race a concurrent teardown's unlocked `close_fd()`) closed by holding `io_mu` around it.
+- **Active takeover teardown** for reactor sessions (the idle-session promptness gap the critique caught)
+  and **`NativeBroker::stop()`'s reactor-session shutdown path** (mirrors `TcpTransport::stop()`'s
+  stop-then-join-then-touch-directly shape).
+- **Explicitly not in 7a**: TLS reactor integration, `IoContext` sharding beyond 1, removing
+  `io_mu`/`subs_mu`, changing `mqtt_codec.hpp`'s `read_packet()`/`read_n()`.
+
+### 7.2 Verification
+
+Full existing broker suite (`native_broker`, `mqtt5`, `broker_cluster`, `acl`, `bridge`,
+`buffered_read_framing`, `mqtt_codec`, `native_broker_security`) green — every plaintext-connecting test
+in that list now silently exercises the reactor path instead of the old thread-per-connection one, with
+zero test changes needed, including `mqtt5.cpp`'s `test_disconnect_reason_session_taken_over` (an idle
+reactor session's takeover DISCONNECT delivered promptly — direct coverage for the critique's idle-session
+gap). `concurrency_stress` (Phase 2 Experiment C's own permanent race test — publish-vs-abrupt-teardown,
+no artificial sleeps) run 20x: 20/20 clean, both before and after this round's edits. Full project `ctest`
+(45 targets): 100% pass.
+
+New `tests/broker/reactor_migration.cpp` (3 tests, run repeatedly clean): a mixed-mode test (one plaintext/
+reactor + one TLS/legacy subscriber on the same topic, published from each side — exercises 3 of the 4
+dispatch-table cells in one test); and the critical regression test for the critique's severe finding — a
+reactor client stops draining after connecting (real TCP backpressure via a 2048-byte × 500-message burst,
+the same technique Phase 6's own investigation proved necessary to force genuine backpressure), then
+several more `Session::send_packet()` calls (PINGREQ→PINGRESP) are forced against that same backed-up
+session, while 5 healthy reactor sessions on the same topic must keep receiving the full burst promptly.
+
+**This test was verified discriminating, not just passing** — per this session's standing "always prove
+with a small run" instruction: `send_packet()`'s reactor branch was temporarily reverted to the old
+unconditional-blocking call, the test was rebuilt and re-run, and it failed exactly as predicted (healthy
+subscribers stalled at 380/500, consistent with the reactor thread wedged on the stalled client's PINGRESP
+replies) — then the fix was restored and re-verified clean 3x. This closes the gap Phase 6's own process
+had: a pre-implementation critique caught a real bug in the design, but only a real adversarial *test* run
+against the actual code proves the fix works, and only a real test run against the *broken* version proves
+the test itself isn't vacuous.
+
+### 7.3 Honest scope: correctness this round, not the throughput/latency claim
+
+This round's verification is deliberately scoped to *correctness* — existing behavior preserved, the new
+path produces identical observable results, the identified races are closed, and (via the stalled-client
+test) a slow reactor recipient provably does not freeze other reactor sessions sharing the thread. It does
+**not** re-measure `broker_bench` throughput/latency numbers, and it does not re-run §2.4 Experiment B's
+full head-of-line-blocking benchmark against production code (only a pass/fail correctness assertion, not
+a p50/p99 latency measurement). Two follow-on slices remain explicitly open, matching the approved plan:
+
+- **7b**: benchmark-grade proof of the head-of-line-blocking fix in production code (Experiment B's own
+  shape — slow-but-alive reactor subscriber + healthy reactor subscribers, real p50/p99 numbers), plus
+  wiring `route_publish()`'s reactor-thread-originated fan-out loop with a bounded-inline/chained-`post()`
+  continuation (`voice_channel.hpp`'s own pattern) — not yet needed for correctness at the fan-out sizes
+  this round's tests exercise, but the natural next step once fan-out at real scale is being measured.
+- **7c**: real `broker_bench` before/after numbers (plaintext 1:1, fan-out, `--independent-pairs`
+  multi-core scaling), machine-noise controlled, raw per-round data preserved (closing §5.1's own
+  documented action item).
+
+No further implementation is planned without explicit direction, per this engagement's established
+discipline.

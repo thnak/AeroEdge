@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <expected>
@@ -166,6 +167,16 @@ public:
         }
 
         running_.store(true, std::memory_order_release);
+
+        // 017 Phase 7: start the reactor loop + its hand-off worker pool BEFORE accept_thread_ — plaintext
+        // connections are handed to the reactor the moment they're accepted (accept_loop()'s
+        // reactor_io_.post()), so the reactor must already be running to receive them.
+        reactor_thread_ = std::thread([this] { reactor_io_.run(); });
+        reactor_thread_id_ = reactor_thread_.get_id();  // available immediately, no need to wait for run()
+        handoff_workers_.reserve(kLegacyHandoffWorkerCount);
+        for (int i = 0; i < kLegacyHandoffWorkerCount; ++i)
+            handoff_workers_.emplace_back([this] { handoff_worker_loop(); });
+
         accept_thread_ = std::thread([this] { accept_loop(); });
         if (cfg_.tls) accept_thread_tls_ = std::thread([this] { accept_loop_tls(); });
         return {};
@@ -190,13 +201,43 @@ public:
             quark::pal::close_fd(listen_fd_tls_);
             listen_fd_tls_ = quark::pal::invalid_fd;
         }
+
+        // 017 Phase 7: stop the reactor loop and join its thread BEFORE touching any reactor session's
+        // state directly — mirrors quark::net::TcpTransport::stop()'s own shape (stop the loop, join the
+        // I/O thread; only THEN is it safe to touch remaining connection state with no concurrency risk,
+        // since nothing can dispatch a readiness/timer/posted callback once run() has returned).
+        reactor_io_.stop();
+        if (reactor_thread_.joinable()) reactor_thread_.join();
+
+        {
+            std::lock_guard<std::mutex> g(handoff_mu_);
+            handoff_stop_ = true;
+        }
+        handoff_cv_.notify_all();
+        for (std::thread& t : handoff_workers_)
+            if (t.joinable()) t.join();
+        handoff_workers_.clear();
+
+        std::vector<std::shared_ptr<Session>> reactor_sessions_to_teardown;
         {
             std::lock_guard<std::mutex> g(sessions_mu_);
             for (std::thread& t : session_threads_)
                 if (t.joinable()) t.join();
             session_threads_.clear();
+            // Every legacy session's own thread already called teardown_session() (Will delivery,
+            // persistent-session handoff, remove_session, close_fd) as the last thing it did before
+            // exiting, per session_loop()'s existing unchanged shape — so `sessions_` should already be
+            // empty of legacy entries by the time the joins above return. Reactor sessions never had a
+            // session_threads_ entry (accept_loop() hands them to the reactor instead) — collect them
+            // here and tear them down explicitly, OUTSIDE this lock (teardown_session() -> remove_session()
+            // re-acquires sessions_mu_ itself; calling it while still holding the lock here would
+            // self-deadlock).
+            for (auto& s : sessions_)
+                if (s->is_reactor_session) reactor_sessions_to_teardown.push_back(s);
             sessions_.clear();
         }
+        for (auto& s : reactor_sessions_to_teardown) teardown_session(s, /*clean_disconnect=*/false);
+
         tls_ctx_.reset();
     }
 
@@ -288,6 +329,33 @@ private:
                                 // not silently reset to "never expires" between PUBLISH and PUBREL.
     };
 
+    // 017 Phase 7: the per-Session outbound queue item shape for reactor-managed (plaintext) sessions.
+    // Exactly one of {raw item, logical item} ever exists per QueuedOutbound — kept as two separate
+    // struct types (rather than one struct with an is-raw flag) so each shape only carries the fields it
+    // actually needs. `Raw` covers Session::send_packet()'s direct replies (CONNACK/SUBACK/PINGRESP/
+    // PUBACK/PUBREC/PUBCOMP/DISCONNECT) — already fully built by their caller, no choke points apply.
+    // `Publish` covers route_publish()'s fan-out deliveries — deliberately the LOGICAL message (topic/
+    // payload/qos/retain/extras), not pre-serialized bytes, so the Message-Expiry-Interval and Maximum-
+    // Packet-Size choke points (publish_to()'s own, reused via build_publish_variable_header_and_payload()
+    // below) are re-checked at ACTUAL send time — which can be well after enqueue time for a backed-up
+    // recipient — exactly the correctness fix Phase 6/§3.0's critique already established and Phase 6
+    // itself preserved; only the wall-clock-blocking problem that sank Phase 6 is what this phase fixes.
+    struct QueuedOutboundRaw {
+        std::byte type_flags;
+        std::vector<std::byte> body;
+    };
+    struct QueuedOutboundPublish {
+        std::string topic;
+        std::vector<std::byte> payload;
+        std::uint8_t qos = 0;
+        bool retain = false;
+        PublishExtras extras;
+    };
+    struct QueuedOutbound {
+        std::optional<QueuedOutboundRaw> raw;
+        std::optional<QueuedOutboundPublish> publish;
+    };
+
     // One Session per accepted connection. io_mu_ serializes every write to `channel` — a PUBLISH fanned
     // out to this session from ANOTHER session's reader thread must not interleave on the wire with
     // this session's own SUBACK/PINGRESP/PUBACK writes.
@@ -307,20 +375,55 @@ private:
     // `fd` is kept alongside the channel (not folded away) because session_loop's keep-alive poll
     // (aero::pal::wait_readable(s->fd, 200)) and teardown's close_fd() both need the raw OS fd regardless
     // of channel kind — TLS still rides a real socket underneath.
-    struct Session {
-        explicit Session(quark::pal::fd_t f) : fd(f), channel(aero::transport::PlainChannel{f}) {}
+    //
+    // 017 Phase 7: `is_reactor_session` is `const`, set ONLY via the constructor (never a post-
+    // construction assignment) — a Plan-agent critique of this phase's draft flagged that a post-
+    // construction write has no established happens-before relationship with the session becoming
+    // visible to other threads (the reactor thread via reactor_io_.post(), or a fan-out thread reading it
+    // off the topic index), which would be an unsynchronized data race, not just a logic bug. Making it
+    // `const` turns "set before any other thread can see this object" into a property the compiler
+    // enforces, not documentation-only discipline — exactly `protocol_version`'s "negotiated once,
+    // read-only after" precedent, but load-bearing from construction rather than from handle_connect.
+    // The plaintext constructor (below) is reactor-managed; the TLS constructor never is (017 Phase 7's
+    // own scope decision — TLS reactor integration is explicitly deferred, see the design doc).
+    // `enable_shared_from_this` lets any Session member function obtain a weak_ptr to itself to safely
+    // capture in a lambda handed to `reactor_io_.post()` (mirrors voice_channel.hpp's State class, which
+    // solves the exact same "outlive an async continuation" problem the same way).
+    struct Session : std::enable_shared_from_this<Session> {
+        explicit Session(quark::pal::fd_t f)
+            : fd(f), channel(aero::transport::PlainChannel{f}), is_reactor_session(true) {}
         Session(quark::pal::fd_t f, aero::pal::tls::TlsSession tls_session)
             : fd(f),
               tls_owner(std::make_unique<aero::pal::tls::TlsSession>(std::move(tls_session))),
-              channel(aero::transport::TlsChannel{tls_owner.get()}) {}
+              channel(aero::transport::TlsChannel{tls_owner.get()}),
+              is_reactor_session(false) {}
 
         quark::pal::fd_t fd;
         std::unique_ptr<aero::pal::tls::TlsSession> tls_owner;  // non-null only for a TLS session
         std::variant<aero::transport::PlainChannel, aero::transport::TlsChannel> channel;
+        const bool is_reactor_session;  // see banner above — plaintext (reactor-managed) vs TLS (legacy)
 
         std::mutex io_mu;
         std::mutex subs_mu;
         std::vector<Subscription> subs;
+
+        // 017 Phase 7: reactor-session-only outbound state, all guarded by io_mu (reuses the existing
+        // mutex rather than adding a new one — this state only ever interacts with `channel`, which io_mu
+        // already protects). Never touched for a legacy (TLS) session — is_reactor_session gates every
+        // access. `out_queue` holds items not yet started; `out_current`/`out_sent` track the ONE packet
+        // currently mid-send (mirrors quark::net::tcp_transport.hpp's `Conn::out`/`out_sent` exactly:
+        // rotation to the next queued item only happens BETWEEN whole packets, never mid-packet).
+        // `write_interest_armed` avoids redundant mod_fd() calls once EPOLLOUT is already registered.
+        std::deque<QueuedOutbound> out_queue;
+        std::vector<std::byte> out_current;
+        std::size_t out_sent = 0;
+        bool write_interest_armed = false;
+        // 017 Phase 7: guards against a reactor session being torn down twice (e.g. a hard write error
+        // during try_drain_reactor_send and a concurrently-detected EOF both trying to schedule teardown)
+        // — schedule_reactor_teardown() only actually posts the teardown task for whichever caller wins
+        // the exchange. Legacy sessions never need this: session_loop's single owning thread only ever
+        // calls teardown_session() once, at the very end of its own loop, by construction.
+        std::atomic<bool> teardown_scheduled{false};
 
         // 017 Phase 3: the buffered-read inbound byte buffer (redesign doc §2.4 Experiment A / §3.1) —
         // same single-thread-owned discipline as client_id/keep_alive_s/etc. below (only this session's
@@ -372,12 +475,13 @@ private:
         // this session's own reader thread ever touches it, via handle_publish).
         std::unordered_map<std::uint16_t, std::string> topic_aliases;
 
-        bool send_packet(std::byte type_flags, const std::vector<std::byte>& body) {
-            std::lock_guard<std::mutex> g(io_mu);
-            return std::visit(
-                [&](auto& ch) { return aero::transport::mqtt::write_packet(ch, type_flags, body); }, channel);
-        }
-
+        // 017 Phase 7: the old Session::send_packet() member moved out to a NativeBroker method of the
+        // same name (see its definition below, near build_publish_variable_header_and_payload()) — it
+        // needs to reach reactor_io_/try_drain_reactor_send() for reactor sessions, which a nested
+        // struct's inline member body cannot do (NativeBroker is still an incomplete type at this point
+        // in the class definition). Every call site in this file changed from `s->send_packet(...)` /
+        // `s.send_packet(...)` to `send_packet(*s, ...)` / `send_packet(s, ...)` — a mechanical rename
+        // only, no business logic touched.
     };
 
     // A QoS ≥1 message that arrived for a client-id while it had no live connection (persistent session,
@@ -424,6 +528,12 @@ private:
     // "a device's PUBLISH topic set is small" allowance; revisit if a real deployment needs more.
     static constexpr std::uint16_t kTopicAliasMax = 16;
 
+    // 017 Phase 7: plaintext connections are reactor-managed (Session::is_reactor_session == true, set by
+    // the constructor used here) — accept_loop() itself is UNCHANGED above the registration step; only
+    // "spawn a session_threads_ entry" became "hand the session to the reactor via post()" (add_fd is
+    // loop-thread-only per IoContext's documented contract, so registration must run ON reactor_thread_,
+    // not here on the accept thread). accept_loop_tls() (below) is completely untouched — TLS sessions
+    // stay on the legacy thread-per-connection path this round (see the design doc's scope decision).
     void accept_loop() {
         while (running_.load(std::memory_order_acquire)) {
             const auto ready = aero::pal::wait_readable(listen_fd_, 200);
@@ -431,9 +541,272 @@ private:
             auto cfd = quark::pal::accept_one(listen_fd_);
             if (!cfd) continue;
             auto session = std::make_shared<Session>(*cfd);
-            std::lock_guard<std::mutex> g(sessions_mu_);
-            sessions_.push_back(session);
-            session_threads_.emplace_back([this, session] { session_loop(session); });
+            {
+                std::lock_guard<std::mutex> g(sessions_mu_);
+                sessions_.push_back(session);
+            }
+            reactor_io_.post([this, session] { register_reactor_session(session); });
+        }
+    }
+
+    // ============================================================================================
+    // 017 Phase 7: IoContext reactor machinery for plaintext sessions. Everything in this block only
+    // ever touches a reactor-managed Session (is_reactor_session == true) — legacy (TLS) sessions and
+    // session_loop()/teardown_session() below are otherwise unaffected by this block's existence.
+    // ============================================================================================
+
+    // 200ms — matches legacy session_loop()'s own wait_readable(fd, 200) poll cadence, so keep-alive
+    // promptness for reactor sessions is no worse than the legacy path's.
+    static constexpr std::int64_t kReactorKeepAliveSweepNs = 200'000'000;
+
+    [[nodiscard]] bool is_on_reactor_thread() const noexcept {
+        return std::this_thread::get_id() == reactor_thread_id_;
+    }
+
+    // Runs ON the reactor loop thread (always called via reactor_io_.post() from accept_loop() above, per
+    // add_fd()'s loop-thread-only contract). weak_ptr-captured (never a raw Session*, unlike
+    // voice_channel.hpp's own zero-allocation-optimized precedent — this round deliberately favors
+    // simplicity over that optimization; see 7a's own scope note: correctness this round, not throughput)
+    // so a session already torn down by the time a stale readiness event's dispatch runs is a safe no-op.
+    void register_reactor_session(const std::shared_ptr<Session>& s) {
+        std::weak_ptr<Session> weak = s;
+        reactor_io_.add_fd(s->fd, EPOLLIN, [this, weak](std::uint32_t events) {
+            auto sp = weak.lock();
+            if (!sp) return;
+            on_reactor_ready(sp, events);
+        });
+        arm_keep_alive_sweep(s);
+    }
+
+    // Perpetual self-rescheduling timer (mirrors quark::net::voice_channel.hpp's arm_idle_sweep() exactly)
+    // — replaces legacy session_loop()'s 200ms-poll-as-heartbeat idiom for reactor sessions. Always runs
+    // on the reactor loop thread (post_after() callbacks fire from inside IoContext::run() itself), so
+    // this never needs marshaling.
+    void arm_keep_alive_sweep(const std::shared_ptr<Session>& s) {
+        std::weak_ptr<Session> weak = s;
+        reactor_io_.post_after(kReactorKeepAliveSweepNs, [this, weak] {
+            auto sp = weak.lock();
+            if (!sp) return;
+            if (sp->teardown_scheduled.load(std::memory_order_acquire)) return;
+            if (keep_alive_expired(*sp)) {
+                send_disconnect(*sp, 0x8D);  // Keep Alive timeout (M7.1) — best-effort, see
+                                              // schedule_reactor_teardown()'s final-flush-attempt comment
+                schedule_reactor_teardown(sp, false);
+                return;
+            }
+            arm_keep_alive_sweep(sp);
+        });
+    }
+
+    // The reactor ReadyHandler's actual body — dispatched for EPOLLIN/EPOLLOUT/EPOLLERR/EPOLLHUP on a
+    // reactor session's fd. Reuses Phase 3's exact buffered-read inner drain loop (try_parse_packet() +
+    // dispatch to the SAME unchanged handle_connect/handle_subscribe/handle_publish/handle_pubrel) —
+    // only the outer driving mechanism differs from session_loop(): event-driven readiness instead of a
+    // blocking poll, and no thread-owned while(running_) loop to `break` out of — a session's lifetime
+    // here is entirely registration-driven (add_fd/del_fd), so every exit path calls
+    // schedule_reactor_teardown() instead.
+    void on_reactor_ready(const std::shared_ptr<Session>& s, std::uint32_t events) {
+        if (s->teardown_scheduled.load(std::memory_order_acquire)) return;  // already going away
+
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            schedule_reactor_teardown(s, /*clean_disconnect=*/false);
+            return;
+        }
+
+        if (events & EPOLLOUT) {
+            std::lock_guard<std::mutex> g(s->io_mu);
+            try_drain_reactor_send(s);
+        }
+        if (s->teardown_scheduled.load(std::memory_order_acquire)) return;  // a hard write error above
+
+        if (!(events & EPOLLIN)) return;
+
+        std::byte recv_scratch[4096];
+        auto got = std::visit(
+            [&](auto& ch) { return ch.recv_some(recv_scratch, sizeof(recv_scratch)); }, s->channel);
+        if (!got) {
+            if (got.error() == quark::pal::would_block()) return;  // spurious readiness — nothing to do
+            schedule_reactor_teardown(s, false);
+            return;
+        }
+        if (*got == 0) {  // peer closed — same Ok(0)/EOF contract session_loop() uses
+            schedule_reactor_teardown(s, false);
+            return;
+        }
+        s->read_buf.insert(s->read_buf.end(), recv_scratch, recv_scratch + *got);
+
+        bool clean_disconnect = false;
+        bool stop_session = false;
+        while (true) {
+            if (s->kicked.load(std::memory_order_acquire)) {
+                send_disconnect(*s, 0x8E);  // Session taken over (M7.1)
+                stop_session = true;
+                break;
+            }
+            auto pkt = aero::transport::mqtt::try_parse_packet(s->read_buf, s->read_pos);
+            if (!pkt) {
+                if (pkt.error() == aero::transport::mqtt::ParseStatus::Malformed) stop_session = true;
+                break;
+            }
+            s->last_activity = std::chrono::steady_clock::now();
+            const std::uint8_t type = pkt->type_flags & 0xF0;
+            if (type == 0x10) {          // CONNECT
+                if (!handle_connect(s, *pkt)) { stop_session = true; break; }
+            } else if (type == 0x80) {   // SUBSCRIBE
+                if (!handle_subscribe(s, *pkt)) { stop_session = true; break; }
+            } else if (type == 0x30) {   // PUBLISH
+                if (!handle_publish(*s, *pkt)) { stop_session = true; break; }
+            } else if (type == 0x60) {   // PUBREL
+                if (!handle_pubrel(*s, *pkt)) { stop_session = true; break; }
+            } else if (type == 0xC0) {   // PINGREQ
+                send_packet(*s, std::byte{0xD0}, {});  // PINGRESP — reactor sessions never report a
+                                                        // synchronous failure here, see send_packet()'s banner
+            } else if (type == 0xE0) {   // DISCONNECT
+                s->has_will = false;
+                clean_disconnect = true;
+                stop_session = true;
+                break;
+            }
+        }
+        if (s->read_pos > 0) {
+            s->read_buf.erase(s->read_buf.begin(),
+                              s->read_buf.begin() + static_cast<std::ptrdiff_t>(s->read_pos));
+            s->read_pos = 0;
+        }
+        if (stop_session) schedule_reactor_teardown(s, clean_disconnect);
+    }
+
+    // Tears down a reactor session. ALWAYS defers the actual work via reactor_io_.post(), even when
+    // already called from the reactor loop thread — deliberate, not an oversight: some callers (e.g.
+    // try_drain_reactor_send on a hard write error) are invoked WHILE still holding s->io_mu; running
+    // teardown inline there would self-deadlock the moment teardown_session() below takes io_mu again
+    // (the close_fd race fix). Deferring unconditionally means teardown always runs on a fresh call
+    // stack, after any caller's lock_guard has released — no per-call-site special-casing needed.
+    // `teardown_scheduled`'s exchange ensures only the FIRST of possibly-several concurrent triggers
+    // (hard write error, EOF, parse error, keep-alive expiry, session takeover) actually posts the task —
+    // without this, two racing triggers would each successfully weak_ptr::lock() and run
+    // teardown_session() twice (double Will delivery, double close_fd on a possibly-already-recycled fd
+    // number). weak_ptr-captured so a session already destroyed by the time this runs is a safe no-op.
+    void schedule_reactor_teardown(const std::shared_ptr<Session>& s, bool clean_disconnect) {
+        if (s->teardown_scheduled.exchange(true, std::memory_order_acq_rel)) return;
+        std::weak_ptr<Session> weak = s;
+        reactor_io_.post([this, weak, clean_disconnect] {
+            auto sp = weak.lock();
+            if (!sp) return;
+            {
+                // Best-effort final flush attempt (never blocks) — gives whatever's already queued (e.g.
+                // a DISCONNECT reason code enqueued by the same call that triggered this teardown) a
+                // chance to actually go out before the socket closes, matching legacy sessions' own
+                // best-effort posture for send_disconnect(). Whatever doesn't fit is simply not sent.
+                std::lock_guard<std::mutex> g(sp->io_mu);
+                try_drain_reactor_send(sp);
+            }
+            reactor_io_.del_fd(sp->fd);
+            teardown_session(sp, clean_disconnect);
+        });
+    }
+
+    // Precondition: caller holds s->io_mu. Arms EPOLLOUT interest for `s` if not already armed —
+    // marshaled via reactor_io_.post() when the calling thread isn't the reactor loop thread itself
+    // (mod_fd() is documented loop-thread-only, not internally synchronized). Fire-and-forget is
+    // sufficient: the caller doesn't need to know synchronously when interest actually gets armed.
+    void arm_write_interest(const std::shared_ptr<Session>& s) {
+        if (s->write_interest_armed) return;
+        s->write_interest_armed = true;
+        if (is_on_reactor_thread()) {
+            reactor_io_.mod_fd(s->fd, EPOLLIN | EPOLLOUT);
+            return;
+        }
+        std::weak_ptr<Session> weak = s;
+        reactor_io_.post([this, weak] {
+            auto sp = weak.lock();
+            if (sp) reactor_io_.mod_fd(sp->fd, EPOLLIN | EPOLLOUT);
+        });
+    }
+
+    // route_publish()'s fan-out loop calls this for a reactor-managed recipient, from ANY thread. Never
+    // blocks. Queues the LOGICAL message (see QueuedOutboundPublish's own banner) so choke points
+    // re-run at actual send time, not enqueue time.
+    void enqueue_reactor_publish(const std::shared_ptr<Session>& s, const std::string& topic,
+                                 const std::vector<std::byte>& payload, std::uint8_t qos, bool retain,
+                                 const PublishExtras& extras) {
+        std::lock_guard<std::mutex> g(s->io_mu);
+        s->out_queue.push_back(
+            QueuedOutbound{std::nullopt, QueuedOutboundPublish{topic, payload, qos, retain, extras}});
+        try_drain_reactor_send(s);
+    }
+
+    // Precondition: caller holds s->io_mu. Serializes+sends as much of the outbound queue as possible
+    // WITHOUT EVER BLOCKING the calling thread — on a genuine would-block it arms EPOLLOUT and returns;
+    // the reactor's own later EPOLLOUT dispatch resumes this same function. This is the mechanism that
+    // makes 017 Phase 7 actually different from Phase 6: Phase 6's item-count cap bounded how many items
+    // a flush drained, not how long any ONE blocking send could take. Here, no send ever blocks at all —
+    // a would-block returns control to the reactor loop instead of waiting on it.
+    void try_drain_reactor_send(const std::shared_ptr<Session>& s) {
+        for (;;) {
+            while (s->out_current.empty() && !s->out_queue.empty()) {
+                QueuedOutbound item = std::move(s->out_queue.front());
+                s->out_queue.pop_front();
+                std::byte type_flags{};
+                std::vector<std::byte> body;
+                bool ok;
+                if (item.raw) {
+                    type_flags = item.raw->type_flags;
+                    body = std::move(item.raw->body);
+                    ok = true;
+                } else {
+                    const QueuedOutboundPublish& p = *item.publish;
+                    std::uint8_t flags = static_cast<std::uint8_t>(p.qos << 1);
+                    if (p.retain) flags |= 0x01;
+                    type_flags = static_cast<std::byte>(0x30 | flags);
+                    ok = build_publish_variable_header_and_payload(*s, p.topic, p.payload, p.qos, p.extras,
+                                                                    body);
+                }
+                if (!ok) continue;  // choke point said skip this item — try the next queued one
+                s->out_current = aero::transport::mqtt::serialize_packet(type_flags, body);
+                s->out_sent = 0;
+            }
+            if (s->out_current.empty()) {  // queue fully drained
+                if (s->write_interest_armed) {
+                    s->write_interest_armed = false;
+                    if (is_on_reactor_thread()) {
+                        reactor_io_.mod_fd(s->fd, EPOLLIN);
+                    } else {
+                        std::weak_ptr<Session> weak = s;
+                        reactor_io_.post([this, weak] {
+                            auto sp = weak.lock();
+                            if (sp) reactor_io_.mod_fd(sp->fd, EPOLLIN);
+                        });
+                    }
+                }
+                return;
+            }
+            auto w = std::visit(
+                [&](auto& ch) {
+                    return ch.send_some(s->out_current.data() + s->out_sent,
+                                        s->out_current.size() - s->out_sent);
+                },
+                s->channel);
+            if (w) {
+                s->out_sent += *w;
+                if (s->out_sent >= s->out_current.size()) {
+                    s->out_current.clear();
+                    s->out_sent = 0;
+                }
+                continue;  // more of this packet to send, or move on to the next queued item
+            }
+            if (w.error() != quark::pal::would_block()) {
+                // Hard I/O error — discard the rest of the queue and tear this session down
+                // asynchronously; never call back into teardown machinery from inside a non-blocking
+                // send attempt (schedule_reactor_teardown() defers for exactly this reason).
+                s->out_queue.clear();
+                s->out_current.clear();
+                s->out_sent = 0;
+                schedule_reactor_teardown(s, /*clean_disconnect=*/false);
+                return;
+            }
+            arm_write_interest(s);
+            return;
         }
     }
 
@@ -545,7 +918,7 @@ private:
                                               // mirrors this file's existing tolerance of e.g. SUBSCRIBE's flags)
                     if (!handle_pubrel(*s, *pkt)) { stop_session = true; break; }
                 } else if (type == 0xC0) {   // PINGREQ
-                    if (!s->send_packet(std::byte{0xD0}, {})) { stop_session = true; break; }  // PINGRESP
+                    if (!send_packet(*s, std::byte{0xD0}, {})) { stop_session = true; break; }  // PINGRESP
                 } else if (type == 0xE0) {   // DISCONNECT (3.1.1 §3.14): graceful — no Will on a clean
                                               // disconnect, so discard it BEFORE teardown runs.
                     s->has_will = false;
@@ -610,7 +983,31 @@ private:
         }
 
         remove_session(s);
-        quark::pal::close_fd(s->fd);
+
+        // 017 Phase 7: close_fd() used to run with NO io_mu lock — a fan-out that already snapshotted
+        // this shared_ptr<Session> (topic_index_candidates() releases topic_index_mu_ before any write
+        // happens) could race a concurrent teardown's close here, a classic fd-reuse hazard: the OS can
+        // hand this exact fd number to a brand-new accept()'d connection before the racing writer's
+        // send_some() call runs. Pre-existing (independent of this phase), but a persistent per-session
+        // outbound queue (items can sit queued across multiple readiness events, not just one in-flight
+        // call) widens the window significantly, so this phase closes it rather than inheriting it: hold
+        // io_mu around close_fd — every writer (send_packet(), try_drain_reactor_send(), the legacy
+        // hand-off pool) already takes io_mu before touching `channel`/`fd`, so this establishes a real
+        // happens-before between "last possible write" and "fd closed". Reactor sessions additionally
+        // discard any still-queued outbound state here — defensive: by the time teardown_session() runs
+        // for a reactor session, schedule_reactor_teardown() has already del_fd()'d it, so no further
+        // readiness event can invoke try_drain_reactor_send() on it, but a foreign-thread enqueue that
+        // raced the teardown post (e.g. a fan-out publish that snapshotted this session moments before)
+        // could still have pushed one more item onto out_queue right before this runs.
+        {
+            std::lock_guard<std::mutex> g(s->io_mu);
+            if (s->is_reactor_session) {
+                s->out_queue.clear();
+                s->out_current.clear();
+                s->out_sent = 0;
+            }
+            quark::pal::close_fd(s->fd);
+        }
     }
 
     bool handle_connect(const std::shared_ptr<Session>& s, const aero::transport::mqtt::Packet& pkt) {
@@ -638,7 +1035,7 @@ private:
         // what the client might have claimed — we can't trust a v5-shaped ack for a version we don't
         // recognize, and this 2-byte shape is legal for a rejecting server to send either way.
         if (protocol_level != 0x04 && protocol_level != 0x05) {
-            (void)s->send_packet(std::byte{0x20}, {std::byte{0x00}, std::byte{0x01}});
+            (void)send_packet(*s, std::byte{0x20}, {std::byte{0x00}, std::byte{0x01}});
             return false;
         }
         const bool is_v5 = protocol_level == 0x05;
@@ -767,9 +1164,9 @@ private:
                 if (is_v5) {
                     std::vector<std::byte> body{std::byte{0x00}, std::byte{0x86}};  // Bad User Name or Password
                     aero::transport::mqtt::put_empty_properties(body);
-                    (void)s->send_packet(std::byte{0x20}, body);
+                    (void)send_packet(*s, std::byte{0x20}, body);
                 } else {
-                    (void)s->send_packet(std::byte{0x20}, {std::byte{0x00}, std::byte{0x04}});
+                    (void)send_packet(*s, std::byte{0x20}, {std::byte{0x00}, std::byte{0x04}});
                 }
                 return false;
             }
@@ -799,11 +1196,32 @@ private:
             // first. "Closes" here means flip the OLD session's `kicked` flag, which IT notices in its
             // own poll loop and tears down on ITS OWN thread — this file never closes a socket from a
             // thread that doesn't own it (matches stop()'s and session_loop's existing discipline).
+            //
+            // 017 Phase 7: a LEGACY session notices `kicked` within ~200ms via session_loop's own
+            // unconditional poll, even while otherwise idle. A reactor session has no equivalent
+            // always-running poll — its handler only runs on genuine fd readiness or an armed timer — so
+            // an idle, kicked reactor session would otherwise sit connected indefinitely instead of being
+            // torn down promptly (a real behavior regression a Plan-agent critique of this phase's draft
+            // caught before any code shipped). Fix: actively schedule its teardown here instead of
+            // relying on passive discovery — safe to call from this (a different session's) thread,
+            // exactly what schedule_reactor_teardown()'s weak_ptr-captured post() design is for.
             {
                 std::lock_guard<std::mutex> g(client_sessions_mu_);
                 const auto it = client_sessions_.find(client_id);
-                if (it != client_sessions_.end() && it->second != s)
+                if (it != client_sessions_.end() && it->second != s) {
                     it->second->kicked.store(true, std::memory_order_release);
+                    if (it->second->is_reactor_session) {
+                        // Legacy sessions send this from their own session_loop() the moment they notice
+                        // `kicked` (within ~200ms). A reactor session has no equivalent poll to notice it
+                        // passively (the promptness gap a Plan-agent critique caught), so send it here,
+                        // from this (the NEW session's) thread — send_packet() is safe from any thread for
+                        // a reactor recipient — then actively schedule teardown; schedule_reactor_teardown()
+                        // makes a best-effort final drain attempt before closing, so this enqueued
+                        // DISCONNECT gets a real chance to go out before the socket closes.
+                        send_disconnect(*it->second, 0x8E);  // Session taken over (M7.1)
+                        schedule_reactor_teardown(it->second, false);
+                    }
+                }
                 client_sessions_[client_id] = s;
             }
 
@@ -848,7 +1266,7 @@ private:
         // kTopicAliasMax (MQTT 5 §3.1.2.11.2).
         std::vector<std::byte> body{static_cast<std::byte>(session_present ? 0x01 : 0x00), std::byte{0x00}};
         if (is_v5) aero::transport::mqtt::put_topic_alias_max_properties(body, kTopicAliasMax);
-        if (!s->send_packet(std::byte{0x20}, body)) return false;  // CONNACK
+        if (!send_packet(*s, std::byte{0x20}, body)) return false;  // CONNACK
 
         // Flush anything that arrived while this persistent session was offline — AFTER CONNACK, per
         // 3.1.1 (the client only knows to expect them once it's seen session-present=1).
@@ -921,7 +1339,7 @@ private:
         aero::transport::mqtt::put_u16_be(vh, packet_id);
         if (s->protocol_version == 5) aero::transport::mqtt::put_empty_properties(vh);
         vh.insert(vh.end(), granted.begin(), granted.end());
-        if (!s->send_packet(std::byte{0x90}, vh)) return false;  // SUBACK
+        if (!send_packet(*s, std::byte{0x90}, vh)) return false;  // SUBACK
 
         // Retained-message replay (3.1.1 §3.8.4): a new matching SUBSCRIBE gets the retained payload
         // immediately, at the subscription's granted QoS. M7.2 PR A: msg.extras carries the retained
@@ -1036,7 +1454,7 @@ private:
             s.qos2_inflight[packet_id] = PendingQos2{resolved_topic, payload, retain, extras};
             std::vector<std::byte> ack;
             aero::transport::mqtt::put_u16_be(ack, packet_id);
-            return s.send_packet(std::byte{0x50}, ack);  // PUBREC
+            return send_packet(s, std::byte{0x50}, ack);  // PUBREC
         }
 
         // QoS 0/1: act BEFORE acking — a publisher that has received its PUBACK must be able to assume a
@@ -1047,7 +1465,7 @@ private:
             if (!allowed) return true;  // silent drop: no PUBACK
             std::vector<std::byte> ack;
             aero::transport::mqtt::put_u16_be(ack, packet_id);
-            if (!s.send_packet(std::byte{0x40}, ack)) return false;  // PUBACK
+            if (!send_packet(s, std::byte{0x40}, ack)) return false;  // PUBACK
         }
         return true;
     }
@@ -1075,7 +1493,7 @@ private:
         }
         std::vector<std::byte> ack;
         aero::transport::mqtt::put_u16_be(ack, packet_id);
-        return s.send_packet(std::byte{0x70}, ack);  // PUBCOMP
+        return send_packet(s, std::byte{0x70}, ack);  // PUBCOMP
     }
 
     // The action a PUBLISH ultimately performs once its QoS contract permits it: QoS 0/1 call this
@@ -1119,8 +1537,22 @@ private:
     // filter), so delivery semantics — including per-session duplicate delivery for overlapping
     // subscriptions — are byte-for-byte unchanged; only which sessions get scanned at all has changed.
     //
+    // 017 Phase 7: the fan-out dispatch is now a 3-way split by (recipient kind, calling thread) — the
+    // 4th cell of the design doc's dispatch table ("any non-reactor-loop thread" -> legacy recipient) IS
+    // this function's original unchanged inline publish_to() call, so it collapses into the `else` below.
+    // `caller_on_reactor_thread` is computed ONCE per route_publish() call, not per-candidate: the calling
+    // thread doesn't change mid-loop. The 3 kinds:
+    //   - reactor-managed recipient (any calling thread): enqueue_reactor_publish() — never blocks.
+    //   - legacy recipient, caller IS the reactor thread: MUST NOT call blocking publish_to() inline (would
+    //     freeze every other reactor session) — hands off to the bounded, persistent worker pool instead
+    //     (enqueue_legacy_handoff(), Critical fix #2 — bounded queue + send deadline, unlike Phase 6's
+    //     unbounded item-count-only cap).
+    //   - legacy recipient, caller is any other thread (a legacy session's own thread, or the
+    //     BrokerRelayActor cluster-relay worker thread — both grouped here since neither is the reactor
+    //     loop thread): today's unchanged inline blocking publish_to() call, exactly as before this phase.
     void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
                        const PublishExtras& extras = {}) {
+        const bool caller_on_reactor_thread = is_on_reactor_thread();
         for (const auto& session : topic_index_candidates(topic)) {
             std::vector<Subscription> matches;
             {
@@ -1130,7 +1562,13 @@ private:
             }
             for (const Subscription& sub : matches) {
                 const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
-                (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false, extras);
+                if (session->is_reactor_session) {
+                    enqueue_reactor_publish(session, topic, payload, deliver_qos, /*retain=*/false, extras);
+                } else if (caller_on_reactor_thread) {
+                    enqueue_legacy_handoff(session, topic, payload, deliver_qos, /*retain=*/false, extras);
+                } else {
+                    (void)publish_to(*session, topic, payload, deliver_qos, /*retain=*/false, extras);
+                }
             }
         }
 
@@ -1153,34 +1591,66 @@ private:
         if (s.protocol_version != 5) return;
         std::vector<std::byte> body{static_cast<std::byte>(reason_code)};
         aero::transport::mqtt::put_empty_properties(body);
-        (void)s.send_packet(std::byte{0xE0}, body);
+        (void)send_packet(s, std::byte{0xE0}, body);
     }
 
-    // 017 M7.2 PR A: this function used to write ZERO Properties bytes for outbound PUBLISH, for EVERY
-    // protocol version — not even an empty MQTT 5 Properties field, which is actually a latent correctness
-    // bug (§3.3.1 requires one, mandatory-even-empty, for v5; see this file's M7/M7.1 banners' own honest
-    // "outbound PUBLISH framing is untouched" scope notes, now superseded). This rewrite fixes that AS A
-    // DOCUMENTED BYPRODUCT while adding the two PR A choke points below. v4 sessions never enter the
-    // `protocol_version == 5` branch — wire shape is byte-for-byte unchanged for them, a hard invariant.
-    bool publish_to(Session& s, const std::string& topic, const std::vector<std::byte>& payload,
-                    std::uint8_t qos, bool retain, const PublishExtras& extras = {}) {
+    // 017 Phase 7 (Critical fix #1): the single choke point EVERY outbound write on a Session goes
+    // through — CONNACK/SUBACK/PINGRESP/PUBACK/PUBREC/PUBCOMP/DISCONNECT directly (every call site above
+    // and below this file mechanically renamed from `s->send_packet(...)`/`s.send_packet(...)` to
+    // `send_packet(*s, ...)`/`send_packet(s, ...)` — no business logic touched), and PUBLISH indirectly
+    // via publish_to() below. A Plan-agent critique of this phase's draft caught that routing ONLY
+    // route_publish()'s fan-out through the new non-blocking path (and leaving this one alone) would
+    // still let a single unresponsive reactor client freeze the entire reactor thread the moment it sent
+    // anything needing an immediate reply (a bare PINGREQ is enough) — exactly Phase 6's disproven "looks
+    // non-blocking but isn't, once you trace every call path" failure shape, just through a different
+    // door. Legacy (TLS) sessions keep today's unconditional blocking write_packet() call, byte-for-byte
+    // unchanged, still reporting real synchronous success/failure. Reactor sessions NEVER block here,
+    // regardless of which thread calls this — the write is queued (see QueuedOutboundRaw), not
+    // necessarily sent yet, so this always reports success; a hard I/O error discovered later during the
+    // actual non-blocking send tears the session down asynchronously via schedule_reactor_teardown()
+    // instead of through this function's return value — the reactor has no per-session read loop to
+    // `break` out of the way session_loop() does, so there is nothing for a synchronous failure here to
+    // usefully signal for a reactor session.
+    bool send_packet(Session& s, std::byte type_flags, const std::vector<std::byte>& body) {
+        if (!s.is_reactor_session) {
+            std::lock_guard<std::mutex> g(s.io_mu);
+            return std::visit(
+                [&](auto& ch) { return aero::transport::mqtt::write_packet(ch, type_flags, body); },
+                s.channel);
+        }
+        std::shared_ptr<Session> sp = s.shared_from_this();
+        std::lock_guard<std::mutex> g(s.io_mu);
+        s.out_queue.push_back(QueuedOutbound{QueuedOutboundRaw{type_flags, body}, std::nullopt});
+        try_drain_reactor_send(sp);
+        return true;
+    }
+
+    // 017 Phase 5/Phase 7: builds [PUBLISH variable header + v5 Properties + payload] into `out` (does
+    // NOT include the fixed header byte or remaining-length prefix — callers add framing separately via
+    // aero::transport::mqtt::serialize_packet()/write_packet()/write_packet_bounded()). Extracted
+    // (Phase 7) from publish_to() below so the reactor outbound-queue drain path (which must build this
+    // into a per-Session buffer that outlives one call, not publish_to()'s thread_local scratch) and the
+    // reactor->legacy hand-off pool (Critical fix #2) can reuse the exact same choke-point + serialization
+    // logic instead of re-deriving it — publish_to() itself is UNCHANGED in behavior, only its body is now
+    // split between this function and the framing/send it still does directly (thread_local `vh` reuse,
+    // Phase 5's shipped pooling win, is fully preserved since publish_to() still owns and passes its own
+    // thread_local buffer as `out`). Returns false if a choke point (Message Expiry / Maximum Packet Size)
+    // says this message must not be sent — callers must treat that as "skip, not an error", the same
+    // silent-drop idiom this file has always used (mirrors the ACL-denial idiom: one message not going out
+    // must never tear a session down).
+    [[nodiscard]] bool build_publish_variable_header_and_payload(
+            Session& s, const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
+            const PublishExtras& extras, std::vector<std::byte>& out) {
         // Choke point 1 — Message Expiry: check first, before building anything, so an already-stale
-        // message (offline queue flush, retained replay, or plain fanout racing a long expiry) never gets
-        // serialized. Silent drop (return true, not false) — mirrors this file's existing ACL-denial idiom:
-        // "this one message doesn't go out" must not tear the session down.
+        // message (offline queue flush, retained replay, plain fanout, or a backed-up reactor recipient's
+        // queued item) never gets serialized.
         if (extras.expiry_deadline && std::chrono::steady_clock::now() >= *extras.expiry_deadline) {
-            return true;
+            return false;
         }
 
-        // 017 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector on every one of
-        // this function's 3 call sites (route_publish's fan-out loop, offline-queue flush, retained
-        // replay) - safe because write_packet() (mqtt_codec.hpp) fully copies its `body` parameter (vh)
-        // into its own owned buffer BEFORE the potentially-blocking send/retry loop starts, so a stalled
-        // recipient socket can never extend vh's "live" window past this function's return.
-        static thread_local std::vector<std::byte> vh;
-        vh.clear();
-        aero::transport::mqtt::put_str(vh, topic);
-        if (qos > 0) aero::transport::mqtt::put_u16_be(vh, next_packet_id());
+        out.clear();
+        aero::transport::mqtt::put_str(out, topic);
+        if (qos > 0) aero::transport::mqtt::put_u16_be(out, next_packet_id());
 
         if (s.protocol_version == 5) {
             aero::transport::mqtt::PropertyWriter pw;
@@ -1199,22 +1669,40 @@ private:
             for (const auto& [k, v] : extras.user_properties) pw.put_str_pair(0x26, k, v);
             std::vector<std::byte> props;
             pw.write(props);  // valid Properties block even when pw is empty (one 0x00 byte) — the §3.3.1 fix
-            vh.insert(vh.end(), props.begin(), props.end());
+            out.insert(out.end(), props.begin(), props.end());
         }
-        vh.insert(vh.end(), payload.begin(), payload.end());
+        out.insert(out.end(), payload.begin(), payload.end());
 
         // Choke point 2 — Maximum Packet Size: after Properties are written (so the check covers the real
         // wire size, not an underestimate), before send.
         if (s.max_packet_size) {
             std::vector<std::byte> len_scratch;
-            aero::transport::mqtt::put_remaining_length(len_scratch, static_cast<std::uint32_t>(vh.size()));
-            const std::size_t total = 1 + len_scratch.size() + vh.size();  // fixed-header byte + rem-len + vh
-            if (total > *s.max_packet_size) return true;  // silent drop, same idiom as choke point 1
+            aero::transport::mqtt::put_remaining_length(len_scratch, static_cast<std::uint32_t>(out.size()));
+            const std::size_t total = 1 + len_scratch.size() + out.size();  // fixed-header + rem-len + out
+            if (total > *s.max_packet_size) return false;  // silent drop, same idiom as choke point 1
         }
+        return true;
+    }
+
+    // 017 M7.2 PR A: this function used to write ZERO Properties bytes for outbound PUBLISH, for EVERY
+    // protocol version — not even an empty MQTT 5 Properties field, which is actually a latent correctness
+    // bug (§3.3.1 requires one, mandatory-even-empty, for v5; see this file's M7/M7.1 banners' own honest
+    // "outbound PUBLISH framing is untouched" scope notes, now superseded). This rewrite fixes that AS A
+    // DOCUMENTED BYPRODUCT while adding the two PR A choke points below. v4 sessions never enter the
+    // `protocol_version == 5` branch — wire shape is byte-for-byte unchanged for them, a hard invariant.
+    bool publish_to(Session& s, const std::string& topic, const std::vector<std::byte>& payload,
+                    std::uint8_t qos, bool retain, const PublishExtras& extras = {}) {
+        // 017 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector on every one of
+        // this function's 3 call sites (route_publish's fan-out loop, offline-queue flush, retained
+        // replay) - safe because write_packet() (mqtt_codec.hpp) fully copies its `body` parameter (vh)
+        // into its own owned buffer BEFORE the potentially-blocking send/retry loop starts, so a stalled
+        // recipient socket can never extend vh's "live" window past this function's return.
+        static thread_local std::vector<std::byte> vh;
+        if (!build_publish_variable_header_and_payload(s, topic, payload, qos, extras, vh)) return true;
 
         std::uint8_t flags = static_cast<std::uint8_t>(qos << 1);
         if (retain) flags |= 0x01;
-        return s.send_packet(static_cast<std::byte>(0x30 | flags), vh);
+        return send_packet(s, static_cast<std::byte>(0x30 | flags), vh);
     }
 
     std::uint16_t next_packet_id() {
@@ -1336,7 +1824,87 @@ private:
 
     std::mutex sessions_mu_;
     std::vector<std::shared_ptr<Session>> sessions_;
-    std::vector<std::thread> session_threads_;
+    std::vector<std::thread> session_threads_;  // legacy (TLS) sessions only — reactor sessions never
+                                                 // get an entry here (see accept_loop()'s Phase 7 banner)
+
+    // 017 Phase 7: the shared reactor (single shard, per the design doc's §2.2 resolution — sharding
+    // stays a future, separately-validated option) plaintext sessions register with. `reactor_thread_id_`
+    // is read via std::thread::get_id() on the constructing thread immediately after reactor_thread_'s
+    // construction (available without waiting for the thread body to start) — is_on_reactor_thread()
+    // compares against it to decide whether an IoContext loop-thread-only call (add_fd/mod_fd/del_fd/
+    // post_after) can be made directly or must be marshaled via reactor_io_.post() instead.
+    quark::pal::IoContext reactor_io_;
+    std::thread reactor_thread_;
+    std::thread::id reactor_thread_id_;
+
+    // 017 Phase 7 (Critical fix #2): the bounded, persistent worker pool for "a reactor-originated
+    // PUBLISH fanning out to a legacy (TLS) recipient" — reuses BrokerCluster's own "dedicated persistent
+    // worker, not ad-hoc pooled dispatch" precedent (broker_cluster.hpp's 1-worker Quark engine for
+    // BrokerRelayActor), implemented here as a plain fixed-size std::thread pool rather than pulling in
+    // Quark's full actor/message-pool machinery, which solves a different problem (cross-actor routing)
+    // than "drain a bounded queue with N persistent workers" needs. Bounded queue depth (drop-oldest, the
+    // same idiom as kQueuedMessageCap's offline-message cap) + a per-send deadline
+    // (write_packet_bounded(), mqtt_codec.hpp) together ensure one persistently slow legacy recipient can
+    // occupy a worker for at most kLegacyHandoffSendDeadline, never forever — the exact bound Phase 6's
+    // item-count-only cap failed to provide, applied here to the one edge of the mixed-mode dispatch
+    // table that still uses a worker pool rather than genuinely non-blocking per-item sends.
+    struct LegacyHandoffItem {
+        std::shared_ptr<Session> target;
+        std::string topic;
+        std::vector<std::byte> payload;
+        std::uint8_t qos = 0;
+        bool retain = false;
+        PublishExtras extras;
+    };
+    static constexpr std::size_t kLegacyHandoffQueueCap = 100;
+    static constexpr std::chrono::seconds kLegacyHandoffSendDeadline{5};
+    static constexpr int kLegacyHandoffWorkerCount = 2;
+
+    std::mutex handoff_mu_;
+    std::condition_variable handoff_cv_;
+    std::deque<LegacyHandoffItem> handoff_queue_;
+    bool handoff_stop_ = false;
+    std::vector<std::thread> handoff_workers_;
+
+    void enqueue_legacy_handoff(const std::shared_ptr<Session>& target, const std::string& topic,
+                                const std::vector<std::byte>& payload, std::uint8_t qos, bool retain,
+                                const PublishExtras& extras) {
+        std::lock_guard<std::mutex> g(handoff_mu_);
+        if (handoff_queue_.size() >= kLegacyHandoffQueueCap) handoff_queue_.pop_front();  // drop-oldest
+        handoff_queue_.push_back(LegacyHandoffItem{target, topic, payload, qos, retain, extras});
+        handoff_cv_.notify_one();
+    }
+
+    void handoff_worker_loop() {
+        for (;;) {
+            LegacyHandoffItem item;
+            {
+                std::unique_lock<std::mutex> lk(handoff_mu_);
+                handoff_cv_.wait(lk, [this] { return handoff_stop_ || !handoff_queue_.empty(); });
+                if (handoff_stop_ && handoff_queue_.empty()) return;
+                item = std::move(handoff_queue_.front());
+                handoff_queue_.pop_front();
+            }
+            std::vector<std::byte> body;
+            if (!build_publish_variable_header_and_payload(*item.target, item.topic, item.payload,
+                                                            item.qos, item.extras, body))
+                continue;  // choke point said skip
+            std::uint8_t flags = static_cast<std::uint8_t>(item.qos << 1);
+            if (item.retain) flags |= 0x01;
+            const auto deadline = std::chrono::steady_clock::now() + kLegacyHandoffSendDeadline;
+            std::lock_guard<std::mutex> g(item.target->io_mu);
+            // A false return (deadline exceeded or a hard error) is treated the same as every other
+            // best-effort fan-out delivery in this file — route_publish() never reports per-recipient
+            // failures back to the publisher. The recipient's own reader thread notices a genuinely dead
+            // connection on its next read attempt and tears itself down through the normal path.
+            (void)std::visit(
+                [&](auto& ch) {
+                    return aero::transport::mqtt::write_packet_bounded(
+                        ch, static_cast<std::byte>(0x30 | flags), body, deadline);
+                },
+                item.target->channel);
+        }
+    }
 
     std::mutex retained_mu_;
     std::unordered_map<std::string, RetainedMessage> retained_;

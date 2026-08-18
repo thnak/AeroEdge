@@ -26,6 +26,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -451,17 +452,27 @@ inline std::expected<Packet, ParseStatus> try_parse_packet(const std::vector<std
     return pkt;
 }
 
+// Serializes [fixed-header-byte | remaining-length | body] into a fresh buffer — the exact framing
+// write_packet()/write_packet_bounded() below send as-is. Extracted (017 Phase 7) so a caller building a
+// packet for later/async transmission (e.g. NativeBroker's reactor outbound queue, which must frame a
+// packet once and then track a partial-send byte offset across multiple non-blocking send attempts) can
+// reuse the exact same framing logic instead of re-deriving it.
+inline std::vector<std::byte> serialize_packet(std::byte type_flags, const std::vector<std::byte>& body) {
+    std::vector<std::byte> pkt;
+    pkt.reserve(5 + body.size());
+    pkt.push_back(type_flags);
+    put_remaining_length(pkt, static_cast<std::uint32_t>(body.size()));
+    pkt.insert(pkt.end(), body.begin(), body.end());
+    return pkt;
+}
+
 // Serialize [fixed-header-byte | remaining-length | body] and write it fully to `ch`, retrying on
 // would_block. NOT channel-write-serializing by itself — a caller with multiple writer threads on the
 // same channel (e.g. a broker Session fanning out a PUBLISH concurrently with its own reader thread
 // writing a SUBACK) must hold its own mutex around this call.
 template <class Channel>
 inline bool write_packet(Channel& ch, std::byte type_flags, const std::vector<std::byte>& body) {
-    std::vector<std::byte> pkt;
-    pkt.reserve(5 + body.size());
-    pkt.push_back(type_flags);
-    put_remaining_length(pkt, static_cast<std::uint32_t>(body.size()));
-    pkt.insert(pkt.end(), body.begin(), body.end());
+    std::vector<std::byte> pkt = serialize_packet(type_flags, body);
     std::size_t sent = 0;
     while (sent < pkt.size()) {
         auto w = ch.send_some(pkt.data() + sent, pkt.size() - sent);
@@ -478,6 +489,30 @@ inline bool write_packet(Channel& ch, std::byte type_flags, const std::vector<st
 inline bool write_packet(quark::pal::fd_t fd, std::byte type_flags, const std::vector<std::byte>& body) {
     aero::transport::PlainChannel ch{fd};
     return write_packet(ch, type_flags, body);
+}
+
+// 017 Phase 7 (Critical fix #2): same as write_packet() but gives up (returns false) once `deadline`
+// passes, instead of retrying forever like write_packet()'s own unbounded loop. write_packet() itself is
+// BYTE-FOR-BYTE UNCHANGED for every existing caller — this is a new, additive overload, not a
+// modification. Used by NativeBroker's reactor->legacy-recipient hand-off pool so one persistently slow
+// legacy (TLS) recipient can't monopolize a hand-off worker forever (the exact failure mode Phase 6's
+// item-count cap failed to prevent — bounding wall-clock time directly, not a proxy for it).
+template <class Channel>
+inline bool write_packet_bounded(Channel& ch, std::byte type_flags, const std::vector<std::byte>& body,
+                                  std::chrono::steady_clock::time_point deadline) {
+    std::vector<std::byte> pkt = serialize_packet(type_flags, body);
+    std::size_t sent = 0;
+    while (sent < pkt.size()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        auto w = ch.send_some(pkt.data() + sent, pkt.size() - sent);
+        if (w) {
+            sent += *w;
+            continue;
+        }
+        if (w.error() != quark::pal::would_block()) return false;
+        if (!aero::pal::wait_writable(ch.fd(), 200)) return false;  // poll itself failed
+    }
+    return true;
 }
 
 }  // namespace aero::transport::mqtt
