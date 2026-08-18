@@ -28,6 +28,7 @@
 // short-circuit the flow; otherwise it returns Continue and the pipeline proceeds.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -294,7 +295,13 @@ public:
     [[nodiscard]] bool valid() const noexcept { return prog_.ok; }
     [[nodiscard]] const std::string& error() const noexcept { return prog_.error; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Rule, "aero.rule.expr"};
+    static constexpr std::array<FieldSpec, 2> kFields{{
+        {.key = "expr", .label = "Expression", .type = FieldType::String, .required = true,
+         .help = "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop."},
+        {.key = "alarm", .label = "Alarm event", .type = FieldType::String,
+         .default_string = "AlarmRaised"},
+    }};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Rule, "aero.rule.expr", kFields};
 
 private:
     // 0-alloc RPN eval over a fixed value stack (N1). Bounded by the program's compiled depth.

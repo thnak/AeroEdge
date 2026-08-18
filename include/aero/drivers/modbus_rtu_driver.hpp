@@ -232,7 +232,29 @@ public:
     // Observability, same shape as ModbusTcpDriver::last_exception_code().
     [[nodiscard]] std::uint8_t last_exception_code() const noexcept { return last_exception_code_; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_rtu", /*writable*/ true, /*poll_driven*/ true};
+    static constexpr std::array<std::string_view, 4> kRegisterTypeOptions{"holding", "input", "coils",
+                                                                          "discrete_inputs"};
+    static constexpr std::array<std::string_view, 3> kParityOptions{"N", "E", "O"};
+    static constexpr std::array<FieldSpec, 8> kFields{{
+        {.key = "port", .label = "Serial port", .type = FieldType::String, .required = true,
+         .help = "e.g. /dev/ttyUSB0 or COM3."},
+        {.key = "baud_rate", .label = "Baud rate", .type = FieldType::Int, .default_number = 9600,
+         .has_min = true, .min = 1},
+        {.key = "slave_address", .label = "Slave address", .type = FieldType::Int, .default_number = 1,
+         .has_min = true, .min = 0},
+        {.key = "start_address", .label = "Start address", .type = FieldType::Int, .has_min = true,
+         .min = 0},
+        {.key = "register_count", .label = "Register count", .type = FieldType::Int,
+         .default_number = 8, .has_min = true, .min = 1},
+        {.key = "register_type", .label = "Register type", .type = FieldType::Enum,
+         .default_string = "holding", .enum_options = kRegisterTypeOptions},
+        {.key = "parity", .label = "Parity", .type = FieldType::Enum, .default_string = "N",
+         .enum_options = kParityOptions},
+        {.key = "stop_bits", .label = "Stop bits", .type = FieldType::Int, .default_number = 1,
+         .has_min = true, .min = 1},
+    }};
+    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_rtu", /*writable*/ true,
+                                            /*poll_driven*/ true, kFields};
 
 private:
     static constexpr int kReadTimeoutMs = 200;    // per-call transport read timeout (aero::pal::serial)

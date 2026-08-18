@@ -28,9 +28,11 @@ function Wrapper() {
 describe("FlowDesigner canvas", () => {
   it("renders a card per node with its catalog label and type_id", () => {
     render(<Wrapper />);
-    expect(screen.getByText("Decode (scalar)")).toBeTruthy();
+    // Labels are humanized client-side from the type_id (catalog.ts) now that the catalog comes from
+    // GET /catalog, which carries no per-node-type display label (015 U1) — see test-setup.ts's fixture.
+    expect(screen.getByText("Decode")).toBeTruthy();
     expect(screen.getByText("Scale")).toBeTruthy();
-    expect(screen.getByText("Sum Output")).toBeTruthy();
+    expect(screen.getByText("Sum")).toBeTruthy();
     expect(screen.getByText("aero.source.decode")).toBeTruthy();
   });
 

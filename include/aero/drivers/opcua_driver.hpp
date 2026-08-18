@@ -59,15 +59,31 @@
 // unconditionally includes this header (runtime.hpp's register_builtins()) still builds either way.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "aero/drivers/opcua_security.hpp"
 #include "aero/sdk/driver.hpp"
 #include "nlohmann/json.hpp"
+
+// Config schema (015 U1), shared by both the AERO_OPCUA_ENABLED and the "not compiled in" stub branch
+// below so `GET /catalog` reports the same `aero.driver.opcua` shape regardless of build configuration.
+// `security` is the whole `OpcUaSecurityConfig` object (§SECURITY POLICIES above) — a nested,
+// generic-form-unfriendly field, so it's Tier-2 (015 §3) rather than exploded into flat Tier-1 fields.
+namespace aero::drivers {
+inline constexpr std::array<FieldSpec, 4> kOpcUaFields{{
+    {.key = "endpoint", .label = "Endpoint URL", .type = FieldType::String, .required = true},
+    {.key = "node_ids", .label = "Node IDs", .type = FieldType::StringArray},
+    {.key = "browse_root", .label = "Browse root NodeId", .type = FieldType::String},
+    {.key = "security", .label = "Security", .type = FieldType::Object,
+     .tier2_hint = "opcua-security"},
+}};
+}  // namespace aero::drivers
 
 #if defined(AERO_OPCUA_ENABLED) && AERO_OPCUA_ENABLED
 
@@ -349,7 +365,8 @@ public:
 
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ true, /*poll_driven*/ true};
+    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ true, /*poll_driven*/ true,
+                                            kOpcUaFields};
 
 private:
     // Connect-attempt timing is entirely open62541's own (UA_Client_connect blocks internally per its own
@@ -574,7 +591,8 @@ public:
     void close() noexcept override {}
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ false, /*poll_driven*/ true};
+    static constexpr DriverDescriptor kDesc{"aero.driver.opcua", /*writable*/ false, /*poll_driven*/ true,
+                                            kOpcUaFields};
 };
 
 }  // namespace aero::drivers

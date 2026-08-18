@@ -7,7 +7,7 @@
 import { useMemo, useState } from "react";
 import { ReactFlow, type Node, type Edge } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { NODE_CATALOG, DRIVER_CATALOG, catalogEntry } from "./catalog";
+import { getCatalog, catalogEntry } from "./catalog";
 import type { FlowModel, FlowNode } from "./application";
 import { toApplication } from "./application";
 import { Panel } from "./components";
@@ -84,7 +84,7 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
         actions={
           <select value="" onChange={(e) => e.target.value && addNode(e.target.value)}>
             <option value="">+ Add node…</option>
-            {NODE_CATALOG.map((e) => <option key={e.type_id} value={e.type_id}>{e.category}: {e.label}</option>)}
+            {getCatalog().nodes.map((e) => <option key={e.type_id} value={e.type_id}>{e.category}: {e.label}</option>)}
           </select>
         }>
         {model.nodes.length === 0 ? (
@@ -128,7 +128,7 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
           <select value={model.driver?.type_id ?? ""}
             onChange={(e) => onChange({ ...model, driver: e.target.value ? { type_id: e.target.value, config: { frame_count: 100 } } : undefined })}>
             <option value="">— none —</option>
-            {DRIVER_CATALOG.map((d) => <option key={d.type_id} value={d.type_id}>{d.label}</option>)}
+            {getCatalog().drivers.map((d) => <option key={d.type_id} value={d.type_id}>{d.label}</option>)}
           </select>
         </label>
       </Panel>

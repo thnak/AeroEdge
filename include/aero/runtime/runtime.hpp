@@ -43,6 +43,7 @@
 #include "aero/drivers/modbus_tcp_driver.hpp"
 #include "aero/drivers/opcua_driver.hpp"
 #include "aero/drivers/opcua_subscription_driver.hpp"
+#include "aero/egress/http_egress_actor.hpp"
 #include "aero/ext/native_loader.hpp"
 #include "aero/mes/mes.hpp"
 #include "aero/mes/outbox.hpp"
@@ -52,6 +53,7 @@
 #include "aero/nodes/builtin_nodes.hpp"
 #include "aero/nodes/compute_nodes.hpp"
 #include "aero/nodes/expr_rule_node.hpp"
+#include "aero/nodes/http_output_node.hpp"
 #include "aero/nodes/mes_nodes.hpp"
 #include "aero/runtime/flow_actor.hpp"
 #include "aero/runtime/flow_compiler.hpp"
@@ -90,54 +92,67 @@ inline aero::drivers::OpcUaSecurityConfig parse_opcua_security(const nlohmann::j
 // aero-core/registry.hpp) because it #includes aero-nodes/aero-drivers — the one-way layering (R1)
 // forbids aero-core depending upward on them.
 inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg) {
-    node_reg.register_type("aero.source.decode", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.decode", aero::nodes::DecodeSourceNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::DecodeSourceNode>();
     });
-    node_reg.register_type("aero.transform.scale", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.transform.scale", aero::nodes::ScaleNode::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::nodes::ScaleNode>(c.value("factor", 1.0));
     });
-    node_reg.register_type("aero.transform.moving_average", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.transform.moving_average", aero::nodes::RuntimeMovingAverageNode::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::nodes::RuntimeMovingAverageNode>(c.value("window", std::size_t{1}));
     });
-    node_reg.register_type("aero.output.sum", [](const nlohmann::json&) {
+    node_reg.register_type("aero.output.sum", aero::nodes::SumOutputNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::SumOutputNode>();
     });
     // Low-code Rule DSL (008 §6): parse the expression ONCE here (deploy), 0-alloc eval per Command.
     // A malformed 'expr' is rejected earlier by the flow compiler (validate_node_config); this factory
     // parses again and, defensively, a bad program yields a node whose process() returns Error.
-    node_reg.register_type("aero.rule.expr", [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+    node_reg.register_type("aero.rule.expr", aero::nodes::ExprRuleNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
         auto prog = aero::nodes::ExprRuleNode::compile(c.value("expr", std::string{}));
         return std::make_unique<aero::nodes::ExprRuleNode>(
             std::move(prog), c.value("alarm", std::string{"AlarmRaised"}));
     });
 
     // Phase-10 compute-node breadth (005 §2): pure, socket-free transforms/sources (compute_nodes.hpp).
-    node_reg.register_type("aero.transform.mean", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.mean", aero::nodes::MeanNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::MeanNode>();
     });
-    node_reg.register_type("aero.transform.minmax", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.minmax", aero::nodes::MinMaxNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::MinMaxNode>();
     });
-    node_reg.register_type("aero.transform.sum", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.sum", aero::nodes::SumNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::SumNode>();
     });
-    node_reg.register_type("aero.transform.crc", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.crc", aero::nodes::CrcNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::CrcNode>();
     });
     // Modbus register-map DECODE over already-arrived bytes (no socket; the Modbus-TCP transport is gated).
-    node_reg.register_type("aero.source.modbus", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.modbus", aero::nodes::ModbusDecodeNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::ModbusDecodeNode>();
     });
     // Modbus coil/discrete-input (bit-packed) DECODE — the FC01/FC02 counterpart, M9.1 PR D.
-    node_reg.register_type("aero.source.modbus_bits", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.modbus_bits", aero::nodes::ModbusBitsDecodeNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::ModbusBitsDecodeNode>();
     });
-    node_reg.register_type("aero.source.json", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.json", aero::nodes::JsonParseNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::JsonParseNode>();
     });
 
     // Phase-10 MES hook (012 §4): the outbound report Output node + the inbound order Source node.
-    node_reg.register_type("aero.output.mes", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.output.mes", aero::nodes::MesReportNode::kDesc,
+        [](const nlohmann::json& c) {
         auto kind = aero::StagedMesReport::Kind::Production;
         const std::string k = c.value("kind", std::string{"production"});
         if (k == "alarm") kind = aero::StagedMesReport::Kind::Alarm;
@@ -145,11 +160,22 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
         return std::make_unique<aero::nodes::MesReportNode>(
             c.value("line", std::string{"line-1"}), c.value("label", std::string{"produced"}), kind);
     });
-    node_reg.register_type("aero.source.mes_order", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.source.mes_order", aero::nodes::MesOrderSourceNode::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::nodes::MesOrderSourceNode>(c.value("order_qty", 0.0));
     });
 
-    driver_reg.register_type("aero.driver.generator", [](const nlohmann::json&) {
+    // 019 slice: generic HTTP output (see nodes/http_output_node.hpp's banner for scope/non-durability).
+    node_reg.register_type("aero.output.http", aero::nodes::HttpOutputNode::kDesc,
+        [](const nlohmann::json& c) {
+        return std::make_unique<aero::nodes::HttpOutputNode>(
+            c.value("url", std::string{}), c.value("method", std::string{"POST"}),
+            c.contains("headers") && c["headers"].is_object() ? c["headers"].dump() : std::string{"{}"},
+            c.value("timeout_ms", 2000));
+    });
+
+    driver_reg.register_type("aero.driver.generator", aero::drivers::GeneratorDriver::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::drivers::GeneratorDriver>();
     });
     // M9a (018 §Multi-protocol southbound): a real Modbus-TCP PULL driver. Config is read straight out
@@ -159,7 +185,8 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // "discrete_inputs" (FC02) — M9.1 PR B/PR D. For "coils"/"discrete_inputs", "register_count" means
     // coil/discrete-input count, not register count (pair with "aero.source.modbus_bits", not
     // "aero.source.modbus", downstream).
-    driver_reg.register_type("aero.driver.modbus_tcp", [](const nlohmann::json& c) {
+    driver_reg.register_type("aero.driver.modbus_tcp", aero::drivers::ModbusTcpDriver::kDesc,
+        [](const nlohmann::json& c) {
         using RF = aero::drivers::ModbusTcpDriver::ReadFunction;
         auto read_fn = RF::HoldingRegisters;
         const std::string rt = c.value("register_type", std::string{"holding"});
@@ -178,7 +205,8 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // cert (opcua_security.hpp) — absent/empty object == disabled (MessageSecurityMode::None), matching
     // every deploy config written before M9.4. Cert/key material is loaded from DER FILE PATHS (not
     // inline bytes in this JSON — see opcua_security.hpp's banner for why).
-    driver_reg.register_type("aero.driver.opcua", [](const nlohmann::json& c) {
+    driver_reg.register_type("aero.driver.opcua", aero::drivers::OpcUaDriver::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::drivers::OpcUaDriver>(
             c.value("endpoint", std::string{}),
             c.value("node_ids", std::vector<std::string>{}),
@@ -188,7 +216,8 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // M9.3 (018 §8): OPC-UA Subscriptions/MonitoredItems — the PUSH counterpart to aero.driver.opcua
     // above, a SEPARATE type_id/class (opcua_subscription_driver.hpp's own banner explains why: push vs
     // pull is a different IDriver invocation contract, not a mode flag on one driver).
-    driver_reg.register_type("aero.driver.opcua_subscribe", [](const nlohmann::json& c) {
+    driver_reg.register_type("aero.driver.opcua_subscribe", aero::drivers::OpcUaSubscriptionDriver::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::drivers::OpcUaSubscriptionDriver>(
             c.value("endpoint", std::string{}), c.value("node_ids", std::vector<std::string>{}),
             parse_opcua_security(c));
@@ -196,7 +225,8 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // M9.1 PR H (018 §8): Modbus RTU/serial counterpart to aero.driver.modbus_tcp above — same
     // "register_type" selector and defaults, plus serial-specific fields (port name, baud, parity,
     // stop_bits, slave_address in place of host/port/unit_id).
-    driver_reg.register_type("aero.driver.modbus_rtu", [](const nlohmann::json& c) {
+    driver_reg.register_type("aero.driver.modbus_rtu", aero::drivers::ModbusRtuDriver::kDesc,
+        [](const nlohmann::json& c) {
         using RF = aero::drivers::ModbusRtuDriver::ReadFunction;
         auto read_fn = RF::HoldingRegisters;
         const std::string rt = c.value("register_type", std::string{"holding"});
@@ -213,12 +243,73 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     });
 }
 
+// Enumerate the registries into the `GET /catalog` shape (015 U1) — the single source of truth for what
+// the Studio's node/driver picker offers, generated from the same descriptors the registry itself uses
+// (013 T3: Studio and runtime cannot drift). Free function (not a Runtime method) so it only needs the
+// registries, not a live Runtime instance — usable straight after register_builtins().
+inline nlohmann::json build_catalog(const NodeRegistry& node_reg, const DriverRegistry& driver_reg) {
+    auto field_json = [](const FieldSpec& f) {
+        nlohmann::json j;
+        j["key"] = f.key;
+        j["label"] = f.label;
+        switch (f.type) {
+            case FieldType::Number: j["type"] = "number"; break;
+            case FieldType::Int: j["type"] = "int"; break;
+            case FieldType::String: j["type"] = "string"; break;
+            case FieldType::Bool: j["type"] = "boolean"; break;
+            case FieldType::Enum: j["type"] = "enum"; break;
+            case FieldType::StringArray: j["type"] = "string_array"; break;
+            case FieldType::Object: j["type"] = "object"; break;
+        }
+        j["required"] = f.required;
+        if (f.type == FieldType::Number || f.type == FieldType::Int) j["default"] = f.default_number;
+        else if (f.type == FieldType::Bool) j["default"] = f.default_bool;
+        else if (!f.default_string.empty()) j["default"] = f.default_string;
+        if (f.has_min) j["min"] = f.min;
+        if (!f.help.empty()) j["help"] = f.help;
+        if (!f.tier2_hint.empty()) j["tier2"] = f.tier2_hint;
+        if (!f.enum_options.empty()) {
+            j["options"] = nlohmann::json::array();
+            for (const auto& o : f.enum_options) j["options"].push_back(o);
+        }
+        return j;
+    };
+
+    nlohmann::json out;
+    out["nodes"] = nlohmann::json::array();
+    node_reg.for_each([&](const std::string& type_id, const NodeDescriptor& d) {
+        nlohmann::json j;
+        j["type_id"] = type_id;
+        switch (d.category) {
+            case NodeCategory::Source: j["category"] = "Source"; break;
+            case NodeCategory::Transform: j["category"] = "Transform"; break;
+            case NodeCategory::Rule: j["category"] = "Rule"; break;
+            case NodeCategory::Output: j["category"] = "Output"; break;
+        }
+        j["fields"] = nlohmann::json::array();
+        for (const auto& f : d.config_fields) j["fields"].push_back(field_json(f));
+        out["nodes"].push_back(std::move(j));
+    });
+    out["drivers"] = nlohmann::json::array();
+    driver_reg.for_each([&](const std::string& type_id, const DriverDescriptor& d) {
+        nlohmann::json j;
+        j["type_id"] = type_id;
+        j["writable"] = d.writable;
+        j["poll_driven"] = d.poll_driven;
+        j["fields"] = nlohmann::json::array();
+        for (const auto& f : d.config_fields) j["fields"].push_back(field_json(f));
+        out["drivers"].push_back(std::move(j));
+    });
+    return out;
+}
+
 class Runtime {
 public:
     Runtime() { register_builtins(nodes_, drivers_); }
     ~Runtime() {
         (void)undeploy();
         if (mes_engine_) mes_engine_->stop();
+        if (http_egress_engine_) http_egress_engine_->stop();
         // Order matters (017 M6): stop the broker's accept loop + every session thread BEFORE the cluster
         // — that guarantees no locally-originated PUBLISH can still be mid-flight into
         // NativeBroker::deliver_publish() (and so into peer_forwarder_) once broker_cluster_ starts tearing
@@ -537,6 +628,12 @@ public:
         return arr;
     }
 
+    // The node/driver catalog (015 U1, 016 §2-style additive route): every registered type_id's config
+    // schema, straight from the registries `register_builtins()` populated — never a hand-maintained
+    // Studio-side list. No lock needed: nodes_/drivers_ are populated once in the ctor and never mutated
+    // after (deploy only reads them via create()).
+    nlohmann::json catalog() { return build_catalog(nodes_, drivers_); }
+
     // Undeploy (by name; empty name == the current deployment). Stops the driver + engine and joins all
     // threads before destroying anything (ordered teardown).
     std::expected<void, std::string> undeploy(const std::string& name = "") {
@@ -627,6 +724,60 @@ public:
         j["staged"] = s.staged;
         j["pending"] = s.pending;
         j["delivered"] = s.delivered;
+        return j;
+    }
+
+    // ---- HTTP egress (019 slice) --------------------------------------------------------------------
+    // Same daemon-lifetime, opt-in shape as the MES gateway above — a HttpEgressActor is best-effort
+    // (no durable outbox, see egress/http_egress_actor.hpp's banner), so unlike MES there is nothing to
+    // recover on restart; it still lives at daemon scope (not deployment scope) so it survives a flow
+    // redeploy, matching how an Output node's egress target should outlive the flow that staged into it.
+    using HttpEgress = aero::egress::HttpEgressActor;
+
+    std::expected<void, std::string> configure_http_egress() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (http_egress_engine_) {
+            return std::unexpected("HTTP egress already configured");
+        }
+        http_egress_actor_ = std::make_unique<HttpEgress>();
+        http_egress_pool_ = std::make_unique<quark::detail::MessagePool>(1024);
+        http_egress_activation_ = std::make_unique<quark::Activation>(
+            http_egress_actor_.get(), HttpEgress::dispatch_table(), http_egress_pool_->sink());
+        http_egress_engine_ = std::make_unique<quark::Engine<>>(quark::EngineConfig{/*workers*/ 1,
+                                                                                     /*shards*/ 1,
+                                                                                     /*budget*/ 64, 64});
+        quark::register_actor<HttpEgress>(*http_egress_engine_, /*key*/ 1, *http_egress_activation_);
+        http_egress_router_ =
+            std::make_unique<quark::LocalRouter>(http_egress_engine_->post_courier(), *http_egress_pool_);
+        http_egress_engine_->start();
+        return {};
+    }
+
+    // Forward one staged request through the egress actor (mirrors mes_stage()'s hand-off point). Public
+    // so a flow-actor integration or a test can drive it without reaching into the actor internals —
+    // same honest scope as mes_stage() (no automatic live-flow-actor forwarding is wired yet either).
+    std::expected<void, std::string> http_send(const aero::egress::SendHttpRequest& r) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!http_egress_engine_) return std::unexpected("HTTP egress not configured");
+        http_egress_router_->get<HttpEgress>(1).tell(r);
+        return {};
+    }
+
+    // Egress observability: {"configured": false} when configure_http_egress() was never called.
+    nlohmann::json http_egress_stats() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json j;
+        if (!http_egress_engine_) {
+            j["configured"] = false;
+            return j;
+        }
+        auto ref = http_egress_router_->get<HttpEgress>(1);
+        auto r = quark::block_on(
+            ref.template ask<aero::egress::HttpEgressStats>(aero::egress::GetHttpEgressStats{}));
+        const aero::egress::HttpEgressStats s = r.value_or(aero::egress::HttpEgressStats{});
+        j["configured"] = true;
+        j["sent"] = s.sent;
+        j["failed"] = s.failed;
         return j;
     }
 
@@ -1035,6 +1186,13 @@ private:
     std::unique_ptr<quark::Activation> mes_activation_;
     std::unique_ptr<quark::Engine<>> mes_engine_;
     std::unique_ptr<quark::LocalRouter> mes_router_;
+
+    // HTTP egress lifetime (daemon-scoped — see configure_http_egress() above).
+    std::unique_ptr<HttpEgress> http_egress_actor_;
+    std::unique_ptr<quark::detail::MessagePool> http_egress_pool_;
+    std::unique_ptr<quark::Activation> http_egress_activation_;
+    std::unique_ptr<quark::Engine<>> http_egress_engine_;
+    std::unique_ptr<quark::LocalRouter> http_egress_router_;
 
     // Fleet/OTA/placement lifetime (daemon-scoped, set by configure_fleet() above).
     std::vector<std::string> node_flags_;

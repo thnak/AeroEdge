@@ -24,7 +24,7 @@ public:
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.decode"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.decode"};  // no config
 };
 
 // Transform: scale every tag by a configured factor (config read once — Phase-1 via ctor; the
@@ -41,7 +41,11 @@ public:
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.scale"};
+    static constexpr std::array<FieldSpec, 1> kFields{{
+        {.key = "factor", .label = "Factor", .type = FieldType::Number, .required = true,
+         .default_number = 1.0, .help = "Multiply every tag by this factor."},
+    }};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.scale", kFields};
 
 private:
     double factor_;
@@ -127,7 +131,12 @@ public:
     [[nodiscard]] std::size_t warm_samples() const noexcept { return count_; }
     [[nodiscard]] std::size_t window() const noexcept { return ring_.size(); }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.moving_average"};
+    static constexpr std::array<FieldSpec, 1> kFields{{
+        {.key = "window", .label = "Window (samples)", .type = FieldType::Int, .default_number = 1,
+         .has_min = true, .min = 1},
+    }};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.moving_average",
+                                          kFields};
 
 private:
     std::vector<double> ring_;  // TRANSIENT per-instance state (007 §6) — sized once, never grown (N1)
@@ -151,7 +160,7 @@ public:
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Output, "aero.output.sum"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Output, "aero.output.sum"};  // no config
 };
 
 }  // namespace aero::nodes

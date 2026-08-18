@@ -28,35 +28,50 @@ namespace aero {
 using NodeFactory = std::function<std::unique_ptr<INode>(const nlohmann::json& config)>;
 using DriverFactory = std::function<std::unique_ptr<IDriver>(const nlohmann::json& config)>;
 
-// Generic `type_id → factory` table. Not thread-safe for concurrent register/create; population
-// happens once at startup (register_builtins), lookups happen at deploy — both single-threaded (I3).
-template <class Factory, class Product>
+// Generic `type_id → {descriptor, factory}` table. Not thread-safe for concurrent register/create;
+// population happens once at startup (register_builtins), lookups happen at deploy — both
+// single-threaded (I3). The descriptor is stored alongside the factory (not read off a throwaway
+// constructed instance) so `for_each` — the `GET /catalog` source (015 U1) — never has to construct a
+// node/driver just to read its `static constexpr kDesc`.
+template <class Factory, class Product, class Descriptor>
 class Registry {
 public:
-    void register_type(std::string type_id, Factory factory) {
-        factories_.insert_or_assign(std::move(type_id), std::move(factory));
+    void register_type(std::string type_id, const Descriptor& descriptor, Factory factory) {
+        entries_.insert_or_assign(std::move(type_id), Entry{descriptor, std::move(factory)});
     }
 
     [[nodiscard]] bool contains(const std::string& type_id) const {
-        return factories_.find(type_id) != factories_.end();
+        return entries_.find(type_id) != entries_.end();
     }
 
     // Resolve + construct. Unknown type_id → a clear error (Phase-5 adds full DAG validation; Phase-4
     // does name resolution + config only, 009 §3).
     [[nodiscard]] std::expected<std::unique_ptr<Product>, std::string>
     create(const std::string& type_id, const nlohmann::json& config) const {
-        const auto it = factories_.find(type_id);
-        if (it == factories_.end()) {
+        const auto it = entries_.find(type_id);
+        if (it == entries_.end()) {
             return std::unexpected("unknown type_id: '" + type_id + "'");
         }
-        return it->second(config);
+        return it->second.factory(config);
+    }
+
+    // Enumerate every registered {type_id, descriptor} pair — the catalog enumeration path (015 U1).
+    template <class Fn>
+    void for_each(Fn&& fn) const {
+        for (const auto& [type_id, entry] : entries_) {
+            fn(type_id, entry.descriptor);
+        }
     }
 
 private:
-    std::unordered_map<std::string, Factory> factories_;
+    struct Entry {
+        Descriptor descriptor;
+        Factory factory;
+    };
+    std::unordered_map<std::string, Entry> entries_;
 };
 
-using NodeRegistry = Registry<NodeFactory, INode>;
-using DriverRegistry = Registry<DriverFactory, IDriver>;
+using NodeRegistry = Registry<NodeFactory, INode, NodeDescriptor>;
+using DriverRegistry = Registry<DriverFactory, IDriver, DriverDescriptor>;
 
 }  // namespace aero

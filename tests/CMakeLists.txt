@@ -336,6 +336,22 @@ target_link_libraries(mes_outbox PRIVATE aero::mes aero::runtime)
 add_test(NAME mes_outbox COMMAND mes_outbox)
 set_tests_properties(mes_outbox PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# ---- 019 slice: GET /catalog config schema + aero.output.http ---------------------------------------
+# Regression gate (015 U1): Runtime::catalog() must list every registered node/driver type_id with its
+# real field schema — this is what would have caught modbus_tcp/modbus_rtu/opcua/opcua_subscribe being
+# invisible to the Studio (see 019-Flow-Graph-Model-and-Studio-Canvas-API.md's ground-truth table).
+add_executable(catalog runtime/catalog.cpp)
+target_link_libraries(catalog PRIVATE aero::runtime)
+add_test(NAME catalog COMMAND catalog)
+set_tests_properties(catalog PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# aero.output.http end to end (best-effort HTTP egress, NOT aero-mes's durable outbox shape — see
+# egress/http_egress_actor.hpp's banner). Ephemeral-port local httplib sink, bounded polling.
+add_executable(http_egress egress/http_egress.cpp)
+target_link_libraries(http_egress PRIVATE aero::runtime aero::egress aero::nodes)
+add_test(NAME http_egress COMMAND http_egress)
+set_tests_properties(http_egress PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-11.1 gate (016 §2.3): the MES gateway wired into Runtime + reachable over the real REST API —
 # GET /mes/outbox is {"configured": false} until configure_mes(), then reflects a staged/retained
 # report (MES down) and a drained/delivered one (MES up, via POST /mes/outbox/drain).

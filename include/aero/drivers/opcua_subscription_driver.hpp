@@ -41,15 +41,28 @@
 // runtime.hpp's unconditional include still builds either way.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "aero/drivers/opcua_security.hpp"
 #include "aero/sdk/driver.hpp"
 #include "nlohmann/json.hpp"
+
+// Config schema (015 U1), shared by both the AERO_OPCUA_ENABLED and the "not compiled in" stub branch
+// below — mirrors opcua_driver.hpp's own kOpcUaFields (no `browse_root`: this driver has no browse mode).
+namespace aero::drivers {
+inline constexpr std::array<FieldSpec, 3> kOpcUaSubscribeFields{{
+    {.key = "endpoint", .label = "Endpoint URL", .type = FieldType::String, .required = true},
+    {.key = "node_ids", .label = "Node IDs", .type = FieldType::StringArray},
+    {.key = "security", .label = "Security", .type = FieldType::Object,
+     .tier2_hint = "opcua-security"},
+}};
+}  // namespace aero::drivers
 
 #if defined(AERO_OPCUA_ENABLED) && AERO_OPCUA_ENABLED
 
@@ -181,7 +194,7 @@ public:
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
     static constexpr DriverDescriptor kDesc{"aero.driver.opcua_subscribe", /*writable*/ false,
-                                             /*poll_driven*/ false};
+                                             /*poll_driven*/ false, kOpcUaSubscribeFields};
 
 private:
     static constexpr int kInitialBackoffMs = 200;
@@ -353,7 +366,7 @@ public:
     const DriverDescriptor& descriptor() const noexcept override { return kDesc; }
 
     static constexpr DriverDescriptor kDesc{"aero.driver.opcua_subscribe", /*writable*/ false,
-                                             /*poll_driven*/ false};
+                                             /*poll_driven*/ false, kOpcUaSubscribeFields};
 };
 
 }  // namespace aero::drivers

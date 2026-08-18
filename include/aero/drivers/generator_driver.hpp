@@ -10,6 +10,7 @@
 // back off on no-credit), with the blocking "read" replaced by a deterministic counter.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <thread>
@@ -61,7 +62,17 @@ public:
     [[nodiscard]] std::uint64_t produced() const noexcept { return produced_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t stalls() const noexcept { return stalls_.load(std::memory_order_relaxed); }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.generator", /*writable*/ false};
+    // frame_count/rate_hz are read out of Application.driver.config into DriverConfig by Runtime::deploy
+    // (runtime.hpp), not by this driver's own ctor — this schema describes the accepted config surface,
+    // not the internal plumbing path (015 U1).
+    static constexpr std::array<FieldSpec, 2> kFields{{
+        {.key = "frame_count", .label = "Frame count", .type = FieldType::Int, .default_number = 0,
+         .has_min = true, .min = 0, .help = "0 = run until stopped."},
+        {.key = "rate_hz", .label = "Rate (Hz)", .type = FieldType::Int, .default_number = 0,
+         .has_min = true, .min = 0},
+    }};
+    static constexpr DriverDescriptor kDesc{"aero.driver.generator", /*writable*/ false,
+                                            /*poll_driven*/ false, kFields};
 
 private:
     DriverConfig cfg_{};

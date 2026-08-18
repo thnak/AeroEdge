@@ -7,8 +7,10 @@
 // are added when the compiler needs them; Phase-1 keeps the descriptor minimal.
 #pragma once
 
+#include <span>
 #include <string_view>
 
+#include "aero/sdk/config_schema.hpp"
 #include "aero/sdk/processing_context.hpp"
 
 namespace aero {
@@ -29,6 +31,10 @@ enum class NodeCategory {
 struct NodeDescriptor {
     NodeCategory category;
     std::string_view type_id;  // stable identity, e.g. "aero.transform.scale"
+    // The config schema `GET /catalog` serves (015 U1) — what this type_id's JSON config accepts.
+    // Default-empty so every existing 2-field `kDesc{...}` brace-init keeps compiling unchanged
+    // (same posture as `DriverDescriptor::poll_driven`'s additive default).
+    std::span<const FieldSpec> config_fields{};
 };
 
 class INode {

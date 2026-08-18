@@ -364,6 +364,15 @@ target_include_directories(aero-mes INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_link_libraries(aero-mes INTERFACE aero-core aero-sdk aero-thirdparty-httplib aero-thirdparty-json quark::quark)
 add_library(aero::mes ALIAS aero-mes)
 
+# aero-egress — generic HTTP egress (019 slice): the HttpEgressActor delivery lane for
+# `aero.output.http` (nodes/http_output_node.hpp stays in aero-nodes, HTTP-free — R1). Deliberately NOT
+# aero-mes's durable-outbox shape (see egress/http_egress_actor.hpp's banner) — best-effort, no Quark 012
+# store dependency, just httplib + the actor.
+add_library(aero-egress INTERFACE)
+target_include_directories(aero-egress INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-egress INTERFACE aero-core aero-sdk aero-thirdparty-httplib aero-thirdparty-json quark::quark)
+add_library(aero::egress ALIAS aero-egress)
+
 # aero-ota — Firmware OTA (011): the per-device state machine + mock OTA driver (ota.hpp) and the
 # FleetActor staged-rollout policy (fleet.hpp). Durable OTA progress reuses aero-core's DurableState over
 # the Quark 012 seam; the device write goes through the fenced IDriver::write (aero-sdk). No httplib.
@@ -456,7 +465,7 @@ add_library(aero::schema ALIAS aero-schema)
 add_library(aero-runtime INTERFACE)
 target_include_directories(aero-runtime INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-runtime INTERFACE
-  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-ota aero-cluster aero-schema aero-broker
+  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-egress aero-ota aero-cluster aero-schema aero-broker
   quark::quark aero-thirdparty-json Threads::Threads)
 add_library(aero::runtime ALIAS aero-runtime)
 

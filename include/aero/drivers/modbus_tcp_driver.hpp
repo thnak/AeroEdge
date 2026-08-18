@@ -166,7 +166,23 @@ public:
     // Modbus exception code).
     [[nodiscard]] std::uint8_t last_exception_code() const noexcept { return last_exception_code_; }
 
-    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_tcp", /*writable*/ true, /*poll_driven*/ true};
+    static constexpr std::array<std::string_view, 4> kRegisterTypeOptions{"holding", "input", "coils",
+                                                                          "discrete_inputs"};
+    static constexpr std::array<FieldSpec, 6> kFields{{
+        {.key = "host", .label = "Host", .type = FieldType::String, .required = true},
+        {.key = "port", .label = "Port", .type = FieldType::Int, .default_number = 502, .has_min = true,
+         .min = 1},
+        {.key = "unit_id", .label = "Unit id", .type = FieldType::Int, .default_number = 1,
+         .has_min = true, .min = 0},
+        {.key = "start_address", .label = "Start address", .type = FieldType::Int, .has_min = true,
+         .min = 0},
+        {.key = "register_count", .label = "Register count", .type = FieldType::Int,
+         .default_number = 8, .has_min = true, .min = 1},
+        {.key = "register_type", .label = "Register type", .type = FieldType::Enum,
+         .default_string = "holding", .enum_options = kRegisterTypeOptions},
+    }};
+    static constexpr DriverDescriptor kDesc{"aero.driver.modbus_tcp", /*writable*/ true,
+                                            /*poll_driven*/ true, kFields};
 
 private:
     static constexpr int kConnectTimeoutMs = 2000;
