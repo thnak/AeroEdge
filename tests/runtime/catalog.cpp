@@ -33,7 +33,7 @@ int main() {
         "aero.output.sum", "aero.rule.expr", "aero.transform.mean", "aero.transform.minmax",
         "aero.transform.sum", "aero.transform.crc", "aero.source.modbus", "aero.source.modbus_bits",
         "aero.source.json", "aero.output.mes", "aero.source.mes_order", "aero.output.http",
-        "aero.flow.switch",
+        "aero.flow.switch", "aero.transform.set",
     };
     const std::set<std::string> expected_drivers = {
         "aero.driver.generator", "aero.driver.modbus_tcp", "aero.driver.modbus_rtu",
@@ -91,6 +91,15 @@ int main() {
                                   has_field(n["fields"], "timeout_ms");
         ok &= full_fields;
         std::printf("[catalog] aero.output.http full_fields=%d %s\n", full_fields,
+                    full_fields ? "ok" : "FAIL");
+    }
+
+    // Spot-check: aero.transform.set (020 §7, new this slice) carries tag+expr.
+    for (const auto& n : cat["nodes"]) {
+        if (n.value("type_id", std::string{}) != "aero.transform.set") continue;
+        const bool full_fields = has_field(n["fields"], "tag") && has_field(n["fields"], "expr");
+        ok &= full_fields;
+        std::printf("[catalog] aero.transform.set full_fields=%d %s\n", full_fields,
                     full_fields ? "ok" : "FAIL");
     }
 

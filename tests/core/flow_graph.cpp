@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <string>
 
+#include "aero/nodes/set_node.hpp"
 #include "aero/runtime/flow_compiler.hpp"
 #include "aero/runtime/runtime.hpp"
 #include "aero/schema/application.hpp"
@@ -98,6 +99,52 @@ int main() {
       "edges":[
         {"from":"src","to":"sw1"},{"from":"src","to":"sw2"},
         {"from":"sw1","from_port":"true","to":"a"},{"from":"sw2","from_port":"true","to":"b"}]})");
+
+    // 020 §7.5: two unconditional aero.transform.set nodes writing the same tag — order-dependent,
+    // rejected at deploy rather than letting whichever runs last silently win.
+    expect_reject("tag-writer-collision-graph", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"id":"src","type_id":"aero.source.decode"},
+        {"id":"s1","type_id":"aero.transform.set","config":{"tag":"x","expr":"raw"}},
+        {"id":"s2","type_id":"aero.transform.set","config":{"tag":"x","expr":"raw*2"}},
+        {"id":"out","type_id":"aero.output.sum"}],
+      "edges":[
+        {"from":"src","to":"s1"},{"from":"src","to":"s2"},
+        {"from":"s1","to":"out"},{"from":"s2","to":"out"}]})");
+
+    // Same collision, but in LINEAR (edges-empty) mode — every node is unconditional there too.
+    expect_reject("tag-writer-collision-linear", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"type_id":"aero.source.decode"},
+        {"type_id":"aero.transform.set","config":{"tag":"y","expr":"raw"}},
+        {"type_id":"aero.transform.set","config":{"tag":"y","expr":"raw*2"}},
+        {"type_id":"aero.output.sum"}]})");
+
+    // 020 §7.5: a set node colliding with a Source node's own fixed tag ("raw") is the same bug —
+    // whichever runs last silently wins the value everything downstream reads as "raw".
+    expect_reject("tag-writer-collision-vs-source", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"type_id":"aero.source.decode"},
+        {"type_id":"aero.transform.set","config":{"tag":"raw","expr":"raw*2"}},
+        {"type_id":"aero.output.sum"}]})");
+
+    // 020 §7.5: two set nodes on MUTUALLY EXCLUSIVE switch branches writing the same tag is legal — at
+    // most one of them ever runs in a given Command, so there's no real collision.
+    expect_accept("tag-writer-mutually-exclusive", R"({
+      "name":"ok","version":"1",
+      "flow":[
+        {"id":"src","type_id":"aero.source.decode"},
+        {"id":"sw","type_id":"aero.flow.switch","config":{"expr":"raw > 100"}},
+        {"id":"s1","type_id":"aero.transform.set","config":{"tag":"x","expr":"raw*10"}},
+        {"id":"s2","type_id":"aero.transform.set","config":{"tag":"x","expr":"raw*1"}},
+        {"id":"out","type_id":"aero.output.sum"}],
+      "edges":[
+        {"from":"src","to":"sw"},
+        {"from":"sw","from_port":"true","to":"s1"},{"from":"sw","from_port":"false","to":"s2"},
+        {"from":"s1","to":"out"},{"from":"s2","to":"out"}]})");
 
     // Valid graph, no branching — same shape as hello_flow.json but expressed as a graph, proving the
     // edges[] path accepts a well-formed linear graph too, not just the array-order fallback.
@@ -192,6 +239,66 @@ int main() {
         };
         run_switch(150.0, 1500.0);  // > 100 -> true branch (x10) -> only "hi" ran
         run_switch(50.0, 50.0);     // <= 100 -> false branch (x1) -> only "lo" ran
+    }
+
+    // 020 §7.1: aero.transform.set — first write for a fresh tag name is a push_back.
+    {
+        Application app;
+        app.name = "set-fresh";
+        app.version = "0.1.0";
+        app.flow = {
+            NodeSpec{.id = "src", .type_id = "aero.source.decode"},
+            NodeSpec{.id = "set", .type_id = "aero.transform.set",
+                     .config = {{"tag", "doubled"}, {"expr", "raw * 2"}}},
+            NodeSpec{.id = "out", .type_id = "aero.output.sum"},
+        };
+        auto plan = aero::runtime::compile_flow(app, node_reg);
+        bool ok = plan.has_value();
+        if (ok) {
+            aero::ProcessingContext ctx;
+            aero::Frame frame{5};
+            ctx.reset(&frame);
+            plan->flow.execute(ctx);
+            double doubled = -1.0;
+            std::size_t raw_count = 0;
+            for (const auto& t : ctx.tags) {
+                if (t.name == "doubled") doubled = t.value;
+                if (t.name == "raw") ++raw_count;
+            }
+            ok = doubled == 10.0 && raw_count == 1;  // fresh write pushed, "raw" untouched
+            std::printf("  %-28s : doubled=%.1f raw_count=%zu %s\n", "set-fresh-write", doubled,
+                        raw_count, ok ? "ok" : "FAIL");
+        } else {
+            std::printf("  %-28s : compile REJECTED(!) %s\n", "set-fresh-write", plan.error().c_str());
+        }
+        if (!ok) ++failures;
+    }
+
+    // 020 §7.1: aero.transform.set — overwrite-in-place (not append) of an EXISTING tag, and
+    // self-reference reads the OLD value (evaluate() runs before the overwrite). This is the SAME
+    // node's own configured `tag` referencing itself in its own `expr` (the "change-by" pattern, §7.3)
+    // — a single writer, not the two-different-nodes collision §7.5 above tests, so it's exercised
+    // directly against SetNode rather than through compile_flow/validate_tag_writers.
+    {
+        using aero::nodes::SetNode;
+        SetNode node(SetNode::compile("tag(\"counter\") + 1"), "counter");
+        aero::ProcessingContext ctx;
+        ctx.reset(nullptr);
+
+        node.process(ctx);  // "counter" doesn't exist yet -> tag_value reads 0.0 -> writes 1.0 (push_back)
+        double after_first = -1.0;
+        std::size_t count_first = 0;
+        for (const auto& t : ctx.tags) if (t.name == "counter") { after_first = t.value; ++count_first; }
+
+        node.process(ctx);  // SAME ctx, not reset -> reads the OLD 1.0 -> writes 2.0 IN PLACE
+        double after_second = -1.0;
+        std::size_t count_second = 0;
+        for (const auto& t : ctx.tags) if (t.name == "counter") { after_second = t.value; ++count_second; }
+
+        const bool ok = after_first == 1.0 && count_first == 1 && after_second == 2.0 && count_second == 1;
+        std::printf("  %-28s : after1=%.1f(n=%zu) after2=%.1f(n=%zu) %s\n", "set-overwrite-self-ref",
+                    after_first, count_first, after_second, count_second, ok ? "ok" : "FAIL");
+        if (!ok) ++failures;
     }
 
     std::printf("%s\n", failures == 0 ? "OK" : "FAIL");
