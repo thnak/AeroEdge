@@ -50,12 +50,16 @@ struct Options {
     int payload_bytes = 64;   // clamped to >= 8 (leading 8 bytes carry the send timestamp)
     int qos = 1;
     int timeout_s = 30;       // max wait for delivery to finish once publishing is done
+    int external_port = 0;    // 0 = spin up an in-process NativeBroker (default); nonzero = dial an
+                               // already-running MQTT 3.1.1 broker on 127.0.0.1:external_port instead, for
+                               // apples-to-oranges comparisons against other brokers using the exact same
+                               // client-side protocol code and measurement methodology.
 };
 
 [[noreturn]] void usage_and_exit(const char* prog) {
     std::fprintf(stderr,
                   "usage: %s [--subscribers N] [--idle-sessions N] [--publishers N] [--messages N]\n"
-                  "          [--payload-bytes N] [--qos 0|1] [--timeout-s N]\n",
+                  "          [--payload-bytes N] [--qos 0|1] [--timeout-s N] [--external-port N]\n",
                   prog);
     std::exit(2);
 }
@@ -73,6 +77,7 @@ Options parse_args(int argc, char** argv) {
         else if (flag == "--payload-bytes") o.payload_bytes = val;
         else if (flag == "--qos") o.qos = val;
         else if (flag == "--timeout-s") o.timeout_s = val;
+        else if (flag == "--external-port") o.external_port = val;
         else usage_and_exit(argv[0]);
     }
     if (o.payload_bytes < 8) o.payload_bytes = 8;  // leading 8 bytes are the send timestamp
@@ -320,17 +325,24 @@ int main(int argc, char** argv) {
                 "payload-bytes=%d qos=%d\n",
                 o.subscribers, o.idle_sessions, o.publishers, o.messages, o.payload_bytes, o.qos);
 
-    Config cfg;
-    cfg.bind_host = "127.0.0.1";
-    cfg.listen_port = 0;  // ephemeral
-    cfg.backlog = 256;
-    NativeBroker broker(std::move(cfg));
-    auto started = broker.start();
-    if (!started) {
-        std::fprintf(stderr, "broker start failed: %s\n", started.error().c_str());
-        return 1;
+    std::optional<NativeBroker> broker;
+    std::uint16_t port = 0;
+    if (o.external_port != 0) {
+        port = static_cast<std::uint16_t>(o.external_port);
+        std::printf("driving external broker at 127.0.0.1:%u (no in-process NativeBroker started)\n", port);
+    } else {
+        Config cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.listen_port = 0;  // ephemeral
+        cfg.backlog = 256;
+        broker.emplace(std::move(cfg));
+        auto started = broker->start();
+        if (!started) {
+            std::fprintf(stderr, "broker start failed: %s\n", started.error().c_str());
+            return 1;
+        }
+        port = broker->listen_port();
     }
-    const std::uint16_t port = broker.listen_port();
 
     // Idle sessions: connected + subscribed to topics that never match `topic` — pure sessions_ bloat for
     // route_publish()'s linear scan-and-skip. Never counted in delivery stats. Progress is printed every
@@ -412,7 +424,7 @@ int main(int argc, char** argv) {
 
     for (auto& s : subs) s.close();
     for (auto& s : idle) s.close();
-    broker.stop();
+    if (broker) broker->stop();
 
     std::uint64_t total_received = 0;
     std::vector<std::int64_t> all_latencies;

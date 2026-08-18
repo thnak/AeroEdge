@@ -545,3 +545,80 @@ message, so at most one packet is ever in flight, and the buffered-read win
 amortize over. This matches the mechanism exactly: buffered reads help
 unthrottled/bursty traffic (QoS 0, or QoS 1/2 fan-out to many subscribers under
 load), not single-in-flight round-trip-bound traffic.
+
+### 3.2 Real comparison against Mosquitto (same machine, same tool, same run)
+
+Prompted by an earlier question ("MQTTnet claims 700K msg/s — how does this
+compare?") — that figure is virtually always *aggregate throughput across many
+concurrent connections/cores*, not a single-connection number, so comparing it
+directly to §3.1's single-pair figures is apples-to-oranges. Instead of
+reasoning from published/marketing numbers, `bench/broker/broker_bench.cpp`
+gained a `--external-port N` flag (skips starting an in-process `NativeBroker`,
+dials an already-running MQTT 3.1.1 broker on `127.0.0.1:N` instead) so the
+*exact same* client-side protocol code and measurement methodology could be
+pointed at Mosquitto 2.0.15 (installed via `conda-forge`, `allow_anonymous
+true`, no persistence, default listener config) on this same Windows machine,
+back-to-back with AeroEdge, in the same session.
+
+**Caveats up front, so the numbers aren't over-read:**
+- AeroEdge's broker runs *in-process* with the benchmark tool in this harness
+  (still communicating over a real loopback TCP socket, same as every other
+  number in this doc); Mosquitto runs as a genuinely separate OS process. This
+  is how AeroEdge has been measured all session, so it stays internally
+  consistent with §2.4/§3.1, but it is a structural difference from Mosquitto's
+  setup, not a fully neutral harness.
+- This is one broker's Windows build (`conda-forge`'s win-64 package) on one
+  machine — not a claim about Mosquitto's Linux/epoll performance in general,
+  which is a different, well-optimized code path this test never touched.
+- No tuning was attempted on either side beyond each project's stated defaults.
+
+**Single connection pair, QoS 0, no fan-out** (3 runs each, back to back):
+
+| Broker | Throughput (msg/s) | p50 latency (ms) |
+|---|---|---|
+| AeroEdge (buffered reads) | 57,270 / 83,634 / 90,764 | 48.8 / 32.6 / 30.8 |
+| Mosquitto 2.0.15 | 40,721 / 41,829 / 25,896 | 69.8 / 62.5 / 110.9 |
+
+AeroEdge was faster and lower-latency than this Mosquitto build in every run,
+for this traffic shape, on this machine.
+
+**2,000 idle (non-matching) subscriber connections present, same 1:1 QoS 0
+traffic on top:**
+
+| Broker | Connect setup rate | Real-traffic throughput | Real-traffic p50 latency |
+|---|---|---|---|
+| AeroEdge | ~24/s | 93,418 msg/s | 29.9ms |
+| Mosquitto 2.0.15 | ~24/s | 448 msg/s | 6,347.6ms |
+
+Two findings here:
+
+1. **The connect-setup rate (~24-26/s) was identical for both brokers.** This
+   corrects an assumption from earlier in this session — the ~25-33/s connect
+   rate seen driving 5,000 idle sessions against AeroEdge was suspected to
+   reflect broker-side (thread-per-connection) setup cost. Since Mosquitto's
+   connection handling is event-loop-based, not thread-per-connection, and it
+   shows the *same* rate, the ceiling is actually in `broker_bench`'s own
+   `SubClient` (one reader thread spawned per idle session, client-side) — not
+   a broker property at all. Worth fixing in the harness if idle-session
+   connect-rate is measured again, but doesn't affect any throughput/latency
+   number in this doc (which are all measured only after setup completes).
+2. **Once traffic starts, AeroEdge holds its 3.1-throughput steady (93K msg/s,
+   ~30ms p50 — matching the 0-idle-session numbers) while this Mosquitto build
+   collapsed to 448 msg/s and 6.3-second p50 latency** with 2,000 idle,
+   non-matching subscriptions present. AeroEdge's result is expected — it's
+   exactly what the topic-index fix (this session's first change) was built
+   to guarantee: `route_publish()` no longer scans idle sessions at all.
+   Mosquitto's collapse was *not* investigated further (out of scope for this
+   round) — a likely cause is this Windows build's network-loop I/O
+   multiplexing degrading under thousands of concurrent sockets (e.g. a
+   `select()`-based loop rather than an IOCP/epoll-equivalent), but that's a
+   hypothesis, not confirmed. Flagged honestly rather than asserted as a
+   general Mosquitto weakness.
+
+**Bottom line:** for the traffic shapes actually measured here, AeroEdge is
+competitive with — and in the idle-connection-scaling case, currently ahead
+of — this particular Mosquitto build on this machine. This is not a claim
+about Mosquitto's real-world (Linux) ceiling, nor about AeroEdge's own ceiling
+against reactor-based brokers at very high aggregate connection counts (tens
+of thousands+), which remains the open question the deferred `IoContext`
+migration (§3.0) would address.
