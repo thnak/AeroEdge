@@ -235,6 +235,20 @@ target_link_libraries(broker_cluster PRIVATE aero::broker)
 add_test(NAME broker_cluster COMMAND broker_cluster)
 set_tests_properties(broker_cluster PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 M5.1 gate (§10): broker_cluster_security.hpp — BrokerCluster's optional mTLS cluster-link over
+# QuarkCpp's ADR-040 SecureTransport/MbedtlsHandshakeEngine/MbedtlsAeadGcm, proven over the SAME real
+# loopback TCP two-node shape as broker_cluster above: a cross-node PUBLISH still crosses AND the link
+# genuinely sealed/opened real frames (not just "still worked over the plain path"); a cluster_id
+# mismatch between two validly-certificated peers fails the handshake, so a PUBLISH never crosses.
+# Uses pre-generated, checked-in TEST-ONLY EC certs under broker/certs_cluster/ (never used in
+# production) — mirrors tls_channel/opcua_driver_security's own *_TEST_CERTS_DIR convention.
+add_executable(broker_cluster_security broker/broker_cluster_security.cpp)
+target_link_libraries(broker_cluster_security PRIVATE aero::broker)
+target_compile_definitions(broker_cluster_security PRIVATE
+  AERO_CLUSTER_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/broker/certs_cluster")
+add_test(NAME broker_cluster_security COMMAND broker_cluster_security)
+set_tests_properties(broker_cluster_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # M5 TLS+ACL milestone gate: acl.hpp — the broker-local per-topic Authorizer seam (Allow/Deny-all
 # triviality, TopicAclAuthorizer's Closed/Open default posture, exact + wildcard principal/topic
 # matching, first-match-wins ordering, Publish/Subscribe action independence). Pure logic, no sockets.

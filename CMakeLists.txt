@@ -304,6 +304,27 @@ endif()
 set(QUARK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(QUARK_BUILD_BENCH OFF CACHE BOOL "" FORCE)
 set(QUARK_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+# M5.1 (017 §10, cluster-link TLS): QuarkCpp's own cmake/QuarkSecurityAdapters.cmake gates its real
+# mTLS handshake (MbedtlsHandshakeEngine) + AES-128-GCM AEAD (MbedtlsAeadGcm) — ADR-040's production
+# transport-security backend — behind QUARK_WITH_MBEDTLS, off by default. Turning it on (only when
+# AERO_ENABLE_TLS is also on — cluster-link TLS is an OPTIONAL BrokerCluster feature, unlike OPC-UA's
+# hard AERO_ENABLE_TLS requirement above, so this stays a silent no-op rather than a FATAL_ERROR for a
+# build that legitimately doesn't want TLS at all) mirrors the M9.4 open62541 fix exactly: QuarkCpp's
+# own `find_package(MbedTLS CONFIG QUIET)` targets an INSTALLED package config this project's
+# FetchContent'd (never installed) mbedTLS doesn't produce, so its fallback find_path/find_library
+# calls are pre-seeded with the SAME already-declared mbedtls/mbedx509/mbedcrypto FetchContent target
+# names used above (aero-thirdparty-tls) — one shared mbedTLS build, not a second independent copy
+# (the exact duplicate-symbol hazard cmake/patch_open62541.cmake's banner documents). AeroEdge's
+# BrokerCluster (broker_cluster.hpp) is the consumer; with AERO_ENABLE_TLS off, its mTLS surface
+# compiles to the same "not compiled in" stub pattern every other optional AeroEdge security feature
+# uses (see broker_cluster_security.hpp's own AERO_TLS_ENABLED guard).
+if(AERO_ENABLE_TLS)
+  set(QUARK_WITH_MBEDTLS ON CACHE BOOL "" FORCE)
+  set(MBEDTLS_INCLUDE_DIR "${mbedtls_SOURCE_DIR}/include" CACHE PATH "" FORCE)
+  set(MBEDTLS_LIBRARY mbedtls CACHE STRING "" FORCE)
+  set(MBEDX509_LIBRARY mbedx509 CACHE STRING "" FORCE)
+  set(MBEDCRYPTO_LIBRARY mbedcrypto CACHE STRING "" FORCE)
+endif()
 add_subdirectory("${QUARK_DIR}" "${CMAKE_BINARY_DIR}/quark")
 
 # ---- AeroEdge libraries (header-first, mirroring Quark's posture) ----------
@@ -400,11 +421,17 @@ add_library(aero::transport ALIAS aero-transport)
 # rabbitmq-c-backed implementation (AERO_RABBITMQ_ENABLED + the rabbitmq-c static lib), not the "not
 # compiled in" stub, whenever this library is actually linked into a binary — same reasoning as the
 # TLS listener above.
+# M5.1 adds quark::security_mbedtls: BrokerCluster's optional mTLS cluster-link (broker_cluster.hpp,
+# 017 M5.1) needs QuarkCpp's real MbedtlsHandshakeEngine/MbedtlsAeadGcm adapter, enabled above via
+# QUARK_WITH_MBEDTLS — a target that only exists when AERO_ENABLE_TLS turned it on, hence the guard.
 add_library(aero-broker INTERFACE)
 target_include_directories(aero-broker INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-broker INTERFACE
   aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json aero-thirdparty-tls
   aero-thirdparty-rabbitmq quark::quark Threads::Threads)
+if(TARGET quark::security_mbedtls)
+  target_link_libraries(aero-broker INTERFACE quark::security_mbedtls)
+endif()
 add_library(aero::broker ALIAS aero-broker)
 
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration

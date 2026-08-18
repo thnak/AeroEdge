@@ -18,7 +18,8 @@
 | M2 | `Runtime::configure_broker()`, `GET /broker/status`, CLI flags — `aero-broker` now linked into `aero-runtime` | **Shipped** |
 | M3 | Bridge seam (`IBridgeSink`: MQTT-to-MQTT, HTTP webhook) + rule engine reusing `ExprRuleNode` (008 §6) | **Shipped** |
 | M4 | Studio dashboard page for the broker | **Shipped** |
-| M5 | TLS + per-topic ACL for the native MQTT broker | **Shipped** — southbound (device-facing) TLS + ACL; cluster-link TLS deferred, M5.1 |
+| M5 | TLS + per-topic ACL for the native MQTT broker | **Shipped** — southbound (device-facing) TLS + ACL; cluster-link TLS shipped separately, M5.1 |
+| M5.1 | Cluster-link mTLS — `BrokerCluster`'s inter-node link over QuarkCpp's real ADR-040 `SecureTransport`/mTLS handshake/AES-128-GCM | **Shipped** |
 | M6 | Cross-node topic routing | **Shipped** — v1 broadcast fanout, not HRW-selective (see §4 correction below) |
 | M7 | MQTT 5 | **Shipped** — protocol negotiation + CONNECT/Will/SUBSCRIBE/PUBLISH properties parsing + v5 CONNACK/SUBACK reason codes; feature properties deferred, M7.1/M7.2 |
 | M7.1 | MQTT 5 feature properties v1 slice | **Shipped** — Session Expiry Interval TTL, server DISCONNECT reason codes, inbound Topic Alias |
@@ -196,6 +197,7 @@ principled exclusions the way v0.1 framed the whole breadth:
 | TLS | **shipped** | M5, `aero/pal/tls.hpp` (mbedTLS-backed `TlsServerContext`/`TlsSession`) — server-auth and optional mTLS (client-cert-required) southbound listener |
 | Per-topic ACL / authorization | **shipped** | M5, `aero/broker/acl.hpp` (`Authorizer`/`TopicAclAuthorizer`) — broker-local seam, not literal Quark 020 reuse (N6 correction below) |
 | Cross-node topic routing | **shipped**, v1 broadcast fanout (not HRW-selective) | M6, see §4 correction; `broker_cluster.hpp` |
+| Cluster-link mTLS | **shipped**, opt-in (default disabled) | M5.1, `broker_cluster_security.hpp` over QuarkCpp's ADR-040 `SecureTransport` — no cert rotation/revocation sweep yet |
 | MQTT 5 | **shipped**, protocol negotiation + properties parsing + a v1 slice of feature properties | M7, `aero/transport/mqtt_codec.hpp`'s bounded Properties codec (`read_varint`/`read_properties`/`put_empty_properties`/`put_topic_alias_max_properties`) + `native_broker.hpp`'s `Session::protocol_version` branch in CONNECT/Will/PUBLISH/SUBSCRIBE parsing and CONNACK/SUBACK reason codes; M7.1 adds Session Expiry Interval TTL enforcement, server DISCONNECT reason codes (keep-alive timeout, session takeover), and inbound Topic Alias — outbound Topic Alias (compression), Shared Subs, Request/Response, User Properties end-to-end, Message Expiry/Max Packet Size enforcement, and Enhanced Auth remain deferred |
 | RabbitMQ bridge | **shipped** | M8, `RabbitMqBridgeSink` (`broker/rabbitmq_bridge_sink.hpp`) over rabbitmq-c (AMQP 0-9-1); PUBLISH only, no TLS/SASL-EXTERNAL, no publisher confirms |
 | Kafka/Pulsar bridges | backlog | M8.1/M8.2 — needs new third-party deps (librdkafka / pulsar-client-cpp), native-extension-shaped (008) |
@@ -232,7 +234,17 @@ adapts to unilaterally. Concretely:
   common case (the device verifies the broker); setting `ServerConfig::ca_file` additionally
   requires and verifies a client certificate (mutual TLS) — a client presenting none, or one that
   doesn't chain to `ca_file`, is rejected at the handshake, never silently downgraded to
-  plaintext-equivalent trust. **C5's cluster-link leg remains open** — see M5.1 in Open Questions.
+  plaintext-equivalent trust.
+- **C5 (014), cluster-link leg — shipped, M5.1**: `BrokerCluster`'s inter-node link
+  (`broker_cluster.hpp`, M6) can opt into real mTLS over QuarkCpp's ADR-040 `SecureTransport` seam
+  (`quark::adapters::MbedtlsHandshakeEngine`/`MbedtlsAeadGcm`) via `BrokerClusterSecurityConfig`
+  (`broker_cluster_security.hpp`) — additive, default-disabled: an unconfigured `BrokerCluster`
+  keeps wiring `DistributedRouter` straight to its plain `TcpTransport`, exactly as before M5.1.
+  Peer identity is bound to `CN=quark:<cluster_id>:<node_id>` on a certificate chaining to one
+  configured CA/trust roots blob; a `cluster_id` mismatch between two otherwise-validly-certificated
+  peers fails the handshake (proven in `tests/broker/broker_cluster_security.cpp`). See §10's M5.1
+  entry for the full v1 scope and what's still deferred (rotation/revocation sweep, `TcpTransport`
+  reset-on-disconnect hooks).
 - **CONNECT-time authentication — shipped, M5**: `NativeBroker::Config::authenticate`
   (`aero::broker::Authenticator`, `aero/broker/acl.hpp`) is a pluggable
   `(username, password) -> optional<principal>` callback consulted before any other CONNECT-time
@@ -397,9 +409,39 @@ adapts to unilaterally. Concretely:
 - **Southbound OPC-UA/Modbus termination** — this spec is MQTT-only; the same "AeroEdge
   terminates the protocol locally instead of requiring external infra" posture now extends to
   OPC-UA/Modbus via **spec 018** (M9), as this entry anticipated.
-- **M5.1 — cluster-link TLS** — M5 ships TLS for the southbound (device-facing) leg only
-  (`aero/pal/tls.hpp`'s `TlsServerContext`, wired into `NativeBroker`). The broker's inter-node
-  link, if/when cross-node topic routing ships (M6, `DistributedRouter`, §4), is a separate leg
-  C5 (014) also covers and is NOT yet TLS-secured — deferred, blocked on Quark 020 shipping a
-  real (non-mock) `Aead` cipher for its own `SecureTransport` seam. This is upstream QuarkCpp
-  work, not something this project builds itself; revisit once that lands.
+- **M5.1 — cluster-link TLS, shipped.** Unblocked once QuarkCpp's own ADR-040 landed a real
+  (non-mock) `Aead` cipher (`MbedtlsAeadGcm`, AES-128-GCM) and mTLS handshake
+  (`MbedtlsHandshakeEngine`) behind its `SecureTransport` seam — upstream work this spec doesn't
+  build itself, just consumes. `BrokerClusterSecurityConfig` (`broker_cluster_security.hpp`) opts a
+  `BrokerCluster` into wrapping its `TcpTransport` in `SecureTransport`, sharing THIS project's own
+  vendored mbedTLS (017 M5) via the same CMake cache-var pre-seeding trick 018 M9.4 established for
+  open62541 (root `CMakeLists.txt`'s `QUARK_WITH_MBEDTLS` block) — not a second, independent mbedTLS
+  copy. Confirmed and fixed the SAME mbedTLS-threading hazard M9.4 found: QuarkCpp's mTLS handshake
+  needs `aero::pal::tls::detail::ensure_threading_registered()` (017 M5's own `MBEDTLS_THREADING_ALT`
+  registration) called first, or CTR_DRBG seeding fails — `BrokerCluster::start()` now does this
+  before touching any mbedTLS-backed API.
+  <br>**v1 scope, deliberately narrow**: ONE trusted CA/roots blob (not per-peer pinning); identity
+  bound to `CN=quark:<cluster_id>:<node_id>` (QuarkCpp's own convention — a DIFFERENT scheme from
+  018 M9.4's own URI-SAN OPC-UA certs, each subsystem follows whichever upstream library it secures
+  dictates); cert/key material loaded from DER files on disk, one-shot at `start()` (no rotation).
+  <br>**A real gap discovered building this**: `SecureTransport`'s mTLS handshake is glare-free by
+  NodeId ordering (only the lower NodeId initiates) and its only trigger is `send()`'s own
+  "no session → kick off a handshake, drop this frame" path — with M6's broadcast-fanout model, a
+  deployment where only the HIGHER NodeId's clients ever publish could leave BOTH sides
+  permanently stuck (the higher NodeId keeps hitting its passive "wait for the peer" branch, the
+  lower NodeId never has a reason to call `send()` at all). Fixed by having `BrokerCluster`
+  proactively prime a handshake for every peer it is the client role for, both at `start()` (for
+  peers with a known port up front) and from `add_peer()` (the common ephemeral-port-correction
+  case, this project's own established two-phase pattern) — `add_peer()` matters here specifically
+  because priming against a still-unknown/placeholder address burns `SecureTransport`'s own
+  "already pending" dedup window on a dial that's guaranteed to fail, and nothing else would ever
+  retry it.
+  <br>**Still deferred (v2 backlog)**: certificate rotation/revocation sweep
+  (`SecureTransport::sweep_rotation()`/`sweep_revocations()`) — `BrokerCluster` uses
+  `StaticBrokerMembership` (M6, a fixed, never-ticking roster), so there is no periodic-tick
+  mechanism yet to hang either off of, the same v1 boundary M5's own southbound TLS drew (no cert
+  rotation there either); and `SecureTransport::set_reset_hook()`/`on_peer_disconnected()` wiring,
+  which needs `TcpTransport::reset_peer_connection()`/`set_peer_down_hook()` hooks AeroEdge's own
+  from-scratch `TcpTransport` doesn't yet expose (degrades gracefully per `SecureTransport`'s own
+  docs — a stale session after a connection drop just drops frames until the peer's natural
+  reconnect triggers a fresh handshake — not a hard failure, but a real gap).
