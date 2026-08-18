@@ -53,6 +53,18 @@ describe("FlowDesigner canvas", () => {
     expect(screen.getByText("aero.output.sum")).toBeTruthy();
   });
 
+  // 019 §4 jigsaw slice: a Source card renders no target handle at all — nothing can ever be wired
+  // into it, by shape, not just by a validation message (the literal "Sum before Decode" case).
+  it("a Source card has no target handle; other categories do", () => {
+    const { container } = render(<Wrapper />);
+    const cards = container.querySelectorAll(".flow-node-card");
+    expect(cards.length).toBe(3); // Decode (Source), Scale (Transform), Sum (Output)
+    expect(cards[0].classList.contains("cat-source")).toBe(true);
+    expect(cards[0].querySelector(".react-flow__handle.target")).toBeNull();
+    expect(cards[1].querySelector(".react-flow__handle.target")).not.toBeNull();
+    expect(cards[2].querySelector(".react-flow__handle.target")).not.toBeNull();
+  });
+
   it("moving a node reorders the emitted Application (order still IS the DAG)", () => {
     render(<Wrapper />);
     const json = () => JSON.parse(screen.getByText(/"flow"/).textContent!) as Application;
