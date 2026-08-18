@@ -22,14 +22,17 @@ import { Button } from "./components";
 import type { CatalogEntry, Category } from "./catalog";
 import { jigsawPath, DEFAULT_LOBE_DEPTH } from "./jigsawPath";
 
-const SWITCH_TYPE_ID = "aero.flow.switch";
-const CARD_WIDTH = 190;
-const CARD_HEIGHT = 140; // the "logical" box: notch sits at y=0, bottom edge at y=CARD_HEIGHT
+// Exported (020 §4.2): SwitchBlockNode.tsx/switchCavityLayout.ts reuse the exact same type_id check and
+// card dimensions so a nested cavity member lines up pixel-for-pixel with a free-floating card of the
+// same shape — one source of truth instead of two copies drifting apart.
+export const SWITCH_TYPE_ID = "aero.flow.switch";
+export const CARD_WIDTH = 190;
+export const CARD_HEIGHT = 140; // the "logical" box: notch sits at y=0, bottom edge at y=CARD_HEIGHT
 // The bottom tab protrudes DEFAULT_LOBE_DEPTH past CARD_HEIGHT — the actual DOM element/SVG viewBox
 // must be that much taller, or the tab gets clipped by SVG's default overflow:hidden (found via the
 // live smoke test: the tab was invisible until this was added — matches styles.css's `.flow-node-card`
 // height, which must stay in sync with this constant).
-const CARD_VISUAL_HEIGHT = CARD_HEIGHT + DEFAULT_LOBE_DEPTH;
+export const CARD_VISUAL_HEIGHT = CARD_HEIGHT + DEFAULT_LOBE_DEPTH;
 
 const CATEGORY_CLASS: Record<Category, string> = {
   Source: "cat-source",
