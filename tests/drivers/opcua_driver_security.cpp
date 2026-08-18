@@ -25,6 +25,19 @@
 //   (3) a client whose cert is NOT in the server's trust list is rejected — proves the server actually
 //       enforces cert-based auth, not merely that encryption is turned on.
 //   (4) a missing/unreadable certificate_file is a clean config-time Error at open(), no network I/O.
+//
+// M9.5 (018 §8, the OPC-UA backlog item after M9.4) adds session-level X.509 UserIdentityToken coverage —
+// a SEPARATE mechanism from (1)-(4)'s channel-level cert auth (see opcua_security.hpp's own banner),
+// layered on top of it here (a pure MessageSecurityMode::None + X.509 UserIdentityToken combination isn't
+// reachable through open62541's own client endpoint-selection — see test (5)'s own comment for why):
+//   (5) a client authenticates its CHANNEL with client_cert.der (M9.4, same as (1)/(2)) AND its SESSION
+//       with a DIFFERENT cert, user_cert.der (M9.5) — both independently trusted by the server, both
+//       required for the read to succeed — proving the two mechanisms are genuinely separate, not a
+//       relabeled duplicate of each other.
+//   (6) a user cert NOT in the server's (session) trust list is rejected at ActivateSession EVEN THOUGH
+//       the channel cert IS trusted — isolates the session-level (sessionPKI) check from the already-
+//       proven channel-level (secureChannelPKI) one in (1)-(4).
+//   (7) a missing/unreadable user_certificate_file is a clean config-time Error at open(), no network I/O.
 // Deterministic-enough, exit-code-gated (0 = pass); bounded polling/retries; clean shutdown.
 #include <atomic>
 #include <chrono>
@@ -82,15 +95,19 @@ UA_ByteString to_ua_bytestring(const std::vector<std::uint8_t>& bytes) noexcept 
 
 // A real open62541 UA_Server, security policies enabled, background thread — see file banner for the
 // TSan root-cause notes this fixture shares verbatim with opcua_driver.cpp's own FakeOpcUaServer.
-// `trusted_client_cert_file` (empty = trust nothing) controls which client cert(s) the server accepts —
-// test (3) below deliberately passes a DIFFERENT cert than the one its client actually presents.
+// `trusted_client_cert_files` (empty = trust nothing) controls which client cert(s) the server accepts —
+// fed to BOTH secureChannelPKI (M9.4, channel identity) and sessionPKI (M9.5, session/UserIdentityToken
+// identity) by UA_ServerConfig_setDefaultWithSecurityPolicies itself, since it's the SAME trust-list
+// parameter for both (see ua_config_default.c). Test (3) below deliberately passes a DIFFERENT cert than
+// the one its client actually presents; M9.5's own tests pass BOTH the channel cert and the (separate)
+// user cert together where a test needs both accepted at once.
 struct SecureFakeOpcUaServer {
     UA_Server* server = nullptr;
     std::atomic<bool> running{false};
     std::thread thr;
 
-    bool start(const std::string& trusted_client_cert_file) {
-        std::vector<std::uint8_t> cert_bytes, key_bytes, trust_bytes;
+    bool start(const std::vector<std::string>& trusted_client_cert_files) {
+        std::vector<std::uint8_t> cert_bytes, key_bytes;
         if (!read_file(kCertsDir + "/server_cert.der", cert_bytes)) {
             std::printf("SecureFakeOpcUaServer::start: failed to read %s\n",
                         (kCertsDir + "/server_cert.der").c_str());
@@ -101,15 +118,24 @@ struct SecureFakeOpcUaServer {
                         (kCertsDir + "/server_key.der").c_str());
             return false;
         }
-        const bool have_trust = !trusted_client_cert_file.empty();
-        if (have_trust && !read_file(trusted_client_cert_file, trust_bytes)) {
-            std::printf("SecureFakeOpcUaServer::start: failed to read %s\n", trusted_client_cert_file.c_str());
-            return false;
+
+        // Each entry's backing bytes must outlive the UA_ByteString views built from it below — held in
+        // this vector for the whole setDefaultWithSecurityPolicies call (which copies internally, but only
+        // once it actually runs).
+        std::vector<std::vector<std::uint8_t>> trust_bytes(trusted_client_cert_files.size());
+        for (std::size_t i = 0; i < trusted_client_cert_files.size(); ++i) {
+            if (!read_file(trusted_client_cert_files[i], trust_bytes[i])) {
+                std::printf("SecureFakeOpcUaServer::start: failed to read %s\n",
+                            trusted_client_cert_files[i].c_str());
+                return false;
+            }
         }
+        std::vector<UA_ByteString> trust_list(trust_bytes.size());
+        for (std::size_t i = 0; i < trust_bytes.size(); ++i) trust_list[i] = to_ua_bytestring(trust_bytes[i]);
+        const bool have_trust = !trust_list.empty();
 
         const UA_ByteString cert = to_ua_bytestring(cert_bytes);
         const UA_ByteString key = to_ua_bytestring(key_bytes);
-        const UA_ByteString trust = to_ua_bytestring(trust_bytes);
 
         UA_ServerConfig config;
         std::memset(&config, 0, sizeof(config));
@@ -121,7 +147,8 @@ struct SecureFakeOpcUaServer {
         UA_StatusCode rc = UA_STATUSCODE_BADINTERNALERROR;
         while (std::chrono::steady_clock::now() < deadline) {
             rc = UA_ServerConfig_setDefaultWithSecurityPolicies(
-                &config, kTestPort, &cert, &key, have_trust ? &trust : nullptr, have_trust ? 1 : 0,
+                &config, kTestPort, &cert, &key, have_trust ? trust_list.data() : nullptr,
+                trust_list.size(),
                 nullptr, 0, nullptr, 0);
             if (rc == UA_STATUSCODE_GOOD) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -255,7 +282,7 @@ OpcUaSecurityConfig client_security(bool sign_and_encrypt) {
 // ---- (1) happy path: SignAndEncrypt, cert-based client auth, real value read --------------------------
 bool test_secure_connect_and_read() {
     SecureFakeOpcUaServer server;
-    if (!server.start(kCertsDir + "/client_cert.der")) {
+    if (!server.start({kCertsDir + "/client_cert.der"})) {
         std::printf("secure_connect_and_read: server start failed\n");
         return false;
     }
@@ -287,7 +314,7 @@ bool test_secure_connect_and_read() {
 // ---- (2) Sign-only (no encryption) also connects and reads --------------------------------------------
 bool test_sign_only_connect_and_read() {
     SecureFakeOpcUaServer server;
-    if (!server.start(kCertsDir + "/client_cert.der")) {
+    if (!server.start({kCertsDir + "/client_cert.der"})) {
         std::printf("sign_only: server start failed\n");
         return false;
     }
@@ -312,7 +339,7 @@ bool test_sign_only_connect_and_read() {
 bool test_untrusted_client_rejected() {
     // Server trusts ONLY the server's own cert (a stand-in "someone else's cert") — never the client's.
     SecureFakeOpcUaServer server;
-    if (!server.start(kCertsDir + "/server_cert.der")) {
+    if (!server.start({kCertsDir + "/server_cert.der"})) {
         std::printf("untrusted_client: server start failed\n");
         return false;
     }
@@ -352,6 +379,95 @@ bool test_missing_cert_file_rejected() {
     return ok;
 }
 
+// ---- (5) M9.5: session-level X.509 UserIdentityToken, layered on top of M9.4's channel-level cert auth --
+// Proves the two mechanisms opcua_security.hpp's own banner describes are genuinely independent gates,
+// not one relabeled as the other: the SecureChannel is authenticated with client_cert.der (M9.4, exactly
+// client_security() below — same as tests (1)/(2)), while the SESSION is separately authenticated with a
+// DIFFERENT cert, user_cert.der (M9.5) — the server's sessionPKI trust check validates user_cert.der
+// independently of secureChannelPKI's own client_cert.der check, and both must pass for the read to
+// succeed. (An X.509 UserIdentityToken over a channel with NO crypto SecurityPolicy loaded at all isn't
+// reachable through open62541's own client endpoint-selection — its Certificate UserTokenPolicy entries
+// are tagged with the SAME SecurityPolicy URI as the channel policy they're offered alongside, and the
+// client can only sign the proof-of-possession nonce using a SecurityPolicy it already has loaded — hence
+// layering on top of M9.4's Sign/SignAndEncrypt here rather than testing MessageSecurityMode::None.)
+bool test_user_identity_token_accepted() {
+    // Server trusts BOTH certs: client_cert.der (channel) and user_cert.der (session) — each gates a
+    // DIFFERENT check (secureChannelPKI vs. sessionPKI), both of which this test needs to pass.
+    SecureFakeOpcUaServer server;
+    if (!server.start({kCertsDir + "/client_cert.der", kCertsDir + "/user_cert.der"})) {
+        std::printf("user_identity_token_accepted: server start failed\n");
+        return false;
+    }
+
+    OpcUaSecurityConfig sec = client_security(/*sign_and_encrypt*/ true);
+    sec.user_certificate_file = kCertsDir + "/user_cert.der";
+    sec.user_private_key_file = kCertsDir + "/user_key.der";
+
+    OpcUaDriver driver(kEndpoint, std::vector<std::string>{"ns=1;s=Temperature"}, {}, sec);
+    aero::DriverConfig cfg{};
+    bool ok = open_with_retry(driver, cfg);
+    if (!ok) std::printf("user_identity_token_accepted: open() never succeeded\n");
+
+    const auto outcome = poll_once(driver);
+    ok &= outcome.status == aero::DriverStatus::Ok;
+    ok &= outcome.frame.has_value();
+
+    driver.close();
+    server.stop();
+    if (!ok) std::printf("user_identity_token_accepted: assertion failed\n");
+    return ok;
+}
+
+// ---- (6) a user cert NOT in the server's (session) trust list is rejected, even with a fully-trusted ----
+//          channel-level cert — proves sessionPKI is a SEPARATE gate from secureChannelPKI, not piggybacked
+bool test_user_identity_token_rejected() {
+    // Server trusts client_cert.der (channel — this test's SecureChannel opens fine) but NOT user_cert.der
+    // (session), so ActivateSession's X509IdentityToken check (BADIDENTITYTOKENREJECTED) is what fails the
+    // overall connect — isolating the session-level check from the already-proven channel-level one.
+    SecureFakeOpcUaServer server;
+    if (!server.start({kCertsDir + "/client_cert.der"})) {
+        std::printf("user_identity_token_rejected: server start failed\n");
+        return false;
+    }
+
+    OpcUaSecurityConfig sec = client_security(/*sign_and_encrypt*/ true);
+    sec.user_certificate_file = kCertsDir + "/user_cert.der";
+    sec.user_private_key_file = kCertsDir + "/user_key.der";
+
+    OpcUaDriver driver(kEndpoint, std::vector<std::string>{"ns=1;s=Temperature"}, {}, sec);
+    aero::DriverConfig cfg{};
+    // No retry-until-success loop here either (mirrors test_untrusted_client_rejected): this must never
+    // succeed, so a single bounded attempt window is enough.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool ever_connected = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (driver.open(cfg) == aero::DriverStatus::Ok) { ever_connected = true; break; }
+        driver.close();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    driver.close();
+    server.stop();
+    if (ever_connected) {
+        std::printf("user_identity_token_rejected: driver connected despite an untrusted user cert\n");
+    }
+    return !ever_connected;
+}
+
+// ---- (7) a missing user_certificate_file is a clean config-time Error, no network I/O --------------------
+bool test_missing_user_cert_file_rejected() {
+    OpcUaSecurityConfig sec;
+    sec.user_certificate_file = kCertsDir + "/does_not_exist.der";
+    sec.user_private_key_file = kCertsDir + "/user_key.der";
+
+    OpcUaDriver driver("opc.tcp://127.0.0.1:1", std::vector<std::string>{}, {}, sec);
+    aero::DriverConfig cfg{};
+    const bool ok = driver.open(cfg) == aero::DriverStatus::Error;
+    driver.close();
+    if (!ok) std::printf("missing_user_cert_file_rejected: assertion failed\n");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -381,6 +497,18 @@ int main() {
     const bool missing_cert_ok = test_missing_cert_file_rejected();
     ok &= missing_cert_ok;
     std::printf("[missing_cert_file_rejected] %s\n", missing_cert_ok ? "ok" : "FAIL");
+
+    const bool user_token_ok = test_user_identity_token_accepted();
+    ok &= user_token_ok;
+    std::printf("[user_identity_token_accepted] %s\n", user_token_ok ? "ok" : "FAIL");
+
+    const bool user_token_rejected_ok = test_user_identity_token_rejected();
+    ok &= user_token_rejected_ok;
+    std::printf("[user_identity_token_rejected] %s\n", user_token_rejected_ok ? "ok" : "FAIL");
+
+    const bool missing_user_cert_ok = test_missing_user_cert_file_rejected();
+    ok &= missing_user_cert_ok;
+    std::printf("[missing_user_cert_file_rejected] %s\n", missing_user_cert_ok ? "ok" : "FAIL");
 
     std::printf("opcua_driver_security: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

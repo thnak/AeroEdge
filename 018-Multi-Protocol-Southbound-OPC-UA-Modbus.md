@@ -25,6 +25,7 @@
 | M9.2 | `Runtime` poll-timer wiring (006 §6.1) — makes `ModbusTcpDriver`/`ModbusRtuDriver`/`OpcUaDriver` actually deployable via a real Application, not just unit-testable | **Shipped** |
 | M9.3 | `OpcUaSubscriptionDriver` — OPC-UA Subscriptions/MonitoredItems, the PUSH counterpart to `OpcUaDriver` | **Shipped** |
 | M9.4 | OPC-UA security policies — Sign/SignAndEncrypt over a client certificate, cert-based client auth (`OpcUaSecurityConfig`, shared by `OpcUaDriver`/`OpcUaSubscriptionDriver`) | **Shipped** |
+| M9.5 | OPC-UA session-level X.509 `UserIdentityToken` (`OpcUaSecurityConfig::user_certificate_file`/`user_private_key_file`, over `UA_ClientConfig_setAuthenticationCert`) — closes 018 §8's last backlog item | **Shipped** |
 
 ## 1. Why
 
@@ -319,15 +320,41 @@ registration for the one shared mbedTLS build, exactly the fix 017 M5's own shim
 generalize to.
 
 **Still deferred** (v2 backlog): a CA-chain/multi-entry trust store (v1 is exactly one trusted
-peer cert, matching this driver's existing "one configured endpoint" posture); a session-level
-X.509 `UserIdentityToken` for user (not channel) authentication (`UA_ClientConfig_
-setAuthenticationCert`, a related but separate OPC-UA mechanism M9.4 didn't need); certificate
+peer cert, matching this driver's existing "one configured endpoint" posture); certificate
 rotation/expiry handling (v1 loads cert/key files once, at `open()`); and — within browsing itself
 — continuation-point paging beyond the first `kMaxBrowseResults` children, and reading nested
 subtrees (v1 is exactly one browse level per `poll()` call). Within Subscriptions (M9.3): Events
 (only DataChange notifications), server-requested-parameter renegotiation (accepts whatever the
 server revises), and resubscribing to an EXISTING subscription id after a reconnect (v1 always
 creates a fresh one).
+
+**M9.5** shipped the one item M9.4 explicitly left backlog: a session-level X.509
+`UserIdentityToken` (OPC-UA Part 4 §7.36.5) for USER (not channel) authentication — a genuinely
+separate mechanism from M9.4's SecureChannel cert auth, not a relabeling of it. `OpcUaSecurityConfig`
+gains `user_certificate_file`/`user_private_key_file` (DER, same on-disk convention as every other
+cert knob in this file); `apply_security_config()` forwards them to open62541's own
+`UA_ClientConfig_setAuthenticationCert` (`client_config_default.h`), which does the real work:
+constructs the `X509IdentityToken` and separately provisions `authSecurityPolicies` so
+`ActivateSession` can sign the server's nonce as proof the client holds the matching private key.
+Independent of `certificate_file`/`private_key_file` by construction — a deployment can set either,
+both, or neither; empty (the default) stays an implicit Anonymous session, unchanged pre-M9.5
+behavior. Same build gate as `UA_ClientConfig_setAuthenticationCert` itself
+(`UA_ENABLE_ENCRYPTION_MBEDTLS`), already satisfied by M9.4's own CMake requirement — no new
+CMake work needed.
+<br>**A real constraint found building this**: a X.509 UserIdentityToken over a channel with NO
+crypto SecurityPolicy loaded at all (`MessageSecurityMode::None`, no `certificate_file`) is not
+reachable through open62541's own client endpoint-selection — the server's default AccessControl
+plugin tags each endpoint's Certificate `UserTokenPolicy` with the SAME SecurityPolicy URI as that
+endpoint's own channel policy (`ua_accesscontrol_default.c`), and the client can only sign the
+ActivateSession proof-of-possession nonce using a SecurityPolicy it already has loaded — which
+`UA_ClientConfig_setDefault()` (the `certificate_file`-empty path) never loads. In practice this
+means session-level X.509 auth is layered on top of M9.4's own Sign/SignAndEncrypt (own trusted
+cert, own trust list — `opcua_driver_security.cpp`'s test (5) uses a DIFFERENT cert for the channel
+than for the session, proving the two checks are independently enforced), not a MessageSecurityMode
+::None-only feature.
+<br>**Still deferred** (v2 backlog, unchanged from M9.4's own list): a CA-chain/multi-entry trust
+store for the session identity too (v1 is exactly one trusted peer cert, same posture as
+`trusted_server_certificate_file`); certificate rotation/expiry handling.
 
 ## 6. Capability table
 
@@ -345,7 +372,8 @@ creates a fresh one).
 | OPC-UA: address-space browse (one root, one level, capped result count) | **shipped** | M9.1 PR G, `OpcUaDriver` browse mode |
 | OPC-UA: Subscriptions/MonitoredItems (data-change push) | **shipped** | M9.3, `OpcUaSubscriptionDriver` |
 | OPC-UA: security policies — Sign/SignAndEncrypt, cert-based client auth | **shipped** | M9.4, `OpcUaSecurityConfig` |
-| OPC-UA: CA-chain/multi-entry trust store, X.509 user identity token, browse paging/nested subtrees, Subscription Events | backlog | M9.1/M9.3/M9.4 |
+| OPC-UA: session-level X.509 `UserIdentityToken` (user, not channel, authentication) | **shipped** | M9.5, `OpcUaSecurityConfig::user_certificate_file`/`user_private_key_file` |
+| OPC-UA: CA-chain/multi-entry trust store, browse paging/nested subtrees, Subscription Events | backlog | M9.1/M9.3/M9.4/M9.5 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |
 | Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | all drivers |
@@ -366,13 +394,17 @@ doesn't set `certificate_file` connects at `MessageSecurityMode::None` exactly a
 that remains an accepted posture for a trusted OT network segment where the operational cost of
 managing certs isn't justified. Neither driver claims to be safe dialing an untrusted network
 without security enabled — revisit which posture is the DEFAULT if a deployment target changes.
+M9.5 adds a SEPARATE, session-level identity on top: `user_certificate_file`/`user_private_key_file`
+authenticate the OPC-UA *session* (ActivateSession's X.509 UserIdentityToken) independently of
+whichever cert (if any) authenticated the SecureChannel itself — also opt-in, also defaulting to
+unchanged pre-M9.5 behavior (implicit Anonymous) when unset.
 
-## 8. Open questions (M9.1/M9.2/M9.3/M9.4)
+## 8. Open questions (M9.1/M9.2/M9.3/M9.4/M9.5)
 
-- **OPC-UA security policies v1 limits (M9.4).** See §5's own writeup for the shipped scope and
-  the "still deferred" list (CA-chain/multi-entry trust store, X.509 user identity token, cert
-  rotation). Revisit alongside 017 §10's M5.1 (cluster-link TLS) if a deployment needs any of
-  those.
+- **OPC-UA security policies v1 limits (M9.4/M9.5).** See §5's own writeup for the shipped scope
+  and the "still deferred" list (CA-chain/multi-entry trust store on both the channel and session
+  side, cert rotation). Revisit alongside 017 §10's M5.1 (cluster-link TLS) if a deployment needs
+  any of those.
 - **OPC-UA Subscriptions v1 limits (M9.3).** `OpcUaSubscriptionDriver` ships DataChange
   notifications only (no Events), open62541's default subscription parameters (no per-deployment
   tuning of publishing interval/queue size yet), and always creates a FRESH Subscription on

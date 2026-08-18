@@ -468,12 +468,13 @@ target_link_libraries(opcua_subscription_driver PRIVATE aero::drivers aero::node
 add_test(NAME opcua_subscription_driver COMMAND opcua_subscription_driver)
 set_tests_properties(opcua_subscription_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
-# ---- M9.4: OPC-UA security policies (018 §8, the last v1 backlog item) --------------------------------
+# ---- M9.4/M9.5: OPC-UA security policies (018 §8) -------------------------------------------------------
 # Sign/SignAndEncrypt over a client certificate + cert-based client auth (opcua_security.hpp), proven
 # against a REAL open62541 UA_Server configured via UA_ServerConfig_setDefaultWithSecurityPolicies (own
-# fixed port 48715, distinct from every other OPC-UA test's port). Uses pre-generated, checked-in
-# TEST-ONLY self-signed certs under drivers/certs/ (never used in production) — mirrors tls_channel/
-# native_broker_security's own AERO_TLS_TEST_CERTS_DIR convention.
+# fixed port 48715, distinct from every other OPC-UA test's port). M9.5 adds a session-level X.509
+# UserIdentityToken (a SEPARATE mechanism from M9.4's channel cert auth) over the same fixture. Uses
+# pre-generated, checked-in TEST-ONLY self-signed certs under drivers/certs/ (never used in production) —
+# mirrors tls_channel/native_broker_security's own AERO_TLS_TEST_CERTS_DIR convention.
 add_executable(opcua_driver_security drivers/opcua_driver_security.cpp)
 target_link_libraries(opcua_driver_security PRIVATE aero::drivers aero::nodes aero::sdk aero-thirdparty-opcua
   aero-thirdparty-tls quark::quark Threads::Threads)
