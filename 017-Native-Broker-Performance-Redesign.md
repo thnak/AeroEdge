@@ -615,10 +615,66 @@ Two findings here:
    hypothesis, not confirmed. Flagged honestly rather than asserted as a
    general Mosquitto weakness.
 
-**Bottom line:** for the traffic shapes actually measured here, AeroEdge is
-competitive with — and in the idle-connection-scaling case, currently ahead
-of — this particular Mosquitto build on this machine. This is not a claim
-about Mosquitto's real-world (Linux) ceiling, nor about AeroEdge's own ceiling
-against reactor-based brokers at very high aggregate connection counts (tens
-of thousands+), which remains the open question the deferred `IoContext`
-migration (§3.0) would address.
+**Bottom line (2,000-session round):** for the traffic shapes actually
+measured here, AeroEdge is competitive with — and in the idle-connection-
+scaling case, currently ahead of — this particular Mosquitto build on this
+machine. This is not a claim about Mosquitto's real-world (Linux) ceiling, nor
+about AeroEdge's own ceiling against reactor-based brokers at very high
+aggregate connection counts (tens of thousands+), which remains the open
+question the deferred `IoContext` migration (§3.0) would address.
+
+### 3.3 Full-scale re-run: 5,000 idle sessions, plus a CPU-usage check
+
+Re-ran the same comparison at the full 5,000-idle-session scale already used
+for AeroEdge earlier in this session (matching that original benchmark's
+scope), and added real CPU-usage sampling (`Get-Process` polled every 3s
+throughout) to check an observation made mid-run: neither side looked
+CPU-bound on Task Manager.
+
+**AeroEdge, 5,000 idle sessions:** connect setup held steady at ~27-33/s
+(same range as the 2,000-session run and the original 5,000-session run
+earlier this session — no decay as count grows), then real 1:1 QoS 0 traffic
+on top: **86,997 msg/s, 32.4ms p50** — matching the 0- and 2,000-idle-session
+numbers almost exactly. The topic index holds at this scale too.
+
+**Mosquitto 2.0.15, 5,000 idle sessions: broke at session 2,047.** Setup
+proceeded at the same ~26-30/s rate as AeroEdge up to session 2,000, then
+**session 2,047 failed to connect/subscribe after an 80.7s timeout** — the
+Mosquitto process itself stayed alive throughout (confirmed via `Get-Process`
+immediately after), it simply stopped completing new connection handshakes
+past that point. The number is suspicious in a specific way: 2,047 is exactly
+`2,048 - 1`, consistent with a compile-time `FD_SETSIZE`-style cap on this
+Windows build's socket multiplexing (one slot reserved for the listening
+socket) rather than a random hang. **Not confirmed** — didn't have this
+build's source/build config on hand to verify — but it lines up with §3.2's
+"select()-based loop" hypothesis for the 2,000-session collapse: the same
+mechanism could plausibly explain both the *slowdown* at 2,000 and the *hard
+wall* at 2,047. Flagged as a strong lead, not a proven root cause.
+
+**CPU usage during the run (answers "our test didn't use much CPU" — it's
+real, not just visual):**
+
+| Process | Avg CPU over the ~80s window |
+|---|---|
+| `mosquitto.exe` | ~1.6% |
+| `broker_bench.exe` (client, 2,000+ live threads) | ~12-13%, trending down |
+
+Neither process was anywhere near CPU-saturated when Mosquitto stopped
+accepting new connections. This matters for the diagnosis: it rules out "the
+CPU is the bottleneck" for both the connect-rate ceiling (§3.2's finding —
+already known to be client-thread-spawn-bound, not compute-bound) and
+Mosquitto's connection-count wall — reinforcing that these are I/O-multiplexing
+/ socket-accounting limits, not raw processing-power limits. This is
+consistent with the whole session's throughline: AeroEdge's own bottlenecks
+(pre-topic-index linear scan, pre-buffered-reads per-syscall reads) were also
+never about CPU cycles — they were about the *shape* of I/O (syscall count,
+scan breadth), which is exactly why a topic index and buffered reads produced
+real wins without needing more compute.
+
+**Updated bottom line:** at full 5,000-connection scale, AeroEdge not only
+kept its throughput/latency steady (as it did at 2,000) but was the only one
+of the two that could actually reach 5,000 live connections on this machine —
+this specific Mosquitto build hit a hard connection-count wall around 2,047.
+Same caveats as §3.2 apply: one Windows build, one machine, not a general
+claim about Mosquitto (particularly not about its Linux/epoll deployments,
+where this specific limit likely wouldn't exist).
