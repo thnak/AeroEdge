@@ -24,6 +24,9 @@
 #include <expected>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "aero/core/compiled_flow.hpp"
@@ -45,10 +48,23 @@ struct CompiledPlan {
 
     // Re-point the flow at the owned nodes. Called once after all nodes are constructed; the flow
     // stores raw INode* which stay valid as long as `nodes` (and therefore this plan) lives.
-    void wire() {
+    //
+    // `order` (019 §2): indices into `nodes`, in the sequence steps should run — empty means natural
+    // construction order (today's linear behaviour, unchanged, 019 G6). `labels[i]` is the
+    // required_label for `nodes[i]` (see CompiledFlow::add) — must reference STABLE storage (a static
+    // literal, never a view into the Application that produced this plan, which does not outlive it).
+    void wire(const std::vector<std::size_t>& order = {},
+              const std::vector<std::string_view>& labels = {}) {
         flow = aero::CompiledFlow{};
-        for (auto& n : nodes) {
-            flow.add(*n);
+        if (order.empty()) {
+            for (auto& n : nodes) {
+                flow.add(*n);
+            }
+            return;
+        }
+        for (std::size_t idx : order) {
+            const std::string_view label = idx < labels.size() ? labels[idx] : std::string_view{};
+            flow.add(*nodes[idx], label);
         }
     }
 };
@@ -85,8 +101,132 @@ inline std::expected<void, std::string> validate_node_config(const std::string& 
         if (!prog.ok) {
             return std::unexpected("node 'aero.rule.expr' invalid expression: " + prog.error);
         }
+    } else if (type_id == "aero.flow.switch") {
+        // Same DSL, same parse-once-at-deploy posture as aero.rule.expr (019 §5).
+        if (!cfg.contains("expr") || !cfg["expr"].is_string()) {
+            return std::unexpected("node 'aero.flow.switch' requires a string 'expr'");
+        }
+        auto prog = aero::nodes::ExprRuleNode::compile(cfg["expr"].get<std::string>());
+        if (!prog.ok) {
+            return std::unexpected("node 'aero.flow.switch' invalid expression: " + prog.error);
+        }
     }
     return {};
+}
+
+// The result of ordering a real graph (019 §2): a topological order over app.flow's indices, plus each
+// node's required_label (see CompiledFlow::add) — empty for an unconditional node, or the STATIC
+// "true"/"false" literal for one reached only via a labeled edge from aero.flow.switch.
+struct GraphOrder {
+    std::vector<std::size_t> order;
+    std::vector<std::string_view> labels;
+};
+
+// Validate `app.edges` against `app.flow` and produce a schedulable order (019 §2). Only called when
+// `app.edges` is non-empty — an empty-edges Application takes the original linear path unchanged (G6).
+// Kahn's algorithm does topo-sort AND cycle detection in one pass: repeatedly dequeue a zero-in-degree
+// node, decrement its successors'; anything left over after the queue drains is a cycle.
+inline std::expected<GraphOrder, std::string> order_flow_graph(
+        const schema::Application& app, const std::vector<std::unique_ptr<INode>>& nodes) {
+    // v1 scope (019 §5): only aero.flow.switch produces labeled edges, and only ever "true"/"false" —
+    // so labels reference these two static literals, never a view into `app` (which does not outlive
+    // the CompiledPlan this order feeds). Any other from_port is rejected below, not silently accepted.
+    static constexpr std::string_view kTrue = "true";
+    static constexpr std::string_view kFalse = "false";
+
+    const std::size_t n = app.flow.size();
+
+    std::unordered_map<std::string, std::size_t> id_to_index;
+    id_to_index.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!id_to_index.emplace(app.flow[i].id, i).second) {
+            return std::unexpected("duplicate node id: '" + app.flow[i].id + "'");
+        }
+    }
+
+    std::vector<std::vector<std::pair<std::size_t, std::string_view>>> adj(n);  // from-idx -> {to-idx, label}
+    std::vector<int> in_degree(n, 0);
+    // v1 supports exactly one active branch decision per Command (ctx.active_branch is a single field,
+    // not a stack — 019 §10 "multiple independent switch points"). Track which node index is the
+    // source of a labeled edge; a SECOND distinct source would let one switch's decision silently
+    // overwrite another's before its own labeled steps are checked (P1: reject at deploy, never let a
+    // node route on the wrong switch's answer).
+    bool have_branch_source = false;
+    std::size_t branch_source = 0;
+    for (const auto& e : app.edges) {
+        const auto from_it = id_to_index.find(e.from);
+        if (from_it == id_to_index.end()) {
+            return std::unexpected("edge references unknown node id: '" + e.from + "'");
+        }
+        const auto to_it = id_to_index.find(e.to);
+        if (to_it == id_to_index.end()) {
+            return std::unexpected("edge references unknown node id: '" + e.to + "'");
+        }
+        std::string_view label;
+        if (!e.from_port.empty()) {
+            if (e.from_port == "true") label = kTrue;
+            else if (e.from_port == "false") label = kFalse;
+            else {
+                return std::unexpected("edge.from_port '" + e.from_port + "' is not supported yet "
+                                       "(only \"true\"/\"false\", from aero.flow.switch)");
+            }
+            if (!have_branch_source) {
+                have_branch_source = true;
+                branch_source = from_it->second;
+            } else if (branch_source != from_it->second) {
+                return std::unexpected("flow has more than one branch-producing node ('" +
+                                       app.flow[branch_source].id + "' and '" + e.from + "') — only one "
+                                       "active switch point per flow is supported yet (019 sec3/sec10)");
+            }
+        }
+        adj[from_it->second].push_back({to_it->second, label});
+        ++in_degree[to_it->second];
+    }
+
+    std::vector<std::size_t> queue;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (in_degree[i] == 0) queue.push_back(i);
+    }
+    if (queue.size() != 1) {
+        return std::unexpected("flow must have exactly one root (a node with no incoming edge); found " +
+                               std::to_string(queue.size()));
+    }
+    if (nodes[queue[0]]->descriptor().category != NodeCategory::Source) {
+        return std::unexpected("flow's root node '" + app.flow[queue[0]].id + "' must be a Source node");
+    }
+
+    std::vector<std::vector<std::string_view>> incoming_labels(n);
+    std::vector<std::size_t> order;
+    order.reserve(n);
+    std::vector<int> remaining = in_degree;
+    for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+        const std::size_t u = queue[qi];
+        order.push_back(u);
+        for (const auto& [v, label] : adj[u]) {
+            incoming_labels[v].push_back(label);
+            if (--remaining[v] == 0) {
+                queue.push_back(v);
+            }
+        }
+    }
+    if (order.size() != n) {
+        return std::unexpected("flow contains a cycle");
+    }
+
+    std::vector<std::string_view> labels(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (incoming_labels[i].empty()) continue;  // the root — no incoming edge, always unconditional
+        const std::string_view first = incoming_labels[i].front();
+        for (const std::string_view l : incoming_labels[i]) {
+            if (l != first) {
+                return std::unexpected("node '" + app.flow[i].id + "' is reached by edges with "
+                                       "conflicting branch labels — not supported yet");
+            }
+        }
+        labels[i] = first;
+    }
+
+    return GraphOrder{std::move(order), std::move(labels)};
 }
 
 // Validate + compile an Application's flow into a CompiledPlan (009 §3). Never throws, never
@@ -133,7 +273,16 @@ inline std::expected<CompiledPlan, std::string> compile_flow(const schema::Appli
         return std::unexpected("flow has no Output node: the pipeline stages no egress");
     }
 
-    plan.wire();
+    if (app.edges.empty()) {
+        plan.wire();  // linear, array order IS the DAG — unchanged from today (019 G6)
+        return plan;
+    }
+
+    auto order = order_flow_graph(app, plan.nodes);
+    if (!order) {
+        return std::unexpected(order.error());
+    }
+    plan.wire(order->order, order->labels);
     return plan;
 }
 

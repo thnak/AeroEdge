@@ -55,6 +55,7 @@
 #include "aero/nodes/expr_rule_node.hpp"
 #include "aero/nodes/http_output_node.hpp"
 #include "aero/nodes/mes_nodes.hpp"
+#include "aero/nodes/switch_node.hpp"
 #include "aero/runtime/flow_actor.hpp"
 #include "aero/runtime/flow_compiler.hpp"
 #include "aero/schema/application.hpp"
@@ -163,6 +164,15 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     node_reg.register_type("aero.source.mes_order", aero::nodes::MesOrderSourceNode::kDesc,
         [](const nlohmann::json& c) {
         return std::make_unique<aero::nodes::MesOrderSourceNode>(c.value("order_qty", 0.0));
+    });
+
+    // 019 §5: the graph-model router (see nodes/switch_node.hpp's banner — the only utility node that
+    // needed new runtime machinery; fan-out/merge are free once edges[] exists). Parses ONCE here
+    // (deploy), mirroring aero.rule.expr's factory just above — 0-alloc eval per Command.
+    node_reg.register_type("aero.flow.switch", aero::nodes::SwitchNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+        auto prog = aero::nodes::SwitchNode::compile(c.value("expr", std::string{}));
+        return std::make_unique<aero::nodes::SwitchNode>(std::move(prog));
     });
 
     // 019 slice: generic HTTP output (see nodes/http_output_node.hpp's banner for scope/non-durability).

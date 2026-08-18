@@ -1,17 +1,21 @@
 # 019 — Flow Graph Model and Studio Canvas API
 
-> Draft v0.1. Upgrades the Flow Designer from a linear list dressed up as a canvas (Phase 11.8:
-> `@xyflow/react` rendering `Application.flow: NodeSpec[]` with dragging/connecting disabled) to a
-> real node-graph — drag, wire, branch/merge, Node-RED/EMQX-style — while keeping 004's compile-once,
-> zero-alloc execution invariant untouched. Also narrows 008/015's plugin ambition: built-in
-> nodes/drivers stay the default; the extension ABI is kept as a boundary, not grown into an active
-> marketplace, until a real third-party need shows up (decided in discussion, 2026-08-18).
+> Draft v0.2. Upgrades the Flow model from a linear list to a real graph — branch/fan-out/merge,
+> Node-RED-style — while keeping 004's compile-once, zero-alloc execution invariant untouched. **§2/§3
+> (schema `edges[]` + Flow Compiler topo-sort/branch-routing) and §7's `aero.flow.switch` are
+> DELIVERED (2026-08-18)** — built smaller than originally drafted: fan-out and merge needed zero new
+> machinery once it was confirmed nodes share one mutable `ProcessingContext` rather than having real
+> per-port data (§2/§3). §4 (Studio canvas editing) and §5's other routes (`POST /flows/validate`,
+> trace SSE, `debug-run`) remain undelivered, separate follow-up work. Also narrows 008/015's plugin
+> ambition: built-in nodes/drivers stay the default; the extension ABI is kept as a boundary, not
+> grown into an active marketplace, until a real third-party need shows up (decided in discussion,
+> 2026-08-18).
 
 ## 1. Where this starts from (grounded in current code, not aspiration)
 
-- **Schema** (`include/aero/schema/application.hpp`): `Application.flow` is `std::vector<NodeSpec>`,
-  strictly ordered — array order **is** the DAG (004 v0.1: linear + single switch). No node `id`, no
-  edges, no ports.
+- **Schema** (`include/aero/schema/application.hpp`): **as of this ADR, `NodeSpec` has an `id` and
+  `Application` has an optional `edges: EdgeSpec[]`** (§2) — grounding below describes the state
+  BEFORE this ADR, kept for context on why §2/§3 were shaped the way they were.
 - **Studio canvas** (`studio/src/FlowDesigner.tsx`, `FlowCanvasNode.tsx`, Phase 11.8): already renders
   through React Flow, but `nodesDraggable={false}`, `nodesConnectable={false}`,
   `edgesReconnectable={false}` — a presentation upgrade over the same array, with ↑/↓/✕ buttons doing
@@ -33,9 +37,9 @@
 switch — revision 2."* This is that revision, paired with the Studio-facing graph API needed to author
 it.
 
-## 2. Schema — from ordered array to a real graph (extends 004 §7, 013 T3)
+## 2. Schema — from ordered array to a real graph (extends 004 §7, 013 T3) — DELIVERED
 
-`aero-schema`'s `Application` gains:
+`aero-schema`'s `Application` gained (`include/aero/schema/application.hpp`):
 
 ```jsonc
 {
@@ -44,49 +48,67 @@ it.
     { "id": "scale1",  "type_id": "aero.transform.scale", "config": { "factor": 2 } }
   ],
   "edges": [
-    { "from": "decode1", "from_port": "out", "to": "scale1", "to_port": "in" }
+    { "from": "decode1", "from_port": "true", "to": "scale1" }
   ]
 }
 ```
 
-- Every `NodeSpec` gets a required `id` (stable string, unique within the flow) — today's array index
-  is the implicit id; this makes it explicit and edge-addressable.
-- `edges: EdgeSpec[]` replaces "array order is the DAG." An edge is `{from, from_port?, to, to_port?}`;
-  omitted ports default to a node's single implicit in/out (keeps today's linear flows expressible
-  with zero edges boilerplate — see §6 migration).
-- `NodeDescriptor` (005) gains **typed ports**: `{name, kind}` where `kind` is a coarse tag (`scalar`,
-  `frame`, `event` — matching what 004 §2.1 already calls "types match"). Full type system is
-  explicitly out of scope for v0.1; start coarse, grow if a real mismatch bug demands it.
+- Every `NodeSpec` gets an `id` (stable string, unique within the flow) — `load_application` always
+  populates it: explicit from JSON if present, else synthesized `"n<index>"`.
+- `edges: EdgeSpec[]` replaces "array order is the DAG" when non-empty. An edge is
+  `{from, from_port?, to}` — **no `to_port`**, and **no ports on `NodeDescriptor`**. Both were in the
+  original draft of this section and were cut before implementation: nodes have no real per-input
+  slot at all today — every `INode::process(ProcessingContext&)` reads/writes the SAME shared
+  `ctx.tags`/`ctx.output`/`ctx.events` buffers (confirmed by re-reading `core/compiled_flow.hpp`/
+  `sdk/node.hpp` before writing code, agreed with the user 2026-08-18). An edge only needs to say
+  which node runs next and under what branch condition — there is no per-node "input" to address, so
+  a `to_port` would have had no meaning. `from_port` is empty for an unconditional edge, or a branch
+  label (`"true"`/`"false"` in v1 — the only source is `aero.flow.switch`, §5) for a conditional one.
 
-This is a schema-shape change, not a philosophy change — `aero-schema` stays the one canonical
-contract (013 T3), codegen'd to TS/C++ as before.
+This is additive to `aero-schema` — `examples/hello_flow.json` and its round-trip test are untouched
+(`edges` empty → the exact pre-existing linear path, §6/G6).
 
-## 3. Compile phase — real branch/merge, same zero-alloc execute (extends 004 §2–§3)
+## 3. Compile phase — branch/fan-out, same zero-alloc execute (extends 004 §2–§3) — DELIVERED
 
-The Flow Compiler's job grows but stays entirely at compile time:
+The Flow Compiler (`include/aero/runtime/flow_compiler.hpp`) grows but stays entirely at compile
+time — no `StepKind` enum, because fan-out and merge turned out to need none:
 
-1. **Validate**: DAG acyclic (unchanged rule, now over `edges[]` instead of implicit adjacency),
-   every `to` port resolved from some `from` port, port `kind` compatibility, exactly one trigger
-   node (unchanged, 004 §5).
-2. **Topological order → still a flat step array.** This is the load-bearing constraint: even with
-   real fan-out/fan-in, execution stays `for (Step& step : steps_) step.node->process(ctx)` — no
-   graph walk at runtime. Extend `Step` with a `StepKind`:
-   - `Linear` — today's shape, unconditional next step.
-   - `Fanout` — N downstream steps all enabled (both branches run); compiler lays out all N in
-     topological order with no runtime branching.
-   - `ConditionalBranch` — a Rule/switch node sets a context flag; downstream steps whose branch flag
-     doesn't match are skipped (004 §2.2 already sketches this for the single-switch case — this
-     generalizes it, doesn't invent a new mechanism).
-   - `Merge` — a step whose node needs >1 input; requires the multi-input slots below to be already
-     populated before it runs (compiler ensures ordering).
-3. **Multi-input context slots** (extends 003 §6, still an open item there — "typed struct vs
-   type-erased; decides plan layout"): a merge node reads N named input slots from
-   `ProcessingContext`, laid out once at compile time, same as today's single-input path. No
-   allocation, no map lookup on the hot path — this ADR is the concrete reason 003 §6 needs to close.
+- **Fan-out is free.** Any node may already have >1 outgoing edge; `edges[]` alone expresses it, no
+  dedicated node type or compiler case needed.
+- **Merge is free.** Two branches writing into the shared `ctx` have already "merged" by the time a
+  downstream node runs — a merge point is purely a *topological-order* guarantee (the compiler
+  schedules it after every declared upstream branch), not a data-routing concern. This resolved §10's
+  original "multi-input merge semantics" open question outright: since execution is one synchronous
+  array walk (nothing runs concurrently within a flow execution), there is no runtime "wait" to
+  arbitrate — wait-for-all/first-of-N/windowed-join are async-dataflow concepts that don't apply here.
+- **Branching is the one real addition**, via `order_flow_graph()`, run only when `app.edges` is
+  non-empty:
+  1. Duplicate-id check.
+  2. Edge-endpoint check (`from`/`to` must resolve to a known id).
+  3. **Kahn's algorithm** does topo-sort AND cycle detection in one pass — nodes left over after the
+     queue drains are a cycle.
+  4. **Root check**: exactly one zero-in-degree node, and it must be the flow's Source-category node
+     (generalizes the pre-existing `has_source` check into "the graph's root IS the source").
+  5. **Branch-label assignment**: for each node, the distinct `from_port` values across its incoming
+     edges must be either all-empty (unconditional) or a single non-empty label; a MIX (e.g.
+     `{"", "true"}`) is rejected — "not supported yet" rather than silently mishandled (P1).
+  6. **Single branch source** (added after `/code-review` caught it): `ctx.active_branch` is one
+     field, not a stack, so at most one node in the graph may be the source of a labeled edge. A
+     second independent `aero.flow.switch` compiles but at runtime one switch's decision would
+     silently overwrite the other's before its own labeled steps are checked — rejected at deploy
+     instead ("flow has more than one branch-producing node").
+- `CompiledFlow::Step` (`core/compiled_flow.hpp`) gained one field: `std::string_view required_label`.
+  `execute()` skips a step when `!required_label.empty() && required_label != ctx.active_branch` — an
+  O(1) `string_view` compare, 0-alloc, no graph resolution (I3 untouched). `ctx.active_branch`
+  (`sdk/processing_context.hpp`) is a new `string_view` field, set by `aero.flow.switch` to a static
+  `"true"`/`"false"` literal (§5) — nothing else writes it. Cleared in `ProcessingContext::reset()`
+  alongside every other per-Command buffer (`/code-review` caught this being missed on the first pass
+  — a reused context leaking a stale branch decision into the next Command would have been a real,
+  if latent, bug).
 
-No wait/timeout semantics for merge in v0.1 (see open questions, §10) — a merge step assumes every
-upstream producer runs earlier in the same synchronous walk (true for fan-out from one trigger; not
-true for merging across independently-triggered flows, which is out of scope here).
+**`Stop` keeps its exact existing behavior**: it aborts the whole remaining step array, even under
+fan-out — a documented v1 limitation (§10 used to carry this as an open question; it's now a
+conscious, recorded choice, not something left undecided), not a bug.
 
 ## 4. Studio canvas — turning the existing React Flow instance into a real editor
 
@@ -95,9 +117,12 @@ true for merging across independently-triggered flows, which is out of scope her
 - Flip `nodesDraggable`/`nodesConnectable`/`edgesReconnectable` to `true`; wire `onConnect` to append
   an `EdgeSpec`, `onNodesChange`(drag) to update layout (next bullet), `onNodeClick` keeps today's
   select-to-configure behavior.
-- `FlowCanvasNode` grows from one Top/Bottom `Handle` pair to **named handles per port**, positioned
-  from the node's `NodeDescriptor.ports` (served by `GET /catalog`, §5) — this is the direct Node-RED
-  parallel (typed connectors, not one generic wire).
+- `FlowCanvasNode` grows from one Top/Bottom `Handle` pair to **named handles per branch label** —
+  NOT a `NodeDescriptor.ports` concept (§2 cut that: nodes have no real per-input slot to advertise).
+  Handles are a Studio-only presentation detail derived from a node's possible outgoing `from_port`
+  values — today that means exactly `aero.flow.switch` gets a "true"/"false" pair of handles, every
+  other node gets one generic output handle. Node-RED-style, but thinner: the backend doesn't route
+  distinct data per handle, only a branch label (§3).
 - **Node position is UI-only state, never runtime input.** Store it as a Studio-side sidecar the
   runtime never parses — e.g. `application.studio_meta.layout: {[nodeId]: {x, y}}` — a field the
   Flow Compiler explicitly ignores. This keeps 013 T3 ("Studio and runtime cannot drift") true: a
@@ -114,7 +139,7 @@ true for merging across independently-triggered flows, which is out of scope her
 
 | Route | Purpose | Status |
 |---|---|---|
-| `GET /catalog` | Serve `NodeDescriptor`/`DriverDescriptor` (type_id, category, config schema) straight from the runtime's own registry (013 §2 `aero-nodes`/`aero-drivers`). | **Delivered** (standalone slice, §7) — ports aren't in the schema yet since `NodeDescriptor` has no port concept until §2's graph work lands; today's `fields` cover config only |
+| `GET /catalog` | Serve `NodeDescriptor`/`DriverDescriptor` (type_id, category, config schema) straight from the runtime's own registry (013 §2 `aero-nodes`/`aero-drivers`). | **Delivered** (standalone slice, §7) — no ports in the schema; §2 confirmed `NodeDescriptor` never gets a port concept, `fields` covers config only |
 | `POST /flows/validate` | Run §3.1–2 (validate + topo-sort) against a candidate graph **without** binding nodes or deploying — live-as-you-wire feedback, same two-stage-validation posture as 015 §7 extended to graph structure (dangling port, type mismatch, cycle, multiple triggers). | New, straightforward |
 | `GET /flows/{name}/trace` (SSE) | Per-step last-result + timestamp for the currently deployed flow, feeding the canvas trace overlay (§4). Additive; does not change `/metrics/stream`'s existing shape (016 S1: "new REST routes are additive only"). | New, needs a per-step counter added to `CompiledFlow`/`Runtime::status()`-adjacent state |
 | `POST /flows/{name}/debug-run` | Inject one sample payload through the compiled flow off the live path, for the inject/debug affordance (§4). | **Not committed for v0.1** — needs a sandboxed execution mode in `Runtime` that doesn't touch live actor state; real design work, tracked as an open question (§10) |
@@ -135,11 +160,10 @@ body/response, `{"error": msg}` + 4xx on failure — no new pattern introduced (
   unaffected; a graph that actually branches is a new *capability* an Application opts into by adding
   `edges[]`, not a breaking change to the wire shape.
 
-## 7. Utility nodes — delivered vs. planned (per discussion, 2026-08-18)
+## 7. Utility nodes — delivered, and two retired (per discussion, 2026-08-18)
 
 The request that motivated closing the catalog-drift gap also asked for a few "utility" nodes: branch,
-parallel (fan-out), merge, and an HTTP output. These split cleanly by whether they need §2/§3's graph
-model or not:
+parallel (fan-out), merge, and an HTTP output.
 
 - **`aero.output.http` — delivered**, in the standalone catalog-drift-fix slice alongside `GET /catalog`
   (not gated on this ADR at all): an ordinary `Output`-category node, same shape as `aero.output.mes`
@@ -149,22 +173,23 @@ model or not:
   generic HTTP utility node has no at-least-once requirement by default. `Runtime::configure_http_egress()`
   / `http_send()` mirror `configure_mes()`/`mes_stage()`'s exact scope, including the same honest gap:
   no live-flow-actor auto-forwarding is wired yet for either (a test/caller drives the hand-off
-  manually) — this ADR's §3/§4 branch work does not change that.
-- **`aero.flow.switch` (branch), `aero.flow.fanout` (parallel), `aero.flow.merge` — planned, NOT
-  functional yet.** Each needs a node with more than one next/previous step, which today's linear
-  `flow[]` (even with §2's `edges[]` extension not yet built) cannot express. They are blocked on §2's
-  schema (`edges[]`, node `id`) and §3's `StepKind` compiler work landing first. Rough field-schema
-  sketch for when that happens:
-  - `aero.flow.switch` — `expr` (String, an `ExprRuleNode`-style condition) + N labeled outputs (the
-    `ConditionalBranch` `StepKind`, §3).
-  - `aero.flow.fanout` — no config; N static outputs, all enabled (the `Fanout` `StepKind`, §3).
-  - `aero.flow.merge` — input count + a strategy field, directly blocked on §10's open "multi-input merge
-    semantics" question (wait-for-all vs first-of-N vs windowed join) — do not implement before that's
-    decided.
-
-  Do not register any of these three in `register_builtins()` before §2/§3 land — a node claiming to
-  branch/merge with no compiler support behind it would be exactly the kind of overstated-completion gap
-  R5/S4 (016) exist to prevent.
+  manually) — §3's branch work does not change that.
+- **`aero.flow.switch` — delivered** (`nodes/switch_node.hpp`, `NodeCategory::Rule`). The one utility
+  node that needed new runtime machinery — it *chooses* a path, which `process() -> NodeResult` alone
+  can't signal. Config `{expr}` (same DSL as `aero.rule.expr` — reuses
+  `expr_detail::Program::evaluate()`, factored out of `ExprRuleNode` into a public method on `Program`
+  itself so the two nodes share one 0-alloc RPN evaluator instead of duplicating it). `process()`
+  evaluates `expr` and sets `ctx.active_branch` to the static literal `"true"` or `"false"` (§3),
+  always returns `Continue` — unlike `aero.rule.expr`, a switch never stops the flow, it only routes.
+  v1 is binary only (no N-way case labels) — matches `ExprRuleNode`'s existing boolean-expression
+  precedent exactly; N-way switching is future work if a real need shows up.
+- **`aero.flow.fanout` and `aero.flow.merge` — retired, not built, because they turned out to be
+  unnecessary as distinct node types.** §3 explains why: any node can already have >1 outgoing edge
+  (fan-out), and two branches writing into the shared `ProcessingContext` have already merged by the
+  time a downstream node runs (merge). Neither needs config, a factory, or a `NodeCategory` — adding
+  them would be pure ceremony over what `edges[]` + topo-sort already does for free. If a Studio
+  canvas ever wants an explicit visual "this is where branches merge" marker, that is a presentation
+  concern (§4's Studio-canvas work, separate and not yet built) — it does not need a backend node.
 
 ## 8. Plugin-scope narrowing (per discussion — recorded here, not re-litigated)
 
@@ -179,34 +204,50 @@ model or not:
 
 ## 9. Invariants (normative)
 
-- **G1** — graph validation + topological ordering is compile-time only (extends 004 I3); execution
-  never resolves the graph, allocates, or looks up a node by id/name. `flow_zero_alloc` (or its
-  extension for branch/merge flows) must stay green.
+- **G1** — graph validation (`order_flow_graph`) + topological ordering is compile-time only (extends
+  004 I3); execution never resolves the graph, allocates, or looks up a node by id/name. Confirmed:
+  full `ctest` suite (50/50, including `flow_zero_alloc`) green after this landed.
 - **G2** — node position/layout is Studio-only metadata (`studio_meta`); the Flow Compiler and
-  runtime never read it, never fail on its absence, never let it affect deploy semantics.
-- **G3** — `GET /catalog` is generated from the runtime's actual registry; once it ships, the Studio
-  never hand-maintains a duplicate catalog (retires `catalog.ts`'s hardcoded arrays).
+  runtime never read it, never fail on its absence, never let it affect deploy semantics. (Still
+  applies to the not-yet-built §4 Studio-canvas work.)
+- **G3** — `GET /catalog` is generated from the runtime's actual registry; the Studio never
+  hand-maintains a duplicate catalog (retires `catalog.ts`'s hardcoded arrays). Delivered.
 - **G4** — new routes (§5) are additive; `/apps`, `/status`, `/metrics/stream` shapes are unchanged
   (mirrors 016 S1).
-- **G5** — branch/merge compiles to `StepKind` skip-flags + pre-laid-out multi-input context slots,
-  never a runtime graph walk (extends 004 I3, closes 003 §6's open item).
-- **G6** — a `flow[]` with no `edges[]` keeps today's linear semantics exactly; this ADR must not
-  break `examples/hello_flow.json` or its round-trip test.
+- **G5** — branch routing compiles to a single `string_view required_label` per `CompiledFlow::Step`,
+  checked with an O(1) compare at execute time — never a runtime graph walk, never a per-node input
+  slot (extends 004 I3). Merge needs no compile-time OR runtime state at all beyond topological order
+  (closes 003 §6's open item on this axis: no typed/type-erased scratch was needed for this work).
+- **G6** — a `flow[]` with no `edges[]` keeps today's linear semantics exactly; `examples/hello_flow.json`
+  and its round-trip test are unmodified. Confirmed by the full test suite staying green.
+- **G7** — `Stop` aborts the whole remaining step array regardless of fan-out (§3) — a fired switch
+  branch or a parallel sibling does not get special-cased; refining this is deferred, not silently
+  assumed away.
 
 ## 10. Open questions
 
-- **Multi-input merge semantics** — wait-for-all vs first-of-N vs windowed join. Blocks finalizing
-  3§6/003 §6's context slot layout and §7's `aero.flow.merge`; needs a decision before implementation
-  starts.
 - **`debug-run` sandboxed execution** (§5) — running a compiled flow against one sample payload
   without touching live actor/persistence state. Real design work (does it reuse the actor's
   `CompiledFlow*` read-only? a scratch `ProcessingContext` only?) — not committed for v0.1.
-- **Port type granularity** — coarse `scalar`/`frame`/`event` tags (chosen for v0.1) vs a fuller type
-  system later; revisit only if a real mismatch bug demands it, per 004 §2.1's existing precedent.
 - **Trace endpoint cost** — per-step counters on every `CompiledFlow` step add a small amount of
   state/writes to the hot path; needs to be measured against `flow_zero_alloc`'s CI gate (an atomic
   counter increment is not an allocation, but it is a write — confirm it's cheap enough to always-on,
   or make it opt-in per deployed flow).
-- **Fan-out semantics vs `NodeResult::Stop`** — today a `Stop` short-circuits a linear walk (004
-  §2.2); with real fan-out, does `Stop` on one branch stop only that branch or the whole step array?
-  Needs a decision alongside `StepKind::Fanout` (§3).
+- **Per-branch `Stop` scoping** — G7 above is the conservative v1 choice (Stop aborts everything); a
+  future increment could scope it to the firing branch only if a real use case needs sibling branches
+  to keep running after one aborts. Not needed yet.
+- **N-way switch (beyond true/false)** — v1's `aero.flow.switch` is binary only (§7); a case/label
+  switch would need to relax the single-active-label restriction and the "no conflicting labels"
+  compiler check (§3) to something richer. Revisit only if a real flow needs more than one boolean
+  branch point.
+- ~~Multiple independent switch points in one flow~~ **Resolved: rejected at deploy (§3 step 6).**
+  `ctx.active_branch` is a single field, not a stack — v1 supports exactly one active branch-producing
+  node per flow, matching 004's original "linear + single switch" scope; a second one is a compile-time
+  error, not a silent misroute. Nested/sibling switches sharing one flow is future work if ever needed.
+
+~~Multi-input merge semantics~~ **Resolved (§3):** execution is one synchronous array walk, so there is
+no runtime race to arbitrate — merge is purely topological order, no wait/first-of-N/windowed-join
+concept applies.
+~~Port type granularity~~ **Moot (§2):** `NodeDescriptor` never gained a ports concept — there is
+nothing to type.
+~~Fan-out semantics vs `NodeResult::Stop`~~ **Resolved as G7 above.**

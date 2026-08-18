@@ -62,6 +62,56 @@ struct Program {
     std::size_t max_depth = 0;        // peak value-stack depth (bounds the eval stack)
     bool ok = false;
     std::string error;
+
+    // 0-alloc RPN eval over a fixed value stack (N1), bounded by `max_depth`. A public method on
+    // `Program` itself (not a private helper on whichever node owns one) so any node compiling an
+    // expression — `ExprRuleNode`, `aero.flow.switch` (switch_node.hpp) — shares one evaluator instead
+    // of duplicating the interpreter loop.
+    [[nodiscard]] double evaluate(const aero::ProcessingContext& ctx) const noexcept {
+        static constexpr std::size_t kMaxStack = 128;
+        double stack[kMaxStack];
+        std::size_t sp = 0;
+        for (const auto& in : code) {
+            switch (in.op) {
+                case Op::Const: stack[sp++] = in.k; break;
+                case Op::Tag:   stack[sp++] = tag_value(ctx, in.tag); break;
+                case Op::Neg:   stack[sp - 1] = -stack[sp - 1]; break;
+                case Op::Not:   stack[sp - 1] = (stack[sp - 1] == 0.0) ? 1.0 : 0.0; break;
+                default: {
+                    const double b = stack[--sp];
+                    const double a = stack[--sp];
+                    double r = 0.0;
+                    switch (in.op) {
+                        case Op::Add: r = a + b; break;
+                        case Op::Sub: r = a - b; break;
+                        case Op::Mul: r = a * b; break;
+                        case Op::Div: r = (b == 0.0) ? 0.0 : a / b; break;  // guarded — no trap (E-safe)
+                        case Op::Lt:  r = (a <  b) ? 1.0 : 0.0; break;
+                        case Op::Gt:  r = (a >  b) ? 1.0 : 0.0; break;
+                        case Op::Le:  r = (a <= b) ? 1.0 : 0.0; break;
+                        case Op::Ge:  r = (a >= b) ? 1.0 : 0.0; break;
+                        case Op::Eq:  r = (a == b) ? 1.0 : 0.0; break;
+                        case Op::Ne:  r = (a != b) ? 1.0 : 0.0; break;
+                        case Op::And: r = (a != 0.0 && b != 0.0) ? 1.0 : 0.0; break;
+                        case Op::Or:  r = (a != 0.0 || b != 0.0) ? 1.0 : 0.0; break;
+                        default: break;
+                    }
+                    stack[sp++] = r;
+                }
+            }
+            if (sp >= kMaxStack) break;  // parse bounds depth < kMaxStack; belt-and-suspenders
+        }
+        return sp > 0 ? stack[sp - 1] : 0.0;
+    }
+
+private:
+    double tag_value(const aero::ProcessingContext& ctx, std::uint32_t idx) const noexcept {
+        const std::string& nm = names[idx];
+        for (const auto& t : ctx.tags) {
+            if (t.name == nm) return t.value;
+        }
+        return 0.0;  // missing tag reads as 0.0 (008 §6 open question: could be a config error later)
+    }
 };
 
 // A tiny recursive-descent / precedence-climbing parser. It emits RPN as it recurses, so the output
@@ -280,7 +330,7 @@ public:
 
     NodeResult process(ProcessingContext& ctx) noexcept override {
         if (!prog_.ok) return NodeResult::Error;  // defensive: deploy validation rejects bad exprs
-        const double v = eval(ctx);
+        const double v = prog_.evaluate(ctx);
         if (v != 0.0) {
             // Rule fired: raise the alarm and short-circuit (008 §6). `alarm_` outlives the flow (the
             // node is pinned in the CompiledPlan), so a borrowing Event::type view is safe.
@@ -304,54 +354,6 @@ public:
     static constexpr NodeDescriptor kDesc{NodeCategory::Rule, "aero.rule.expr", kFields};
 
 private:
-    // 0-alloc RPN eval over a fixed value stack (N1). Bounded by the program's compiled depth.
-    static constexpr std::size_t kMaxStack = 128;
-
-    double eval(const ProcessingContext& ctx) const noexcept {
-        double stack[kMaxStack];
-        std::size_t sp = 0;
-        for (const auto& in : prog_.code) {
-            using expr_detail::Op;
-            switch (in.op) {
-                case Op::Const: stack[sp++] = in.k; break;
-                case Op::Tag:   stack[sp++] = tag_value(ctx, in.tag); break;
-                case Op::Neg:   stack[sp - 1] = -stack[sp - 1]; break;
-                case Op::Not:   stack[sp - 1] = (stack[sp - 1] == 0.0) ? 1.0 : 0.0; break;
-                default: {
-                    const double b = stack[--sp];
-                    const double a = stack[--sp];
-                    double r = 0.0;
-                    switch (in.op) {
-                        case Op::Add: r = a + b; break;
-                        case Op::Sub: r = a - b; break;
-                        case Op::Mul: r = a * b; break;
-                        case Op::Div: r = (b == 0.0) ? 0.0 : a / b; break;  // guarded — no trap (E-safe)
-                        case Op::Lt:  r = (a <  b) ? 1.0 : 0.0; break;
-                        case Op::Gt:  r = (a >  b) ? 1.0 : 0.0; break;
-                        case Op::Le:  r = (a <= b) ? 1.0 : 0.0; break;
-                        case Op::Ge:  r = (a >= b) ? 1.0 : 0.0; break;
-                        case Op::Eq:  r = (a == b) ? 1.0 : 0.0; break;
-                        case Op::Ne:  r = (a != b) ? 1.0 : 0.0; break;
-                        case Op::And: r = (a != 0.0 && b != 0.0) ? 1.0 : 0.0; break;
-                        case Op::Or:  r = (a != 0.0 || b != 0.0) ? 1.0 : 0.0; break;
-                        default: break;
-                    }
-                    stack[sp++] = r;
-                }
-            }
-            if (sp >= kMaxStack) break;  // parse bounds depth < kMaxStack; belt-and-suspenders
-        }
-        return sp > 0 ? stack[sp - 1] : 0.0;
-    }
-
-    double tag_value(const ProcessingContext& ctx, std::uint32_t idx) const noexcept {
-        const std::string& nm = prog_.names[idx];
-        for (const auto& t : ctx.tags) {
-            if (t.name == nm) return t.value;
-        }
-        return 0.0;  // missing tag reads as 0.0 (008 §6 open question: could be a config error later)
-    }
-
     Program prog_;
     std::string alarm_;
 };

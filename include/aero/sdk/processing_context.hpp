@@ -96,6 +96,12 @@ struct ProcessingContext {
     std::vector<StagedHttpRequest> http_requests;  // HTTP requests staged by aero.output.http, drained
                                                     // into the HttpEgressActor (019 slice)
 
+    // The branch a Rule/switch node (aero.flow.switch) chose this Command (019 §3/§4) — a view into
+    // static storage (the node's own literal "true"/"false"), so setting it is 0-alloc (N1). Read by
+    // CompiledFlow::execute() to skip steps whose required_label doesn't match. Not a stack (v1 supports
+    // exactly one active switch point per flow, per 004's existing "linear + single switch" precedent).
+    std::string_view active_branch;
+
     // --- flow status ---
     bool failed = false;
     std::size_t failed_step = 0;
@@ -113,6 +119,7 @@ struct ProcessingContext {
         events.clear();
         mes_reports.clear();
         http_requests.clear();
+        active_branch = {};
         failed = false;
         failed_step = 0;
     }

@@ -23,11 +23,26 @@
 
 namespace aero::schema {
 
-// One ordered step of the linear flow pipeline (009 §2): a node type_id + its opaque config object.
-// The config is passed verbatim to the node factory (005 §5); the schema does not interpret it.
+// One step of the flow pipeline (009 §2): a node type_id + its opaque config object. The config is
+// passed verbatim to the node factory (005 §5); the schema does not interpret it. `id` is a stable,
+// edge-addressable identity (019 §1) — always populated by `load_application` (explicit from JSON, or
+// synthesized "n<index>" if absent), so `edges[]` can reference any node regardless of whether the
+// JSON author supplied one.
 struct NodeSpec {
+    std::string id;
     std::string type_id;
     nlohmann::json config = nlohmann::json::object();
+};
+
+// One edge of the flow graph (019 §1/§2). `from_port` is empty for an unconditional/unlabeled edge, or
+// a branch label (currently only "true"/"false", set by `aero.flow.switch`) for a conditional one —
+// there is no `to_port`: nodes have no per-input slot to address (every node reads/writes the SAME
+// shared ProcessingContext buffers), so an edge only needs to say WHICH node runs next and under what
+// branch condition, not which of that node's "inputs" it feeds.
+struct EdgeSpec {
+    std::string from;
+    std::string from_port;
+    std::string to;
 };
 
 // The optional ingestion driver bound to the actor (006). config carries e.g. {"frame_count": N}.
@@ -53,7 +68,9 @@ struct Application {
     std::string name;
     std::string version;
     ActorSpec actor;
-    std::vector<NodeSpec> flow;  // ordered, the linear pipeline (Phase-4; branch/fan-out is Phase-5)
+    std::vector<NodeSpec> flow;  // ordered; array order IS the DAG when `edges` is empty (019 G6)
+    std::vector<EdgeSpec> edges;  // optional (019 §1/§2) — non-empty opts into a real graph, letting a
+                                  // node have more than one next/previous step (fan-out/merge/branch)
     std::optional<DriverSpec> driver;
     std::optional<PersistenceSpec> persistence;
 };
@@ -103,17 +120,49 @@ inline std::expected<Application, std::string> load_application(const std::strin
     if (!j.contains("flow") || !j["flow"].is_array() || j["flow"].empty()) {
         return std::unexpected("Application.flow (non-empty array) is required");
     }
+    std::size_t node_index = 0;
     for (const auto& n : j["flow"]) {
         if (!n.is_object() || !n.contains("type_id") || !n["type_id"].is_string()) {
             return std::unexpected("each flow node needs a string 'type_id'");
         }
         NodeSpec ns;
         ns.type_id = n["type_id"].get<std::string>();
+        // id (019 §1): explicit if given, else synthesized from position — always populated so
+        // `edges[]` (whether authored by hand or by a future Studio) can address any node.
+        if (n.contains("id") && !n["id"].is_null()) {
+            if (!n["id"].is_string()) return std::unexpected("node.id must be a string");
+            ns.id = n["id"].get<std::string>();
+        } else {
+            ns.id = "n" + std::to_string(node_index);
+        }
         if (n.contains("config") && !n["config"].is_null()) {
             if (!n["config"].is_object()) return std::unexpected("node.config must be an object");
             ns.config = n["config"];
         }
         app.flow.push_back(std::move(ns));
+        ++node_index;
+    }
+
+    // edges (optional, 019 §1/§2): a real graph over the flow's node ids. Shape-checked only here
+    // (every field present + a string); resolving ids against the actual node set, acyclicity, and
+    // branch-label consistency is the Flow Compiler's job at deploy (009 §3), same split as `flow`
+    // above — this loader never resolves type_ids or ids, only validates JSON shape.
+    if (j.contains("edges") && !j["edges"].is_null()) {
+        if (!j["edges"].is_array()) return std::unexpected("Application.edges must be an array");
+        for (const auto& e : j["edges"]) {
+            if (!e.is_object() || !e.contains("from") || !e["from"].is_string() ||
+                !e.contains("to") || !e["to"].is_string()) {
+                return std::unexpected("each edge needs string 'from' and 'to'");
+            }
+            EdgeSpec es;
+            es.from = e["from"].get<std::string>();
+            es.to = e["to"].get<std::string>();
+            if (e.contains("from_port") && !e["from_port"].is_null()) {
+                if (!e["from_port"].is_string()) return std::unexpected("edge.from_port must be a string");
+                es.from_port = e["from_port"].get<std::string>();
+            }
+            app.edges.push_back(std::move(es));
+        }
     }
 
     // driver (optional).

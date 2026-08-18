@@ -33,6 +33,7 @@ int main() {
         "aero.output.sum", "aero.rule.expr", "aero.transform.mean", "aero.transform.minmax",
         "aero.transform.sum", "aero.transform.crc", "aero.source.modbus", "aero.source.modbus_bits",
         "aero.source.json", "aero.output.mes", "aero.source.mes_order", "aero.output.http",
+        "aero.flow.switch",
     };
     const std::set<std::string> expected_drivers = {
         "aero.driver.generator", "aero.driver.modbus_tcp", "aero.driver.modbus_rtu",

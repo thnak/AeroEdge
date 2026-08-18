@@ -85,6 +85,15 @@ target_link_libraries(flow_validation PRIVATE aero::runtime)
 add_test(NAME flow_validation COMMAND flow_validation)
 set_tests_properties(flow_validation PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 019 sec2/3 gate: the flow GRAPH model (edges[], topo-sort/cycle-detect, branch routing via
+# aero.flow.switch). Cycle/duplicate-id/unknown-endpoint/conflicting-branch-label graphs are rejected
+# at deploy (P1); a valid fan-out graph runs every branch (merge is free); a switch graph runs ONLY
+# the matching branch.
+add_executable(flow_graph core/flow_graph.cpp)
+target_link_libraries(flow_graph PRIVATE aero::runtime)
+add_test(NAME flow_graph COMMAND flow_graph)
+set_tests_properties(flow_graph PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-5 LOAD-BEARING gate (009 §4 P2): hot-reload a live actor's flow while Commands flow — 0
 # dropped, 0 duplicated (exactly-once), the pre-reload frames run the old flow and post-reload the
 # new one, proven by an exact frame count + output-sum split. Mailbox-ordered swap on a Sequential
