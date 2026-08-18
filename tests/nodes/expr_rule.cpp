@@ -95,6 +95,65 @@ int main() {
     check("temp - raw > 5 fires",  fires("temp - raw > 5", {{"temp", 20}, {"raw", 10}}));
     check("missing tag reads 0 -> passes", passes("ghost > 1", {{"raw", 99}}));
 
+    // --- 020 §6.1 mod ---------------------------------------------------------------------------
+    check("raw % 3 == 1 fires @ raw=7",  fires("raw % 3 == 1", {{"raw", 7}}));
+    check("raw % 3 == 0 passes @ raw=7", passes("raw % 3 == 0", {{"raw", 7}}));
+    check("guarded mod raw%0 passes",    passes("raw % 0 > 1", {{"raw", 100}}));  // %0 -> 0, like Div
+
+    // --- 020 §6.2 math functions (unary) -----------------------------------------------------------
+    check("abs(raw) > 5 fires @ raw=-10",     fires("abs(raw) > 5", {{"raw", -10}}));
+    check("floor(raw) == 4 fires @ raw=4.9",  fires("floor(raw) == 4", {{"raw", 4.9}}));
+    check("ceil(raw) == 5 fires @ raw=4.1",   fires("ceil(raw) == 5", {{"raw", 4.1}}));
+    check("round(raw) == 5 fires @ raw=4.6",  fires("round(raw) == 5", {{"raw", 4.6}}));
+    check("sqrt(raw) == 3 fires @ raw=9",     fires("sqrt(raw) == 3", {{"raw", 9}}));
+    check("sin(0) == 0 fires",                fires("sin(0) == 0", {{"raw", 0}}));
+    check("cos(0) == 1 fires",                fires("cos(0) == 1", {{"raw", 0}}));
+    check("ln(raw) > 2 fires @ raw=20",       fires("ln(raw) > 2", {{"raw", 20.0}}));
+    check("log(100) == 2 fires",              fires("log(100) == 2", {{"raw", 0}}));
+    check("exp(0) == 1 fires",                fires("exp(0) == 1", {{"raw", 0}}));
+    check("atan(tan(1)) close to 1 fires",    fires("atan(tan(1)) > 0.9", {{"raw", 0}}));
+
+    // --- 020 §6.2/§6.3 math functions (binary: pow/min/max) -----------------------------------------
+    check("pow(2, raw) == 8 fires @ raw=3",   fires("pow(2, raw) == 8", {{"raw", 3}}));
+    check("min(3, raw) == 3 fires @ raw=9",   fires("min(3, raw) == 3", {{"raw", 9}}));
+    check("max(3, raw) == 9 fires @ raw=9",   fires("max(3, raw) == 9", {{"raw", 9}}));
+
+    // --- 020 §6.4: NaN propagates (not guarded) AND stages a diagnostic Event either way ------------
+    {
+        // Comparison-shaped: out-of-domain sqrt() makes the inner comparison false -> rule goes quiet,
+        // but the diagnostic Event must still be staged (the "not silent either way" requirement).
+        auto o = run("sqrt(raw) > 5", {{"raw", -1}});
+        check("NaN comparison-shaped: rule passes (goes quiet)", o.result == aero::NodeResult::Continue);
+    }
+    {
+        aero::ProcessingContext ctx = make_ctx({{"raw", -1}});
+        ExprRuleNode node(ExprRuleNode::compile("sqrt(raw) > 5"), "AlarmRaised");
+        node.process(ctx);
+        bool nan_diagnostic = false;
+        for (const auto& e : ctx.events) if (e.type == "ExprNaN") nan_diagnostic = true;
+        check("NaN comparison-shaped: diagnostic Event staged", nan_diagnostic);
+    }
+    {
+        // Bare-arithmetic-shaped: the SAME NaN makes `v != 0.0` true -> spurious fire, per §6.4's
+        // corrected finding. Both the diagnostic Event AND the (spurious) alarm fire.
+        aero::ProcessingContext ctx = make_ctx({{"raw", -1}});
+        ExprRuleNode node(ExprRuleNode::compile("sqrt(raw) - 1"), "AlarmRaised");
+        const auto r = node.process(ctx);
+        bool nan_diagnostic = false, alarm_fired = false;
+        for (const auto& e : ctx.events) {
+            if (e.type == "ExprNaN") nan_diagnostic = true;
+            if (e.type == "AlarmRaised") alarm_fired = true;
+        }
+        check("NaN bare-arithmetic-shaped: spurious fire", r == aero::NodeResult::Stop && alarm_fired);
+        check("NaN bare-arithmetic-shaped: diagnostic Event staged too", nan_diagnostic);
+    }
+
+    // --- unknown function name is a parse error, not a silent misparse ------------------------------
+    {
+        auto prog = ExprRuleNode::compile("sqtr(raw) > 1");
+        check("unknown function name rejected", !prog.ok && !prog.error.empty());
+    }
+
     // --- malformed expressions rejected at compile, no crash --------------------------------------
     for (const char* bad : {"raw >", "(1 + 2", "raw & 3", "* 5", "tag(raw)", "1 2 3", ""}) {
         auto prog = ExprRuleNode::compile(bad);

@@ -33,7 +33,7 @@ int main() {
         "aero.output.sum", "aero.rule.expr", "aero.transform.mean", "aero.transform.minmax",
         "aero.transform.sum", "aero.transform.crc", "aero.source.modbus", "aero.source.modbus_bits",
         "aero.source.json", "aero.output.mes", "aero.source.mes_order", "aero.output.http",
-        "aero.flow.switch",
+        "aero.flow.switch", "aero.transform.set",
     };
     const std::set<std::string> expected_drivers = {
         "aero.driver.generator", "aero.driver.modbus_tcp", "aero.driver.modbus_rtu",
@@ -92,6 +92,32 @@ int main() {
         ok &= full_fields;
         std::printf("[catalog] aero.output.http full_fields=%d %s\n", full_fields,
                     full_fields ? "ok" : "FAIL");
+    }
+
+    // Spot-check: aero.transform.set (020 §7, new this slice) carries tag+expr.
+    for (const auto& n : cat["nodes"]) {
+        if (n.value("type_id", std::string{}) != "aero.transform.set") continue;
+        const bool full_fields = has_field(n["fields"], "tag") && has_field(n["fields"], "expr");
+        ok &= full_fields;
+        std::printf("[catalog] aero.transform.set full_fields=%d %s\n", full_fields,
+                    full_fields ? "ok" : "FAIL");
+    }
+
+    // Spot-check (020 §4.3): aero.output.sum is terminal (Cap shape); aero.output.mes/http are NOT
+    // (they legitimately stay mid-chain, 012 §4) — the flag must actually distinguish, not default-true
+    // everywhere.
+    {
+        bool sum_terminal = false, mes_terminal = true, http_terminal = true;
+        for (const auto& n : cat["nodes"]) {
+            const auto id = n.value("type_id", std::string{});
+            if (id == "aero.output.sum") sum_terminal = n.value("terminal", false);
+            else if (id == "aero.output.mes") mes_terminal = n.value("terminal", false);
+            else if (id == "aero.output.http") http_terminal = n.value("terminal", false);
+        }
+        const bool as_expected = sum_terminal && !mes_terminal && !http_terminal;
+        ok &= as_expected;
+        std::printf("[catalog] terminal: sum=%d mes=%d http=%d %s\n", sum_terminal, mes_terminal,
+                    http_terminal, as_expected ? "ok" : "FAIL");
     }
 
     std::printf("%s\n", ok ? "OK" : "FAIL");

@@ -23,6 +23,7 @@
 
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -109,6 +110,100 @@ inline std::expected<void, std::string> validate_node_config(const std::string& 
         auto prog = aero::nodes::ExprRuleNode::compile(cfg["expr"].get<std::string>());
         if (!prog.ok) {
             return std::unexpected("node 'aero.flow.switch' invalid expression: " + prog.error);
+        }
+    } else if (type_id == "aero.transform.set") {
+        // 020 §7.2: same parse-once-at-deploy posture as aero.rule.expr/aero.flow.switch — PLUS a
+        // non-empty 'tag' (the write target), which the read-only DSL nodes don't need.
+        if (!cfg.contains("tag") || !cfg["tag"].is_string() || cfg["tag"].get<std::string>().empty()) {
+            return std::unexpected("node 'aero.transform.set' requires a non-empty string 'tag'");
+        }
+        if (!cfg.contains("expr") || !cfg["expr"].is_string()) {
+            return std::unexpected("node 'aero.transform.set' requires a string 'expr'");
+        }
+        auto prog = aero::nodes::ExprRuleNode::compile(cfg["expr"].get<std::string>());
+        if (!prog.ok) {
+            return std::unexpected("node 'aero.transform.set' invalid expression: " + prog.error);
+        }
+    }
+    return {};
+}
+
+// 020 §7.5: the statically-known tag name a node writes into ctx.tags, if any. Only nodes with a FIXED
+// (deploy-time-known) name are covered — Source nodes decoding a byte payload into data-dependent names
+// (aero.source.json/.modbus/.modbus_bits: one tag per JSON key / register index) have no name knowable
+// before a real frame arrives, so they're honestly excluded here, not falsely cleared as collision-free.
+// aero.transform.scale/.mean/.minmax/.sum don't introduce a NEW tag name at all (Scale mutates existing
+// tags in place; the others write ctx.output, not ctx.tags), so they're absent from this list too.
+inline std::optional<std::string> static_tag_write(const std::string& type_id, const nlohmann::json& cfg) {
+    if (type_id == "aero.source.decode") return std::string("raw");
+    if (type_id == "aero.transform.crc") return std::string("crc16");
+    if (type_id == "aero.source.mes_order") return std::string("order.qty");
+    if (type_id == "aero.transform.set" && cfg.contains("tag") && cfg["tag"].is_string()) {
+        return cfg["tag"].get<std::string>();
+    }
+    return std::nullopt;
+}
+
+// A new, dedicated compiler pass (020 §7.5) — own function, own single responsibility, not folded into
+// validate_node_config's per-node shape checks or order_flow_graph's topology logic. Rejects two
+// DIFFERENT nodes writing the same tag name unless they're mutually exclusive: v1 supports at most one
+// branch-producing node per flow (order_flow_graph's have_branch_source check above), so any two
+// non-empty, DIFFERENT labels are always the "true"/"false" pair of that one switch — no separate
+// branch-source tracking needed here, it's already enforced upstream. `labels[i]` is empty for every
+// node in linear (edges-empty) mode, so any two linear-mode writers of the same tag always collide.
+inline std::expected<void, std::string> validate_tag_writers(
+        const schema::Application& app, const std::vector<std::string_view>& labels) {
+    struct Writer { std::size_t index; std::string_view label; };
+    std::unordered_map<std::string, std::vector<Writer>> writers_by_tag;
+
+    for (std::size_t i = 0; i < app.flow.size(); ++i) {
+        auto tag = static_tag_write(app.flow[i].type_id, app.flow[i].config);
+        if (!tag) continue;
+        const std::string_view label = i < labels.size() ? labels[i] : std::string_view{};
+        writers_by_tag[*tag].push_back(Writer{i, label});
+    }
+
+    for (const auto& [tag, ws] : writers_by_tag) {
+        for (std::size_t a = 0; a < ws.size(); ++a) {
+            for (std::size_t b = a + 1; b < ws.size(); ++b) {
+                const bool mutually_exclusive =
+                    !ws[a].label.empty() && !ws[b].label.empty() && ws[a].label != ws[b].label;
+                if (!mutually_exclusive) {
+                    return std::unexpected("nodes '" + app.flow[ws[a].index].id + "' and '" +
+                        app.flow[ws[b].index].id + "' both write tag '" + tag + "' and are not "
+                        "mutually exclusive — this makes the tag's value order-dependent");
+                }
+            }
+        }
+    }
+    return {};
+}
+
+// 020 §4.3: a node type flagged NodeDescriptor::terminal (today, only aero.output.sum) must be the
+// flow's LAST step — the Cap shape's "nothing may follow me" (020 §3), enforced here at deploy time for
+// whichever flow shape actually reaches the compiler (both linear array-order and edges[] graph mode).
+inline std::expected<void, std::string> validate_terminal_placement(
+        const schema::Application& app, const std::vector<std::unique_ptr<INode>>& nodes) {
+    if (app.edges.empty()) {
+        // Linear mode: array order IS the DAG — a terminal node may only be the LAST element.
+        for (std::size_t i = 0; i + 1 < nodes.size(); ++i) {
+            if (nodes[i]->descriptor().terminal) {
+                return std::unexpected("node '" + app.flow[i].type_id + "' at flow position " +
+                    std::to_string(i) + " is terminal — nothing may follow it");
+            }
+        }
+        return {};
+    }
+    // Graph mode: a terminal node may not be the source ('from') of any edge.
+    std::unordered_map<std::string, std::size_t> id_to_index;
+    id_to_index.reserve(app.flow.size());
+    for (std::size_t i = 0; i < app.flow.size(); ++i) id_to_index.emplace(app.flow[i].id, i);
+    for (const auto& e : app.edges) {
+        const auto it = id_to_index.find(e.from);
+        if (it == id_to_index.end()) continue;  // unknown-endpoint is order_flow_graph's own error to raise
+        if (nodes[it->second]->descriptor().terminal) {
+            return std::unexpected("node '" + e.from + "' is terminal — nothing may follow it "
+                "(edge to '" + e.to + "')");
         }
     }
     return {};
@@ -272,8 +367,16 @@ inline std::expected<CompiledPlan, std::string> compile_flow(const schema::Appli
     if (!has_output) {
         return std::unexpected("flow has no Output node: the pipeline stages no egress");
     }
+    if (auto term_ok = validate_terminal_placement(app, plan.nodes); !term_ok) {
+        return std::unexpected(term_ok.error());
+    }
 
     if (app.edges.empty()) {
+        // Every node is unconditional in linear mode (no switch exists yet) — an empty-labels vector
+        // makes validate_tag_writers treat any two same-tag writers as an unconditional collision.
+        if (auto tw = validate_tag_writers(app, std::vector<std::string_view>(app.flow.size())); !tw) {
+            return std::unexpected(tw.error());
+        }
         plan.wire();  // linear, array order IS the DAG — unchanged from today (019 G6)
         return plan;
     }
@@ -281,6 +384,9 @@ inline std::expected<CompiledPlan, std::string> compile_flow(const schema::Appli
     auto order = order_flow_graph(app, plan.nodes);
     if (!order) {
         return std::unexpected(order.error());
+    }
+    if (auto tw = validate_tag_writers(app, order->labels); !tw) {
+        return std::unexpected(tw.error());
     }
     plan.wire(order->order, order->labels);
     return plan;

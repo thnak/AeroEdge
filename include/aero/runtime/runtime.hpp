@@ -55,6 +55,7 @@
 #include "aero/nodes/expr_rule_node.hpp"
 #include "aero/nodes/http_output_node.hpp"
 #include "aero/nodes/mes_nodes.hpp"
+#include "aero/nodes/set_node.hpp"
 #include "aero/nodes/switch_node.hpp"
 #include "aero/runtime/flow_actor.hpp"
 #include "aero/runtime/flow_compiler.hpp"
@@ -173,6 +174,15 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
         [](const nlohmann::json& c) -> std::unique_ptr<INode> {
         auto prog = aero::nodes::SwitchNode::compile(c.value("expr", std::string{}));
         return std::make_unique<aero::nodes::SwitchNode>(std::move(prog));
+    });
+
+    // 020 §7: aero.transform.set — write a DSL expression's result into a working-set tag. Parses ONCE
+    // here (deploy), reusing ExprRuleNode::compile — the same pattern aero.flow.switch's factory above
+    // already established, a third reuse of the same evaluator.
+    node_reg.register_type("aero.transform.set", aero::nodes::SetNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+        auto prog = aero::nodes::SetNode::compile(c.value("expr", std::string{}));
+        return std::make_unique<aero::nodes::SetNode>(std::move(prog), c.value("tag", std::string{}));
     });
 
     // 019 slice: generic HTTP output (see nodes/http_output_node.hpp's banner for scope/non-durability).
@@ -296,6 +306,7 @@ inline nlohmann::json build_catalog(const NodeRegistry& node_reg, const DriverRe
             case NodeCategory::Rule: j["category"] = "Rule"; break;
             case NodeCategory::Output: j["category"] = "Output"; break;
         }
+        j["terminal"] = d.terminal;  // 020 §4.3: Cap (nothing may follow) vs. Stack shape
         j["fields"] = nlohmann::json::array();
         for (const auto& f : d.config_fields) j["fields"].push_back(field_json(f));
         out["nodes"].push_back(std::move(j));

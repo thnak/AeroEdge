@@ -31,9 +31,12 @@ public:
 
     NodeResult process(ProcessingContext& ctx) noexcept override {
         if (!prog_.ok) return NodeResult::Error;  // defensive: deploy validation rejects bad exprs
+        bool saw_nan = false;
+        const double v = prog_.evaluate(ctx, &saw_nan);
+        if (saw_nan) ctx.events.push_back(Event{expr_detail::kNaNEventType, v});  // 020 §6.4
         // Both branches are static literals (not node-owned storage) — 0-alloc to set, and valid for
         // the whole flow execution regardless of this node's own lifetime (N1).
-        ctx.active_branch = (prog_.evaluate(ctx) != 0.0) ? kTrueLabel : kFalseLabel;
+        ctx.active_branch = (v != 0.0) ? kTrueLabel : kFalseLabel;
         return NodeResult::Continue;  // a router, never a Stop — unlike aero.rule.expr
     }
 
