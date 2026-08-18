@@ -678,3 +678,77 @@ this specific Mosquitto build hit a hard connection-count wall around 2,047.
 Same caveats as §3.2 apply: one Windows build, one machine, not a general
 claim about Mosquitto (particularly not about its Linux/epoll deployments,
 where this specific limit likely wouldn't exist).
+
+### 3.4 Does AeroEdge actually use more than one core? (multi-pair scaling test)
+
+Raised by a follow-up question: §3.2/§3.3's single-connection-pair numbers and
+low CPU% (~1-13%) could look like "the whole broker only ever uses one core" —
+worth checking directly rather than assuming, since that's a materially
+different claim from "this workload happens to be I/O-bound, not CPU-bound."
+
+`broker_bench` gained `--independent-pairs 1`: instead of every publisher/
+subscriber sharing one broadcast topic, publisher *i* and subscriber *i* get a
+unique topic (`bench/topic/i`), so N pairs behave as N genuinely independent,
+non-overlapping publish→deliver chains — the traffic shape aggregate
+multi-core throughput claims (MQTTnet's 700K, EMQX's 2M) actually measure,
+unlike the single-pair ceiling in §3.1-§3.3.
+
+**Aggregate throughput scaling** (this machine: AMD Ryzen 5 4600H, 6 physical
+/ 12 logical cores; 50,000 msg/publisher, QoS 0):
+
+| Independent pairs | Aggregate throughput | p50 latency |
+|---|---|---|
+| 1 | 52,756 msg/s | 54.4ms |
+| 4 | 96,608 msg/s | 88.8ms |
+| 8 | 131,107 msg/s | 3.8ms (p95 176ms — see note) |
+| 12 | 126,862 msg/s | 106.5ms |
+
+Real scaling with concurrency, not flat — confirms the broker is not confined
+to one core. Peaks around 8 pairs (~6 physical cores' worth of genuinely
+concurrent session threads) and roughly plateaus/dips slightly by 12, which is
+consistent with this machine having 6 physical cores under 12 logical ones.
+
+**Confirmed directly via CPU sampling**, not just inferred from throughput: a
+12-pair, 300,000-msg/publisher run (3.6M total messages) was sampled every
+300ms for its whole duration. CPU usage climbed steadily to **~315% (over 3
+full cores' worth of simultaneous work)** as the run progressed — a world away
+from §3.3's ~12-13% (single-core-equivalent) when the workload was mostly
+idle/blocked threads. **This settles the question: AeroEdge is not
+single-core-bound. §3.1-§3.3's low CPU% reflects those specific workloads
+being I/O-bound (blocked on syscalls, not spinning), not a ceiling on how many
+cores the broker can use** when given genuinely concurrent, independent work.
+
+**A throughput drop seen on the first 300K-msg/publisher run (56,716 msg/s,
+p95 1.76s) did NOT reproduce** — flagged initially as a possible new finding,
+then checked, per this session's own "repeat before concluding" discipline
+(the same reasoning applied to `concurrency_stress` and the §3.1/§3.2 repeat
+runs). Two immediate repeats of the identical 12-pair/300K-msg/publisher run
+came back at **133,153 msg/s and 131,442 msg/s** — consistent with the
+smaller-volume 8/12-pair numbers above, not the one-off drop. The likely cause
+of that single bad sample: it was launched from inside a PowerShell CPU-
+sampling loop polling `Get-Process` every 300ms for the run's entire duration
+— that sampler itself was competing for the same cores it was trying to
+measure. Recorded here as a methodology note, not a broker finding: don't
+trust a single sample, especially one taken by an instrument that shares
+resources with the thing being measured.
+
+One real (reproducible) oddity worth noting: **p50 latency swung between 1.4ms
+and 155.7ms across the two clean repeat runs, while p95/p99/max stayed tight**
+(286-300ms / 359-389ms / 558-582ms). With 12 independent, unsynchronized
+publisher threads racing at QoS 0, the aggregated latency distribution is
+bimodal-ish (some pairs finish their burst quickly, others queue behind
+scheduler contention) — small run-to-run scheduling differences can flip
+which cluster the 50th-percentile index lands in. p95/p99/max are the
+trustworthy numbers for this traffic shape; p50 is not.
+
+**Bottom line:** AeroEdge does scale aggregate throughput with genuine
+concurrency and does use multiple cores when the workload calls for it — the
+single-connection numbers in §3.1-§3.3 measure a different thing (one
+connection pair's ceiling) on purpose, not a hidden single-core limitation.
+Peak observed aggregate throughput this round (~131K msg/s at 8 pairs, small
+volume) is still far below marketing figures like 700K/2M — expected, since
+those are typically measured on server-grade multi-core/multi-node hardware,
+not a 6-core laptop CPU, and (per §3.2) likely represent a different
+connection-count/volume regime than tested here. The volume-dependent
+degradation above is a more interesting lead for closing that gap than raw
+core count is.

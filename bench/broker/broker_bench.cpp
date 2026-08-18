@@ -54,12 +54,22 @@ struct Options {
                                // already-running MQTT 3.1.1 broker on 127.0.0.1:external_port instead, for
                                // apples-to-oranges comparisons against other brokers using the exact same
                                // client-side protocol code and measurement methodology.
+    bool independent_pairs = false;  // false (default): every subscriber subscribes to the one shared topic
+                                      // ("bench/topic"), so N publishers fan out to N subscribers (N^2-ish
+                                      // delivery volume) - models a shared-topic broadcast workload.
+                                      // true: publisher i and subscriber i share a UNIQUE topic
+                                      // ("bench/topic/i"), so each pair is an independent, non-overlapping
+                                      // publish->deliver chain - models "many concurrent client pairs", the
+                                      // traffic shape aggregate multi-core throughput claims (MQTTnet's
+                                      // 700K, EMQX's 2M) actually measure. Requires --subscribers ==
+                                      // --publishers.
 };
 
 [[noreturn]] void usage_and_exit(const char* prog) {
     std::fprintf(stderr,
                   "usage: %s [--subscribers N] [--idle-sessions N] [--publishers N] [--messages N]\n"
-                  "          [--payload-bytes N] [--qos 0|1] [--timeout-s N] [--external-port N]\n",
+                  "          [--payload-bytes N] [--qos 0|1] [--timeout-s N] [--external-port N]\n"
+                  "          [--independent-pairs 0|1]\n",
                   prog);
     std::exit(2);
 }
@@ -78,10 +88,12 @@ Options parse_args(int argc, char** argv) {
         else if (flag == "--qos") o.qos = val;
         else if (flag == "--timeout-s") o.timeout_s = val;
         else if (flag == "--external-port") o.external_port = val;
+        else if (flag == "--independent-pairs") o.independent_pairs = (val != 0);
         else usage_and_exit(argv[0]);
     }
     if (o.payload_bytes < 8) o.payload_bytes = 8;  // leading 8 bytes are the send timestamp
     if (o.qos != 0 && o.qos != 1) usage_and_exit(argv[0]);
+    if (o.independent_pairs && o.subscribers != o.publishers) usage_and_exit(argv[0]);
     return o;
 }
 
@@ -320,10 +332,12 @@ LatencyStats summarize(std::vector<std::int64_t> ns) {
 int main(int argc, char** argv) {
     const Options o = parse_args(argc, argv);
     const std::string topic = "bench/topic";
+    auto pair_topic = [](int i) { return "bench/topic/" + std::to_string(i); };
 
     std::printf("broker_bench: subscribers=%d idle-sessions=%d publishers=%d messages/publisher=%d "
-                "payload-bytes=%d qos=%d\n",
-                o.subscribers, o.idle_sessions, o.publishers, o.messages, o.payload_bytes, o.qos);
+                "payload-bytes=%d qos=%d independent-pairs=%d\n",
+                o.subscribers, o.idle_sessions, o.publishers, o.messages, o.payload_bytes, o.qos,
+                o.independent_pairs ? 1 : 0);
 
     std::optional<NativeBroker> broker;
     std::uint16_t port = 0;
@@ -380,7 +394,8 @@ int main(int argc, char** argv) {
     std::vector<SubClient> subs(static_cast<std::size_t>(o.subscribers));
     for (int i = 0; i < o.subscribers; ++i) {
         const std::string cid = "sub-" + std::to_string(i);
-        if (!subs[static_cast<std::size_t>(i)].connect_and_subscribe(port, cid, topic,
+        const std::string filter = o.independent_pairs ? pair_topic(i) : topic;
+        if (!subs[static_cast<std::size_t>(i)].connect_and_subscribe(port, cid, filter,
                                                                        static_cast<std::uint8_t>(o.qos))) {
             std::fprintf(stderr, "subscriber %d failed to connect/subscribe\n", i);
             return 1;
@@ -395,8 +410,9 @@ int main(int argc, char** argv) {
     std::vector<PublishResult> pub_results(static_cast<std::size_t>(o.publishers));
     for (int i = 0; i < o.publishers; ++i) {
         pub_threads.emplace_back([&, i] {
+            const std::string pub_topic = o.independent_pairs ? pair_topic(i) : topic;
             pub_results[static_cast<std::size_t>(i)] =
-                publish_worker(port, "pub-" + std::to_string(i), topic, o.messages, o.payload_bytes,
+                publish_worker(port, "pub-" + std::to_string(i), pub_topic, o.messages, o.payload_bytes,
                                 static_cast<std::uint8_t>(o.qos));
         });
     }
@@ -409,9 +425,12 @@ int main(int argc, char** argv) {
         total_errors += r.errors;
     }
 
-    const std::uint64_t expected_per_sub = total_sent;  // every subscriber sees every successful publish
+    // Shared-topic mode: every subscriber sees every successful publish (broadcast fan-out).
+    // Independent-pairs mode: subscriber i only ever receives publisher i's messages, so the total expected
+    // deliveries across all subscribers equals total_sent, not total_sent * subscriber_count.
     const std::uint64_t expected_total =
-        expected_per_sub * static_cast<std::uint64_t>(std::max(o.subscribers, 0));
+        o.independent_pairs ? total_sent
+                             : total_sent * static_cast<std::uint64_t>(std::max(o.subscribers, 0));
     const auto deliver_deadline =
         t_pub_end + std::chrono::seconds(o.timeout_s);
     for (;;) {
