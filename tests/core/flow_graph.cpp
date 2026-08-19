@@ -180,6 +180,80 @@ int main() {
         {"id":"out","type_id":"aero.output.sum"}],
       "edges":[{"from":"src","to":"out"}]})");
 
+    // 020 §8: loop rejections — a malformed/unsafe/unsupported loop is caught at deploy, never a
+    // silently-wrong or hung runtime.
+    expect_reject("loop-max-iterations-zero", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"id":"src","type_id":"aero.source.decode"},
+        {"id":"ls","type_id":"aero.flow.loop_start",
+         "config":{"counter_tag":"i","start_expr":"0","max_iterations":0,"max_duration_ms":1000}},
+        {"id":"lb","type_id":"aero.flow.loop_back",
+         "config":{"counter_tag":"i","step_expr":"1","end_expr":"9"}},
+        {"id":"out","type_id":"aero.output.sum"}],
+      "edges":[
+        {"from":"src","to":"ls"},{"from":"ls","to":"lb"},
+        {"from":"lb","from_port":"loop_back","to":"lb"},{"from":"lb","to":"out"}]})");
+
+    expect_reject("loop-missing-max-duration", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"id":"src","type_id":"aero.source.decode"},
+        {"id":"ls","type_id":"aero.flow.loop_start",
+         "config":{"counter_tag":"i","start_expr":"0","max_iterations":20}},
+        {"id":"lb","type_id":"aero.flow.loop_back",
+         "config":{"counter_tag":"i","step_expr":"1","end_expr":"9"}},
+        {"id":"out","type_id":"aero.output.sum"}],
+      "edges":[
+        {"from":"src","to":"ls"},{"from":"ls","to":"lb"},
+        {"from":"lb","from_port":"loop_back","to":"lb"},{"from":"lb","to":"out"}]})");
+
+    // Two loop_back edges — ctx.loop_iterations_remaining/loop_deadline are single fields, not a
+    // stack, same structural reason "two branch sources" is rejected (019 sec10 precedent).
+    expect_reject("loop-two-loop-back-edges", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"id":"src","type_id":"aero.source.decode"},
+        {"id":"ls","type_id":"aero.flow.loop_start",
+         "config":{"counter_tag":"i","start_expr":"0","max_iterations":20,"max_duration_ms":1000}},
+        {"id":"body","type_id":"aero.transform.scale","config":{"factor":1}},
+        {"id":"lb","type_id":"aero.flow.loop_back",
+         "config":{"counter_tag":"i","step_expr":"1","end_expr":"9"}},
+        {"id":"out","type_id":"aero.output.sum"}],
+      "edges":[
+        {"from":"src","to":"ls"},{"from":"ls","to":"body"},{"from":"body","to":"lb"},
+        {"from":"lb","from_port":"loop_back","to":"body"},
+        {"from":"lb","from_port":"loop_back","to":"ls"},
+        {"from":"lb","to":"out"}]})");
+
+    // A loop_start reached only via a "true"/"false" edge breaks its "always runs exactly once before
+    // loop_back" assumption (020 sec8.7) — branch labels don't propagate transitively.
+    expect_reject("loop-nested-in-branch", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"id":"src","type_id":"aero.source.decode"},
+        {"id":"sw","type_id":"aero.flow.switch","config":{"expr":"raw > 0"}},
+        {"id":"ls","type_id":"aero.flow.loop_start",
+         "config":{"counter_tag":"i","start_expr":"0","max_iterations":20,"max_duration_ms":1000}},
+        {"id":"lb","type_id":"aero.flow.loop_back",
+         "config":{"counter_tag":"i","step_expr":"1","end_expr":"9"}},
+        {"id":"out","type_id":"aero.output.sum"}],
+      "edges":[
+        {"from":"src","to":"sw"},{"from":"sw","from_port":"true","to":"ls"},{"from":"ls","to":"lb"},
+        {"from":"lb","from_port":"loop_back","to":"lb"},{"from":"lb","to":"out"}]})");
+
+    // A loop pair with no edges[] at all — array-order linear mode has no from_port concept, so a
+    // loop_back's jump target could never resolve (020 sec8).
+    expect_reject("loop-requires-graph-mode", R"({
+      "name":"bad","version":"1",
+      "flow":[
+        {"type_id":"aero.source.decode"},
+        {"type_id":"aero.flow.loop_start",
+         "config":{"counter_tag":"i","start_expr":"0","max_iterations":20,"max_duration_ms":1000}},
+        {"type_id":"aero.flow.loop_back",
+         "config":{"counter_tag":"i","step_expr":"1","end_expr":"9"}},
+        {"type_id":"aero.output.sum"}]})");
+
     // ---- PART B: execution semantics (direct CompiledFlow, mirrors mes_outbox.cpp's ACT0 style) ----
     aero::NodeRegistry node_reg;
     aero::DriverRegistry driver_reg;
@@ -323,6 +397,93 @@ int main() {
         const bool ok = after_first == 1.0 && count_first == 1 && after_second == 2.0 && count_second == 1;
         std::printf("  %-28s : after1=%.1f(n=%zu) after2=%.1f(n=%zu) %s\n", "set-overwrite-self-ref",
                     after_first, count_first, after_second, count_second, ok ? "ok" : "FAIL");
+        if (!ok) ++failures;
+    }
+
+    // 020 §8: a bounded loop — src -> loop_start(i=0) -> accumulate(sum += i) -> loop_back(i+=1,
+    // continue while i<=9) -(loop_back)-> accumulate; -(else)-> out. Hand-worked expectation: the body
+    // runs once per i in [0..9] inclusive (10 passes) before loop_back's post-increment check (i=10)
+    // finally fails 10<=9, so accumulate sees i=0,1,...,9 -> sum=0+1+...+9=45, and the final counter
+    // (loop_back's own last write) is 10, one past the inclusive bound.
+    {
+        Application app;
+        app.name = "loop-accumulate";
+        app.version = "0.1.0";
+        app.flow = {
+            NodeSpec{.id = "src", .type_id = "aero.source.decode"},
+            NodeSpec{.id = "ls", .type_id = "aero.flow.loop_start",
+                     .config = {{"counter_tag", "i"}, {"start_expr", "0"},
+                                {"max_iterations", 20}, {"max_duration_ms", 5000}}},
+            NodeSpec{.id = "acc", .type_id = "aero.transform.set",
+                     .config = {{"tag", "sum"}, {"expr", "tag(\"sum\") + tag(\"i\")"}}},
+            NodeSpec{.id = "lb", .type_id = "aero.flow.loop_back",
+                     .config = {{"counter_tag", "i"}, {"step_expr", "1"}, {"end_expr", "9"}}},
+            NodeSpec{.id = "out", .type_id = "aero.output.sum"},
+        };
+        app.edges = {
+            EdgeSpec{.from = "src", .to = "ls"},
+            EdgeSpec{.from = "ls", .to = "acc"},
+            EdgeSpec{.from = "acc", .to = "lb"},
+            EdgeSpec{.from = "lb", .from_port = "loop_back", .to = "acc"},
+            EdgeSpec{.from = "lb", .to = "out"},
+        };
+        auto plan = aero::runtime::compile_flow(app, node_reg);
+        bool ok = plan.has_value();
+        if (ok) {
+            aero::ProcessingContext ctx;
+            aero::Frame frame{1};
+            ctx.reset(&frame);
+            plan->flow.execute(ctx);
+            double sum = -1.0, i = -1.0;
+            for (const auto& t : ctx.tags) {
+                if (t.name == "sum") sum = t.value;
+                if (t.name == "i") i = t.value;
+            }
+            ok = !ctx.failed && sum == 45.0 && i == 10.0;
+            std::printf("  %-28s : sum=%.1f(expect 45) i=%.1f(expect 10) failed=%d %s\n",
+                        "loop-accumulate-body-runs-N", sum, i, ctx.failed, ok ? "ok" : "FAIL");
+        } else {
+            std::printf("  %-28s : compile REJECTED(!) %s\n", "loop-accumulate-body-runs-N",
+                        plan.error().c_str());
+        }
+        if (!ok) ++failures;
+    }
+
+    // 020 §8.4: the runaway-safety path — max_iterations set below the real trip count must fail the
+    // Command (ctx.failed), reusing execute()'s existing Error handling, never hang or silently truncate.
+    {
+        Application app;
+        app.name = "loop-runaway";
+        app.version = "0.1.0";
+        app.flow = {
+            NodeSpec{.id = "src", .type_id = "aero.source.decode"},
+            NodeSpec{.id = "ls", .type_id = "aero.flow.loop_start",
+                     .config = {{"counter_tag", "i"}, {"start_expr", "0"},
+                                {"max_iterations", 3}, {"max_duration_ms", 5000}}},
+            NodeSpec{.id = "lb", .type_id = "aero.flow.loop_back",
+                     .config = {{"counter_tag", "i"}, {"step_expr", "1"}, {"end_expr", "1000000"}}},
+            NodeSpec{.id = "out", .type_id = "aero.output.sum"},
+        };
+        app.edges = {
+            EdgeSpec{.from = "src", .to = "ls"},
+            EdgeSpec{.from = "ls", .to = "lb"},
+            EdgeSpec{.from = "lb", .from_port = "loop_back", .to = "lb"},
+            EdgeSpec{.from = "lb", .to = "out"},
+        };
+        auto plan = aero::runtime::compile_flow(app, node_reg);
+        bool ok = plan.has_value();
+        if (ok) {
+            aero::ProcessingContext ctx;
+            aero::Frame frame{1};
+            ctx.reset(&frame);
+            plan->flow.execute(ctx);
+            ok = ctx.failed;
+            std::printf("  %-28s : failed=%d(expect 1) %s\n", "loop-runaway-hits-max-iterations",
+                        ctx.failed, ok ? "ok" : "FAIL");
+        } else {
+            std::printf("  %-28s : compile REJECTED(!) %s\n", "loop-runaway-hits-max-iterations",
+                        plan.error().c_str());
+        }
         if (!ok) ++failures;
     }
 

@@ -55,7 +55,8 @@ struct CompiledPlan {
     // required_label for `nodes[i]` (see CompiledFlow::add) — must reference STABLE storage (a static
     // literal, never a view into the Application that produced this plan, which does not outlive it).
     void wire(const std::vector<std::size_t>& order = {},
-              const std::vector<std::string_view>& labels = {}) {
+              const std::vector<std::string_view>& labels = {},
+              const std::optional<std::pair<std::size_t, std::size_t>>& loop_edge = std::nullopt) {
         flow = aero::CompiledFlow{};
         if (order.empty()) {
             for (auto& n : nodes) {
@@ -63,9 +64,22 @@ struct CompiledPlan {
             }
             return;
         }
-        for (std::size_t idx : order) {
+        // Needed only to resolve loop_edge (app.flow-index space) into step-index space — always fully
+        // populated: order.size() == nodes.size() is already a precondition of order_flow_graph's own
+        // success (anything less is its own "cycle"/"not exactly one root" rejection), so every index
+        // gets a real position here, never a stale zero-default entry.
+        std::vector<std::size_t> position_of(nodes.size());
+        for (std::size_t k = 0; k < order.size(); ++k) {
+            position_of[order[k]] = k;
+        }
+        for (std::size_t k = 0; k < order.size(); ++k) {
+            const std::size_t idx = order[k];
             const std::string_view label = idx < labels.size() ? labels[idx] : std::string_view{};
-            flow.add(*nodes[idx], label);
+            std::optional<std::size_t> jump;
+            if (loop_edge && loop_edge->first == idx) {
+                jump = position_of[loop_edge->second];
+            }
+            flow.add(*nodes[idx], label, jump);
         }
     }
 };
@@ -123,6 +137,56 @@ inline std::expected<void, std::string> validate_node_config(const std::string& 
         auto prog = aero::nodes::ExprRuleNode::compile(cfg["expr"].get<std::string>());
         if (!prog.ok) {
             return std::unexpected("node 'aero.transform.set' invalid expression: " + prog.error);
+        }
+    } else if (type_id == "aero.flow.loop_start") {
+        // 020 §8.2: counter_tag + start_expr (same DSL, same parse-once posture), plus a hard, required
+        // safety cap on both iteration count and wall-clock duration — no default lets a bound go
+        // unexamined (020 §8.8 Q3), and >= 1 specifically closes the 0-underflow bug 020 §8.4 found.
+        if (!cfg.contains("counter_tag") || !cfg["counter_tag"].is_string() ||
+            cfg["counter_tag"].get<std::string>().empty()) {
+            return std::unexpected("node 'aero.flow.loop_start' requires a non-empty string 'counter_tag'");
+        }
+        if (!cfg.contains("start_expr") || !cfg["start_expr"].is_string()) {
+            return std::unexpected("node 'aero.flow.loop_start' requires a string 'start_expr'");
+        }
+        if (auto prog = aero::nodes::ExprRuleNode::compile(cfg["start_expr"].get<std::string>());
+            !prog.ok) {
+            return std::unexpected("node 'aero.flow.loop_start' invalid start_expr: " + prog.error);
+        }
+        if (!cfg.contains("max_iterations") ||
+            !(cfg["max_iterations"].is_number_unsigned() || cfg["max_iterations"].is_number_integer())) {
+            return std::unexpected("node 'aero.flow.loop_start' requires an integer 'max_iterations'");
+        }
+        if (cfg["max_iterations"].get<long long>() < 1) {
+            return std::unexpected("node 'aero.flow.loop_start' 'max_iterations' must be >= 1");
+        }
+        if (!cfg.contains("max_duration_ms") ||
+            !(cfg["max_duration_ms"].is_number_unsigned() || cfg["max_duration_ms"].is_number_integer())) {
+            return std::unexpected("node 'aero.flow.loop_start' requires an integer 'max_duration_ms'");
+        }
+        if (cfg["max_duration_ms"].get<long long>() < 1) {
+            return std::unexpected("node 'aero.flow.loop_start' 'max_duration_ms' must be >= 1");
+        }
+    } else if (type_id == "aero.flow.loop_back") {
+        // 020 §8.2: no max_iterations here — moved to loop_start, which has a single init moment,
+        // unlike loop_back which runs once PER iteration.
+        if (!cfg.contains("counter_tag") || !cfg["counter_tag"].is_string() ||
+            cfg["counter_tag"].get<std::string>().empty()) {
+            return std::unexpected("node 'aero.flow.loop_back' requires a non-empty string 'counter_tag'");
+        }
+        if (cfg.contains("step_expr") && !cfg["step_expr"].is_string()) {
+            return std::unexpected("node 'aero.flow.loop_back' config 'step_expr' must be a string");
+        }
+        if (auto prog = aero::nodes::ExprRuleNode::compile(cfg.value("step_expr", std::string{"1"}));
+            !prog.ok) {
+            return std::unexpected("node 'aero.flow.loop_back' invalid step_expr: " + prog.error);
+        }
+        if (!cfg.contains("end_expr") || !cfg["end_expr"].is_string()) {
+            return std::unexpected("node 'aero.flow.loop_back' requires a string 'end_expr'");
+        }
+        if (auto prog = aero::nodes::ExprRuleNode::compile(cfg["end_expr"].get<std::string>());
+            !prog.ok) {
+            return std::unexpected("node 'aero.flow.loop_back' invalid end_expr: " + prog.error);
         }
     }
     return {};
@@ -215,6 +279,10 @@ inline std::expected<void, std::string> validate_terminal_placement(
 struct GraphOrder {
     std::vector<std::size_t> order;
     std::vector<std::string_view> labels;
+    // 020 §8.7: the resolved loop-back edge, in app.flow-index space — {from (the loop_back node),
+    // to (the jump target)} — or nullopt if this flow has no loop. Resolved into step-index space by
+    // CompiledPlan::wire(), the same timing required_label is already resolved at.
+    std::optional<std::pair<std::size_t, std::size_t>> loop_edge;
 };
 
 // Validate `app.edges` against `app.flow` and produce a schedulable order (019 §2). Only called when
@@ -248,6 +316,14 @@ inline std::expected<GraphOrder, std::string> order_flow_graph(
     // node route on the wrong switch's answer).
     bool have_branch_source = false;
     std::size_t branch_source = 0;
+    // 020 §8.7: a loop_back edge is a backward edge BY CONSTRUCTION (that's its entire point) — unlike
+    // "true"/"false", which are always forward edges and participate in Kahn's algorithm normally, this
+    // one must be excluded from adj/in_degree entirely and resolved separately below. "At most one such
+    // edge in the whole flow" is a strictly sufficient v1 "one loop per flow" rule (020 §8.8 Q2) on its
+    // own — simpler than a second parallel branch_source-style tracker, since one edge trivially implies
+    // one source.
+    bool have_loop_edge = false;
+    std::optional<std::pair<std::size_t, std::size_t>> loop_edge;
     for (const auto& e : app.edges) {
         const auto from_it = id_to_index.find(e.from);
         if (from_it == id_to_index.end()) {
@@ -257,13 +333,24 @@ inline std::expected<GraphOrder, std::string> order_flow_graph(
         if (to_it == id_to_index.end()) {
             return std::unexpected("edge references unknown node id: '" + e.to + "'");
         }
+
+        if (e.from_port == "loop_back") {
+            if (have_loop_edge) {
+                return std::unexpected("flow has more than one loop_back edge — only one loop per flow "
+                                       "is supported yet (020 sec8.8)");
+            }
+            have_loop_edge = true;
+            loop_edge = {from_it->second, to_it->second};
+            continue;  // NOT added to adj/in_degree — see banner above
+        }
+
         std::string_view label;
         if (!e.from_port.empty()) {
             if (e.from_port == "true") label = kTrue;
             else if (e.from_port == "false") label = kFalse;
             else {
                 return std::unexpected("edge.from_port '" + e.from_port + "' is not supported yet "
-                                       "(only \"true\"/\"false\", from aero.flow.switch)");
+                                       "(only \"true\"/\"false\"/\"loop_back\")");
             }
             if (!have_branch_source) {
                 have_branch_source = true;
@@ -321,7 +408,20 @@ inline std::expected<GraphOrder, std::string> order_flow_graph(
         labels[i] = first;
     }
 
-    return GraphOrder{std::move(order), std::move(labels)};
+    // 020 §8.7: a loop_start reached only via a labeled branch edge breaks its "always runs exactly
+    // once before loop_back" assumption (branch labels don't propagate transitively — only the node
+    // DIRECTLY reached by a "true"/"false" edge carries one, confirmed against this file's own
+    // conflicting-branch-labels test). v1 fix: reject at deploy, same "refuse cleanly rather than
+    // silently misbehave" posture every other unsupported combination above already gets.
+    for (std::size_t i = 0; i < n; ++i) {
+        if (nodes[i]->descriptor().type_id == "aero.flow.loop_start" && !labels[i].empty()) {
+            return std::unexpected("node '" + app.flow[i].id + "' (aero.flow.loop_start) is reached "
+                "only via a labeled branch edge — a loop must be reachable unconditionally from the "
+                "flow's root; loops nested inside a branch are not supported yet (020 sec8.7)");
+        }
+    }
+
+    return GraphOrder{std::move(order), std::move(labels), loop_edge};
 }
 
 // Validate + compile an Application's flow into a CompiledPlan (009 §3). Never throws, never
@@ -372,6 +472,17 @@ inline std::expected<CompiledPlan, std::string> compile_flow(const schema::Appli
     }
 
     if (app.edges.empty()) {
+        // 020 §8: linear/array-order mode has no from_port concept at all, so a loop_back's jump
+        // target could never resolve — without this check the "loop" would silently run its body once
+        // and stop (wrong), not fail loudly. Same "refuse cleanly" posture as every other unsupported
+        // combination in this file.
+        for (const auto& n : plan.nodes) {
+            const std::string_view tid = n->descriptor().type_id;
+            if (tid == "aero.flow.loop_start" || tid == "aero.flow.loop_back") {
+                return std::unexpected("node '" + std::string(tid) + "' requires the graph/edges[] "
+                    "flow model — array-order linear flows can't express a loop's jump-back (020 sec8)");
+            }
+        }
         // Every node is unconditional in linear mode (no switch exists yet) — an empty-labels vector
         // makes validate_tag_writers treat any two same-tag writers as an unconditional collision.
         if (auto tw = validate_tag_writers(app, std::vector<std::string_view>(app.flow.size())); !tw) {
@@ -388,7 +499,7 @@ inline std::expected<CompiledPlan, std::string> compile_flow(const schema::Appli
     if (auto tw = validate_tag_writers(app, order->labels); !tw) {
         return std::unexpected(tw.error());
     }
-    plan.wire(order->order, order->labels);
+    plan.wire(order->order, order->labels, order->loop_edge);
     return plan;
 }
 
