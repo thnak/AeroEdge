@@ -241,4 +241,93 @@ describe("validateGraph — instant client feedback mirroring flow_compiler.hpp'
     });
     expect(validateGraph(app)).toEqual([]);
   });
+
+  // 020 §8.7 (Studio-side mirror of order_flow_graph's own loop_back exclusion) — a loop_back edge is
+  // a backward edge BY CONSTRUCTION and must never trip the generic cycle check, unlike a genuinely
+  // unsupported hand-drawn cycle.
+  it("accepts a valid loop graph — the loop_back edge is not a cycle", () => {
+    const app: Application = {
+      name: "n", version: "1", actor: { kind: "edge", key: 1 },
+      flow: [
+        { id: "src", type_id: "aero.source.decode" },
+        { id: "ls", type_id: "aero.flow.loop_start" },
+        { id: "acc", type_id: "aero.transform.set" },
+        { id: "lb", type_id: "aero.flow.loop_back" },
+        { id: "out", type_id: "aero.output.sum" },
+      ],
+      edges: [
+        { from: "src", to: "ls" },
+        { from: "ls", to: "acc" },
+        { from: "acc", to: "lb" },
+        { from: "lb", from_port: "loop_back", to: "acc" },
+        { from: "lb", to: "out" },
+      ],
+    };
+    expect(validateGraph(app)).toEqual([]);
+  });
+
+  it("still rejects a genuine hand-drawn cycle that ISN'T a loop_back edge", () => {
+    const app: Application = {
+      name: "n", version: "1", actor: { kind: "edge", key: 1 },
+      flow: [{ id: "a", type_id: "x" }, { id: "b", type_id: "y" }],
+      edges: [{ from: "a", to: "b" }, { from: "b", to: "a" }],
+    };
+    expect(validateGraph(app).some((e) => e.includes("cycle"))).toBe(true);
+  });
+
+  it("rejects more than one loop_back edge", () => {
+    const app: Application = {
+      name: "n", version: "1", actor: { kind: "edge", key: 1 },
+      flow: [
+        { id: "src", type_id: "aero.source.decode" }, { id: "ls", type_id: "aero.flow.loop_start" },
+        { id: "lb", type_id: "aero.flow.loop_back" }, { id: "out", type_id: "aero.output.sum" },
+      ],
+      edges: [
+        { from: "src", to: "ls" }, { from: "ls", to: "lb" },
+        { from: "lb", from_port: "loop_back", to: "lb" }, { from: "lb", from_port: "loop_back", to: "ls" },
+        { from: "lb", to: "out" },
+      ],
+    };
+    expect(validateGraph(app).some((e) => e.includes("more than one loop_back edge"))).toBe(true);
+  });
+
+  it("a switch and a loop can coexist — not 'more than one branch-producing node'", () => {
+    const app: Application = {
+      name: "n", version: "1", actor: { kind: "edge", key: 1 },
+      flow: [
+        { id: "src", type_id: "aero.source.decode" }, { id: "ls", type_id: "aero.flow.loop_start" },
+        { id: "lb", type_id: "aero.flow.loop_back" }, { id: "sw", type_id: "aero.flow.switch" },
+        { id: "hi", type_id: "aero.transform.scale" }, { id: "lo", type_id: "aero.transform.scale" },
+        { id: "out", type_id: "aero.output.sum" },
+      ],
+      edges: [
+        // The loop is reached unconditionally from the root, closes on itself (empty body), then feeds
+        // the switch — which is what's actually being asserted here: BOTH a loop_back edge and a
+        // true/false pair coexisting shouldn't trip "more than one branch-producing node".
+        { from: "src", to: "ls" }, { from: "ls", to: "lb" }, { from: "lb", from_port: "loop_back", to: "lb" },
+        { from: "lb", to: "sw" },
+        { from: "sw", from_port: "true", to: "hi" }, { from: "sw", from_port: "false", to: "lo" },
+        { from: "hi", to: "out" }, { from: "lo", to: "out" },
+      ],
+    };
+    expect(validateGraph(app)).toEqual([]);
+  });
+
+  it("rejects a loop_start reached only via a labeled branch edge (nested inside a branch)", () => {
+    const app: Application = {
+      name: "n", version: "1", actor: { kind: "edge", key: 1 },
+      flow: [
+        { id: "src", type_id: "aero.source.decode" }, { id: "sw", type_id: "aero.flow.switch" },
+        { id: "ls", type_id: "aero.flow.loop_start" }, { id: "lb", type_id: "aero.flow.loop_back" },
+        { id: "out", type_id: "aero.output.sum" },
+      ],
+      edges: [
+        { from: "src", to: "sw" },
+        { from: "sw", from_port: "true", to: "ls" },
+        { from: "ls", to: "lb" }, { from: "lb", from_port: "loop_back", to: "lb" }, { from: "lb", to: "out" },
+        { from: "sw", from_port: "false", to: "out" },
+      ],
+    };
+    expect(validateGraph(app).some((e) => e.includes("reached only via a labeled branch edge"))).toBe(true);
+  });
 });
