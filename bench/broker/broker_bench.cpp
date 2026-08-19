@@ -16,9 +16,13 @@
 //     `sessions_` and scanned on every publish, but never fanned out to. This is the one knob that
 //     speaks directly to "would a topic trie/index help" — if p99 latency and throughput barely move as
 //     --idle-sessions grows, the linear scan (acl.hpp's documented tradeoff) isn't the bottleneck.
+//   - 017 Phase 7c: whether a slow-but-alive subscriber (--slow-subscribers / --slow-delay-us) delays
+//     delivery to healthy subscribers sharing the same topic — the benchmark-grade version of
+//     tests/broker/reactor_migration.cpp's pass/fail-only stalled-client test.
 //
 // Usage: broker_bench [--subscribers N] [--idle-sessions N] [--publishers N] [--messages N]
-//                      [--payload-bytes N] [--qos 0|1] [--timeout-s N]
+//                      [--payload-bytes N] [--qos 0|1] [--timeout-s N] [--external-port N]
+//                      [--independent-pairs 0|1] [--slow-subscribers N] [--slow-delay-us N]
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -50,12 +54,36 @@ struct Options {
     int payload_bytes = 64;   // clamped to >= 8 (leading 8 bytes carry the send timestamp)
     int qos = 1;
     int timeout_s = 30;       // max wait for delivery to finish once publishing is done
+    int external_port = 0;    // 0 = spin up an in-process NativeBroker (default); nonzero = dial an
+                               // already-running MQTT 3.1.1 broker on 127.0.0.1:external_port instead, for
+                               // apples-to-oranges comparisons against other brokers using the exact same
+                               // client-side protocol code and measurement methodology.
+    bool independent_pairs = false;  // false (default): every subscriber subscribes to the one shared topic
+                                      // ("bench/topic"), so N publishers fan out to N subscribers (N^2-ish
+                                      // delivery volume) - models a shared-topic broadcast workload.
+                                      // true: publisher i and subscriber i share a UNIQUE topic
+                                      // ("bench/topic/i"), so each pair is an independent, non-overlapping
+                                      // publish->deliver chain - models "many concurrent client pairs", the
+                                      // traffic shape aggregate multi-core throughput claims (MQTTnet's
+                                      // 700K, EMQX's 2M) actually measure. Requires --subscribers ==
+                                      // --publishers.
+    int slow_subscribers = 0;   // extra subscribers, on the shared topic, that artificially pause between
+                                 // reads (see --slow-delay-us) to model a slow-but-alive consumer -
+                                 // benchmark-grade version of tests/broker/reactor_migration.cpp's
+                                 // correctness-only stalled-client test. Their deliveries are reported
+                                 // separately from --subscribers' and are NOT mixed into the headline
+                                 // latency stats. Incompatible with --independent-pairs (no shared topic to
+                                 // attach them to).
+    int slow_delay_us = 5000;   // per-message artificial processing delay for --slow-subscribers, applied
+                                 // AFTER each PUBLISH is handled and before the next read - sustained partial
+                                 // backpressure, not a full stall.
 };
 
 [[noreturn]] void usage_and_exit(const char* prog) {
     std::fprintf(stderr,
                   "usage: %s [--subscribers N] [--idle-sessions N] [--publishers N] [--messages N]\n"
-                  "          [--payload-bytes N] [--qos 0|1] [--timeout-s N]\n",
+                  "          [--payload-bytes N] [--qos 0|1] [--timeout-s N] [--external-port N]\n"
+                  "          [--independent-pairs 0|1] [--slow-subscribers N] [--slow-delay-us N]\n",
                   prog);
     std::exit(2);
 }
@@ -73,10 +101,16 @@ Options parse_args(int argc, char** argv) {
         else if (flag == "--payload-bytes") o.payload_bytes = val;
         else if (flag == "--qos") o.qos = val;
         else if (flag == "--timeout-s") o.timeout_s = val;
+        else if (flag == "--external-port") o.external_port = val;
+        else if (flag == "--independent-pairs") o.independent_pairs = (val != 0);
+        else if (flag == "--slow-subscribers") o.slow_subscribers = val;
+        else if (flag == "--slow-delay-us") o.slow_delay_us = val;
         else usage_and_exit(argv[0]);
     }
     if (o.payload_bytes < 8) o.payload_bytes = 8;  // leading 8 bytes are the send timestamp
     if (o.qos != 0 && o.qos != 1) usage_and_exit(argv[0]);
+    if (o.independent_pairs && o.subscribers != o.publishers) usage_and_exit(argv[0]);
+    if (o.independent_pairs && o.slow_subscribers != 0) usage_and_exit(argv[0]);
     return o;
 }
 
@@ -113,7 +147,8 @@ public:
     ~SubClient() { close(); }
 
     bool connect_and_subscribe(std::uint16_t port, const std::string& client_id, const std::string& filter,
-                                std::uint8_t qos) {
+                                std::uint8_t qos, std::chrono::microseconds per_message_delay = {}) {
+        delay_ = per_message_delay;
         fd_ = dial_loopback(port);
         if (fd_ == quark::pal::invalid_fd) return false;
         running_.store(true, std::memory_order_release);
@@ -177,6 +212,7 @@ private:
             const std::uint8_t type = pkt->type_flags & 0xF0;
             if (type == 0x30) {
                 handle_publish(*pkt);
+                if (delay_.count() > 0) std::this_thread::sleep_for(delay_);
             } else {
                 std::lock_guard<std::mutex> g(setup_mu_);
                 setup_inbox_.push_back(std::move(*pkt));
@@ -218,6 +254,7 @@ private:
     std::uint16_t packet_id_ = 0;
     std::atomic<std::uint64_t> received_{0};
     std::vector<std::int64_t> latencies_ns_;
+    std::chrono::microseconds delay_{0};
 };
 
 // ===== publisher: single-threaded connect + sequential publish loop =====================================
@@ -315,22 +352,31 @@ LatencyStats summarize(std::vector<std::int64_t> ns) {
 int main(int argc, char** argv) {
     const Options o = parse_args(argc, argv);
     const std::string topic = "bench/topic";
+    auto pair_topic = [](int i) { return "bench/topic/" + std::to_string(i); };
 
     std::printf("broker_bench: subscribers=%d idle-sessions=%d publishers=%d messages/publisher=%d "
-                "payload-bytes=%d qos=%d\n",
-                o.subscribers, o.idle_sessions, o.publishers, o.messages, o.payload_bytes, o.qos);
+                "payload-bytes=%d qos=%d independent-pairs=%d\n",
+                o.subscribers, o.idle_sessions, o.publishers, o.messages, o.payload_bytes, o.qos,
+                o.independent_pairs ? 1 : 0);
 
-    Config cfg;
-    cfg.bind_host = "127.0.0.1";
-    cfg.listen_port = 0;  // ephemeral
-    cfg.backlog = 256;
-    NativeBroker broker(std::move(cfg));
-    auto started = broker.start();
-    if (!started) {
-        std::fprintf(stderr, "broker start failed: %s\n", started.error().c_str());
-        return 1;
+    std::optional<NativeBroker> broker;
+    std::uint16_t port = 0;
+    if (o.external_port != 0) {
+        port = static_cast<std::uint16_t>(o.external_port);
+        std::printf("driving external broker at 127.0.0.1:%u (no in-process NativeBroker started)\n", port);
+    } else {
+        Config cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.listen_port = 0;  // ephemeral
+        cfg.backlog = 256;
+        broker.emplace(std::move(cfg));
+        auto started = broker->start();
+        if (!started) {
+            std::fprintf(stderr, "broker start failed: %s\n", started.error().c_str());
+            return 1;
+        }
+        port = broker->listen_port();
     }
-    const std::uint16_t port = broker.listen_port();
 
     // Idle sessions: connected + subscribed to topics that never match `topic` — pure sessions_ bloat for
     // route_publish()'s linear scan-and-skip. Never counted in delivery stats. Progress is printed every
@@ -368,23 +414,43 @@ int main(int argc, char** argv) {
     std::vector<SubClient> subs(static_cast<std::size_t>(o.subscribers));
     for (int i = 0; i < o.subscribers; ++i) {
         const std::string cid = "sub-" + std::to_string(i);
-        if (!subs[static_cast<std::size_t>(i)].connect_and_subscribe(port, cid, topic,
+        const std::string filter = o.independent_pairs ? pair_topic(i) : topic;
+        if (!subs[static_cast<std::size_t>(i)].connect_and_subscribe(port, cid, filter,
                                                                        static_cast<std::uint8_t>(o.qos))) {
             std::fprintf(stderr, "subscriber %d failed to connect/subscribe\n", i);
             return 1;
         }
     }
 
-    std::printf("setup done: %d idle session(s), %d subscriber(s) connected — publishing...\n",
-                o.idle_sessions, o.subscribers);
+    // Slow subscribers: real recipients on the shared topic that pause --slow-delay-us after handling each
+    // PUBLISH before reading the next — sustained partial backpressure on their own socket, never a full
+    // stall. Reported separately from --subscribers below; existing purely to answer "does one slow-but-alive
+    // consumer delay the healthy ones," the question tests/broker/reactor_migration.cpp's
+    // test_stalled_reactor_client_does_not_block_others() answers at pass/fail granularity — this answers it
+    // with real throughput/percentile numbers.
+    std::vector<SubClient> slow_subs(static_cast<std::size_t>(o.slow_subscribers));
+    for (int i = 0; i < o.slow_subscribers; ++i) {
+        const std::string cid = "slow-" + std::to_string(i);
+        if (!slow_subs[static_cast<std::size_t>(i)].connect_and_subscribe(
+                port, cid, topic, static_cast<std::uint8_t>(o.qos),
+                std::chrono::microseconds(o.slow_delay_us))) {
+            std::fprintf(stderr, "slow subscriber %d failed to connect/subscribe\n", i);
+            return 1;
+        }
+    }
+
+    std::printf("setup done: %d idle session(s), %d subscriber(s), %d slow subscriber(s) connected — "
+                "publishing...\n",
+                o.idle_sessions, o.subscribers, o.slow_subscribers);
 
     const auto t_pub_start = std::chrono::steady_clock::now();
     std::vector<std::thread> pub_threads;
     std::vector<PublishResult> pub_results(static_cast<std::size_t>(o.publishers));
     for (int i = 0; i < o.publishers; ++i) {
         pub_threads.emplace_back([&, i] {
+            const std::string pub_topic = o.independent_pairs ? pair_topic(i) : topic;
             pub_results[static_cast<std::size_t>(i)] =
-                publish_worker(port, "pub-" + std::to_string(i), topic, o.messages, o.payload_bytes,
+                publish_worker(port, "pub-" + std::to_string(i), pub_topic, o.messages, o.payload_bytes,
                                 static_cast<std::uint8_t>(o.qos));
         });
     }
@@ -397,9 +463,12 @@ int main(int argc, char** argv) {
         total_errors += r.errors;
     }
 
-    const std::uint64_t expected_per_sub = total_sent;  // every subscriber sees every successful publish
+    // Shared-topic mode: every subscriber sees every successful publish (broadcast fan-out).
+    // Independent-pairs mode: subscriber i only ever receives publisher i's messages, so the total expected
+    // deliveries across all subscribers equals total_sent, not total_sent * subscriber_count.
     const std::uint64_t expected_total =
-        expected_per_sub * static_cast<std::uint64_t>(std::max(o.subscribers, 0));
+        o.independent_pairs ? total_sent
+                             : total_sent * static_cast<std::uint64_t>(std::max(o.subscribers, 0));
     const auto deliver_deadline =
         t_pub_end + std::chrono::seconds(o.timeout_s);
     for (;;) {
@@ -410,9 +479,26 @@ int main(int argc, char** argv) {
     }
     const auto t_deliver_end = std::chrono::steady_clock::now();
 
+    // Slow subscribers get their own, more generous deadline (their delivery is intentionally slowed down by
+    // --slow-delay-us, so timing them against the healthy --timeout-s would misreport a working fix as
+    // "incomplete"). Waited for AFTER the healthy measurement above completes, so it never inflates the
+    // headline publish/delivery wall-clock.
+    const std::uint64_t slow_expected_total =
+        total_sent * static_cast<std::uint64_t>(std::max(o.slow_subscribers, 0));
+    const auto slow_deadline = t_pub_end + std::chrono::seconds(o.timeout_s) +
+                                std::chrono::microseconds(static_cast<std::int64_t>(o.messages) *
+                                                           static_cast<std::int64_t>(o.slow_delay_us));
+    for (;;) {
+        std::uint64_t slow_received = 0;
+        for (const auto& s : slow_subs) slow_received += s.received();
+        if (slow_received >= slow_expected_total || std::chrono::steady_clock::now() >= slow_deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
     for (auto& s : subs) s.close();
+    for (auto& s : slow_subs) s.close();
     for (auto& s : idle) s.close();
-    broker.stop();
+    if (broker) broker->stop();
 
     std::uint64_t total_received = 0;
     std::vector<std::int64_t> all_latencies;
@@ -444,6 +530,50 @@ int main(int argc, char** argv) {
     if (lat.count > 0) {
         std::printf("latency (ms): min=%.3f p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f (n=%zu)\n",
                     lat.min_ms, lat.p50_ms, lat.p95_ms, lat.p99_ms, lat.max_ms, lat.mean_ms, lat.count);
+    }
+    if (total_received < expected_total) {
+        // Percentiles above are computed ONLY over messages that actually arrived before --timeout-s
+        // expired (SubClient::latencies_ns_ is appended to on receipt, nothing else). A run that times out
+        // before every expected message arrives is missing exactly its slowest deliveries (the stragglers
+        // that hadn't landed yet) — so p95/p99/max on an incomplete run are a survivorship-biased sample of
+        // the FASTEST deliveries, not a true tail. This silently makes incomplete runs look BETTER than
+        // complete ones on tail latency, which is backwards. Found via workflow red-team review after it
+        // produced a misleading "better tail latency" reading on a run that was actually the more backed-up
+        // one (017-Native-Broker-Performance-Redesign.md, Phase 4 investigation).
+        std::fprintf(stderr,
+                      "\nWARNING: only %llu/%llu (%.1f%%) expected messages arrived before --timeout-s — "
+                      "the latency percentiles above are SURVIVORSHIP-BIASED (computed only over the "
+                      "fastest-arriving messages) and are NOT comparable to a complete run's percentiles. "
+                      "Re-run with a longer --timeout-s or treat this run's tail latency as untrustworthy.\n",
+                      static_cast<unsigned long long>(total_received),
+                      static_cast<unsigned long long>(expected_total),
+                      expected_total > 0
+                          ? 100.0 * static_cast<double>(total_received) / static_cast<double>(expected_total)
+                          : 100.0);
+    }
+
+    if (o.slow_subscribers > 0) {
+        std::uint64_t slow_received = 0;
+        std::vector<std::int64_t> slow_latencies;
+        for (const auto& s : slow_subs) {
+            slow_received += s.received();
+            slow_latencies.insert(slow_latencies.end(), s.latencies_ns().begin(), s.latencies_ns().end());
+        }
+        const LatencyStats slow_lat = summarize(std::move(slow_latencies));
+        std::printf("\n--- slow subscriber(s) (%d, +%dus/msg) ------------------------------\n",
+                    o.slow_subscribers, o.slow_delay_us);
+        std::printf("expected=%llu received=%llu (%.1f%%) — backlog %s within the extended wait\n",
+                    static_cast<unsigned long long>(slow_expected_total),
+                    static_cast<unsigned long long>(slow_received),
+                    slow_expected_total > 0 ? 100.0 * static_cast<double>(slow_received) /
+                                                   static_cast<double>(slow_expected_total)
+                                             : 100.0,
+                    slow_received >= slow_expected_total ? "fully delivered" : "NOT fully delivered");
+        if (slow_lat.count > 0) {
+            std::printf("latency (ms): min=%.3f p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f (n=%zu)\n",
+                        slow_lat.min_ms, slow_lat.p50_ms, slow_lat.p95_ms, slow_lat.p99_ms, slow_lat.max_ms,
+                        slow_lat.mean_ms, slow_lat.count);
+        }
     }
 
     return 0;  // informational tool, not a pass/fail gate — the printed numbers are the point

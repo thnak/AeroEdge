@@ -175,6 +175,15 @@ target_link_libraries(resequencer PRIVATE aero::transport)
 add_test(NAME resequencer COMMAND resequencer)
 set_tests_properties(resequencer PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): try_parse_packet() (mqtt_codec.hpp), the
+# buffered-read counterpart to read_packet()/read_n() NativeBroker's session_loop now drives directly.
+# Pure function, no sockets — proves the parser correct in isolation (empty/partial/malformed/burst
+# buffers) before it drives the broker's only ingestion path; closes Phase 1's test-coverage gap #4.
+add_executable(mqtt_codec transport/mqtt_codec.cpp)
+target_link_libraries(mqtt_codec PRIVATE aero::transport)
+add_test(NAME mqtt_codec COMMAND mqtt_codec)
+set_tests_properties(mqtt_codec PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-7 cross-node gate (014 §2 X1): two actors on distinct NodeIds exchange a message over Quark's
 # REAL LoopbackTransport + DistributedRouter (fully-wired in-process path) — delivery + per-sender FIFO.
 add_executable(cross_node_message transport/cross_node_message.cpp)
@@ -206,6 +215,18 @@ add_executable(native_broker broker/native_broker.cpp)
 target_link_libraries(native_broker PRIVATE aero::broker)
 add_test(NAME native_broker COMMAND native_broker)
 set_tests_properties(native_broker PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# 017 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): NativeBroker::session_loop()'s buffered read
+# behaves correctly over a REAL socket — multiple complete packets delivered in one burst (forcing the
+# inner drain loop to carve more than one out of a single recv_some()), a packet split across two
+# separate writes (forcing a genuinely Incomplete parse across more than one read cycle), and session
+# takeover staying prompt even with a non-trivial backlog buffered ahead of it. Closes Phase 1's
+# test-coverage gap #4 at the broker-integration level (tests/transport/mqtt_codec.cpp already covers the
+# parser itself in isolation).
+add_executable(buffered_read_framing broker/buffered_read_framing.cpp)
+target_link_libraries(buffered_read_framing PRIVATE aero::broker)
+add_test(NAME buffered_read_framing COMMAND buffered_read_framing)
+set_tests_properties(buffered_read_framing PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
 # 017 §6 (revised scope) gate: bridge.hpp — bridging (MqttBridgeSink, HttpWebhookBridgeSink) + the
 # BrokerRuleEngine reusing aero-nodes' ExprRuleNode (008 §6) as the content gate over on_publish().
@@ -443,6 +464,32 @@ target_compile_definitions(native_broker_security PRIVATE
   AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
 add_test(NAME native_broker_security COMMAND native_broker_security)
 set_tests_properties(native_broker_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# 017 Phase 7 gate: the IoContext reactor migration for plaintext connections — mixed-mode fan-out
+# (one reactor/plaintext + one legacy/TLS recipient on the same topic) and the direct regression test for
+# Critical fix #1 (a stalled reactor client must not block other reactor sessions sharing the same reactor
+# thread). Needs aero-thirdparty-tls for the same reason native_broker_security does (a real mbedTLS
+# client-role TLS leg for the mixed-mode test).
+add_executable(reactor_migration broker/reactor_migration.cpp)
+target_link_libraries(reactor_migration PRIVATE aero::broker aero-thirdparty-tls)
+target_compile_definitions(reactor_migration PRIVATE
+  AERO_TLS_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/pal/certs")
+add_test(NAME reactor_migration COMMAND reactor_migration)
+set_tests_properties(reactor_migration PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# 017 Phase 2 Experiment C gate (redesign doc §1.5 gap #1 / §2.3 Experiment C): does a concurrent
+# publish-vs-teardown race already exist in the CURRENT SHIPPED NativeBroker? Unlike every other
+# tests/broker/*.cpp test (which deliberately sleeps to AVOID this race), this one runs straight at it
+# for a sustained 12s window with no artificial sleeps: several publisher threads tight-loop QoS-1
+# PUBLISH to a shared topic while a separate thread repeatedly connects a fresh client, SUBSCRIBEs, and
+# abruptly closes it (no clean DISCONNECT) — forcing teardown_session's non-clean-disconnect path —
+# concurrently, while several STEADY, never-torn-down subscriber clients must keep receiving messages
+# throughout. Proves the broker never hangs/crashes and steady clients' delivery never silently stops.
+# TIMEOUT is generous headroom above the ~12-15s the stress window itself takes.
+add_executable(concurrency_stress broker/concurrency_stress.cpp)
+target_link_libraries(concurrency_stress PRIVATE aero::broker)
+add_test(NAME concurrency_stress COMMAND concurrency_stress)
+set_tests_properties(concurrency_stress PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL" TIMEOUT 60)
 
 # ---- M9a: multi-protocol southbound (018) ------------------------------------------------------------
 # ModbusTcpDriver (drivers/modbus_tcp_driver.hpp): a real Modbus-TCP PULL driver (FC03 Read Holding

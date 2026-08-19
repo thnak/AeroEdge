@@ -26,7 +26,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -401,17 +403,84 @@ inline std::optional<Packet> read_packet(quark::pal::fd_t fd, const std::atomic<
     return read_packet(ch, running);
 }
 
+// 017 Phase 3 addition: the buffered-read counterpart to read_packet() above — ADDITIVE, does not
+// replace it. read_packet()/read_n() do one recv_some()-or-poll cycle PER BYTE of the fixed header and
+// remaining-length varint, plus one more for the body — 3+ syscalls per packet, unconditionally
+// (measured as the dominant per-packet cost even with zero fan-out, see
+// 017-Native-Broker-Performance-Redesign.md §2.4 Experiment A). This function does none of that I/O
+// itself: it is a PURE function over a caller-owned buffer, meant to be driven by a caller that fills
+// `buf` via its own bulk recv_some() calls (one recv_some() can hand over many packets' worth of bytes
+// at once) and repeatedly calls this to carve complete packets out of whatever has accumulated so far.
+// `MqttClientTransport`, bridge.hpp, and every test file's hand-rolled client keep using
+// read_packet()/read_n() completely unchanged — this is additive, not a replacement (017 N3 precedent:
+// don't touch shared code for one caller's needs).
+//
+// Tries to carve exactly one Packet out of buf[pos, buf.size()). On success: the Packet is returned and
+// `pos` is advanced past it (ready for the next call). On Incomplete: `pos` is left UNCHANGED — this is
+// not an error, it means "not enough bytes buffered yet for a whole packet"; the caller should recv_some()
+// more bytes, append them, and retry. On Malformed: `pos` is left UNCHANGED and the caller must treat
+// this exactly like read_packet() returning nullopt today — a fatal framing error, close the connection.
+// The only Malformed case is a remaining-length varint exceeding MQTT's own 4-byte encoding cap (§1.5.5,
+// the same limit read_varint()/put_remaining_length() enforce elsewhere in this file) — read_packet()'s
+// own remaining-length loop above does not actually check for this (it silently stops after 4 bytes
+// regardless of whether the 4th byte's continuation bit is still set); this function closes that gap
+// rather than reproducing it, since a well-formed sender can never trigger it and doing so is a strict
+// improvement, not a behavior change any real caller depends on.
+enum class ParseStatus { Incomplete, Malformed };
+
+inline std::expected<Packet, ParseStatus> try_parse_packet(const std::vector<std::byte>& buf,
+                                                            std::size_t& pos) {
+    std::size_t p = pos;
+    if (p >= buf.size()) return std::unexpected(ParseStatus::Incomplete);
+    const std::byte b0 = buf[p];
+    ++p;
+
+    std::uint32_t mult = 1, len = 0;
+    bool have_length = false;
+    for (int i = 0; i < 4 && !have_length; ++i) {
+        if (p >= buf.size()) return std::unexpected(ParseStatus::Incomplete);
+        const std::uint8_t e = std::to_integer<std::uint8_t>(buf[p]);
+        ++p;
+        len += static_cast<std::uint32_t>(e & 0x7F) * mult;
+        if ((e & 0x80) == 0) {
+            have_length = true;
+        } else {
+            mult *= 128;
+        }
+    }
+    if (!have_length) return std::unexpected(ParseStatus::Malformed);  // 5th continuation byte
+
+    if (buf.size() - p < len) return std::unexpected(ParseStatus::Incomplete);  // body not fully buffered
+
+    Packet pkt;
+    pkt.type_flags = std::to_integer<std::uint8_t>(b0);
+    pkt.body.assign(buf.begin() + static_cast<std::ptrdiff_t>(p),
+                    buf.begin() + static_cast<std::ptrdiff_t>(p + len));
+    pos = p + len;
+    return pkt;
+}
+
+// Serializes [fixed-header-byte | remaining-length | body] into a fresh buffer — the exact framing
+// write_packet()/write_packet_bounded() below send as-is. Extracted (017 Phase 7) so a caller building a
+// packet for later/async transmission (e.g. NativeBroker's reactor outbound queue, which must frame a
+// packet once and then track a partial-send byte offset across multiple non-blocking send attempts) can
+// reuse the exact same framing logic instead of re-deriving it.
+inline std::vector<std::byte> serialize_packet(std::byte type_flags, const std::vector<std::byte>& body) {
+    std::vector<std::byte> pkt;
+    pkt.reserve(5 + body.size());
+    pkt.push_back(type_flags);
+    put_remaining_length(pkt, static_cast<std::uint32_t>(body.size()));
+    pkt.insert(pkt.end(), body.begin(), body.end());
+    return pkt;
+}
+
 // Serialize [fixed-header-byte | remaining-length | body] and write it fully to `ch`, retrying on
 // would_block. NOT channel-write-serializing by itself — a caller with multiple writer threads on the
 // same channel (e.g. a broker Session fanning out a PUBLISH concurrently with its own reader thread
 // writing a SUBACK) must hold its own mutex around this call.
 template <class Channel>
 inline bool write_packet(Channel& ch, std::byte type_flags, const std::vector<std::byte>& body) {
-    std::vector<std::byte> pkt;
-    pkt.reserve(5 + body.size());
-    pkt.push_back(type_flags);
-    put_remaining_length(pkt, static_cast<std::uint32_t>(body.size()));
-    pkt.insert(pkt.end(), body.begin(), body.end());
+    std::vector<std::byte> pkt = serialize_packet(type_flags, body);
     std::size_t sent = 0;
     while (sent < pkt.size()) {
         auto w = ch.send_some(pkt.data() + sent, pkt.size() - sent);
@@ -428,6 +497,30 @@ inline bool write_packet(Channel& ch, std::byte type_flags, const std::vector<st
 inline bool write_packet(quark::pal::fd_t fd, std::byte type_flags, const std::vector<std::byte>& body) {
     aero::transport::PlainChannel ch{fd};
     return write_packet(ch, type_flags, body);
+}
+
+// 017 Phase 7 (Critical fix #2): same as write_packet() but gives up (returns false) once `deadline`
+// passes, instead of retrying forever like write_packet()'s own unbounded loop. write_packet() itself is
+// BYTE-FOR-BYTE UNCHANGED for every existing caller — this is a new, additive overload, not a
+// modification. Used by NativeBroker's reactor->legacy-recipient hand-off pool so one persistently slow
+// legacy (TLS) recipient can't monopolize a hand-off worker forever (the exact failure mode Phase 6's
+// item-count cap failed to prevent — bounding wall-clock time directly, not a proxy for it).
+template <class Channel>
+inline bool write_packet_bounded(Channel& ch, std::byte type_flags, const std::vector<std::byte>& body,
+                                  std::chrono::steady_clock::time_point deadline) {
+    std::vector<std::byte> pkt = serialize_packet(type_flags, body);
+    std::size_t sent = 0;
+    while (sent < pkt.size()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        auto w = ch.send_some(pkt.data() + sent, pkt.size() - sent);
+        if (w) {
+            sent += *w;
+            continue;
+        }
+        if (w.error() != quark::pal::would_block()) return false;
+        if (!aero::pal::wait_writable(ch.fd(), 200)) return false;  // poll itself failed
+    }
+    return true;
 }
 
 }  // namespace aero::transport::mqtt
