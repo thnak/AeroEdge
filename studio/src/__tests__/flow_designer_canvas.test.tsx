@@ -65,6 +65,16 @@ describe("FlowDesigner canvas", () => {
     expect(cards[2].querySelector(".react-flow__handle.target")).not.toBeNull();
   });
 
+  // 020 §4.3: the Cap-shape symmetric case — aero.output.sum is `terminal` in the catalog fixture, so
+  // its card renders no SOURCE handle either (nothing may follow it, made visible as a shape, not just
+  // a deploy-time validation message). Scale (non-terminal Transform) keeps its source handle.
+  it("a terminal (Cap-shape) card has no source handle; a non-terminal one does", () => {
+    const { container } = render(<Wrapper />);
+    const cards = container.querySelectorAll(".flow-node-card");
+    expect(cards[1].querySelector(".react-flow__handle.source")).not.toBeNull(); // Scale
+    expect(cards[2].querySelector(".react-flow__handle.source")).toBeNull(); // Sum, terminal
+  });
+
   it("moving a node reorders the emitted Application (order still IS the DAG)", () => {
     render(<Wrapper />);
     const json = () => JSON.parse(screen.getByText(/"flow"/).textContent!) as Application;

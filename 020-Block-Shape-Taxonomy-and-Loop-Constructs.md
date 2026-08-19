@@ -118,13 +118,17 @@ rejects a terminal node with anything after it, in BOTH linear array-order mode 
 `GET /catalog` now serves the flag (`build_catalog`, `runtime.hpp`). Covered by `tests/core/flow_graph.cpp`
 (reject-not-last / reject-outgoing-edge / accept-non-terminal-mid-chain) and `tests/runtime/catalog.cpp`.
 
-**Studio Cap-shape rendering is deliberately NOT done here.** The catalog's `terminal` flag is typed and
-plumbed through (`catalog.ts`), but actually hiding the bottom tab/handle needs the same
-category-aware-handle + `implicitEdges` fix the (still separate, unmerged) jigsaw-shapes PR
-(`studio/jigsaw-node-shapes`) already built for the analogous Source/target-handle case — doing it again
-here, on `main` without that branch's `jigsawPath`/`bottomTabs` machinery, would either duplicate that
-work or reintroduce the exact react-flow error #008 that work was built to avoid. Natural follow-up once
-that PR lands (or as a small commit on that branch directly).
+**Studio Cap-shape rendering: implemented.** `FlowCanvasNode.tsx` renders `bottomTabs: 0` and no
+`<Handle type="source">` at all for a `terminal`-flagged catalog entry — the exact same category-aware-
+handle machinery the Source/target-handle case already established, applied symmetrically to the other
+end. `implicitEdges` (`application.ts`) mirrors its own Source-target skip: it never draws an edge OUT
+of a terminal node either, for the same "don't hit react-flow error #008" reason — an arrangement that
+would need one already fails `validate_terminal_placement` at deploy regardless, so skipping the drawn
+edge is purely about not crashing the canvas, never about hiding a real validation error. Live-verified
+against a real daemon: `aero.output.sum`'s card loses its bottom tab/handle while `aero.output.mes`
+(non-terminal) keeps its Stack shape, and a `Decode -> Scale -> Mes -> Sum` flow still deploys and runs
+clean (100/100 frames, 0 failures) — the terminal flag distinguishes correctly, it doesn't just hide
+every Output's tab. Covered by `flow_designer_canvas.test.tsx` and `flow_graph_model.test.ts`.
 
 ## 5. Reporter/Boolean value blocks — the free-text-DSL gap
 
