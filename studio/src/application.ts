@@ -74,6 +74,12 @@ export function nodeId(n: FlowNode, index: number): string {
   return n.id ?? `n${index}`;
 }
 
+// 020 §8: the two loop nodes' type_ids, needed as plain string comparisons (not catalog lookups —
+// category alone can't distinguish "this Rule node is specifically a loop_start") by both
+// validateGraph below and loopCavity.ts's pairing logic.
+export const LOOP_START_TYPE_ID = "aero.flow.loop_start";
+export const LOOP_BACK_TYPE_ID = "aero.flow.loop_back";
+
 // Drop empty config objects (and, in legacy mode, `id`) so the emitted JSON matches the runtime's
 // minimal shape (a node with no config omits the key entirely, as hello_flow.json's decode/sum nodes
 // do).
@@ -206,11 +212,23 @@ export function validateGraph(app: Application): string[] {
   }
   if (errs.length > 0) return errs; // topo-sort below assumes every endpoint resolves
 
+  // 020 §8.7: a loop_back edge is a backward edge BY CONSTRUCTION (that's its entire point) — unlike
+  // "true"/"false", which are always forward edges and participate in Kahn's algorithm normally, this
+  // one must be excluded from it entirely, mirroring order_flow_graph's own exclusion exactly (a
+  // loop_back edge that DID participate would always read back as "flow graph contains a cycle" below,
+  // which is wrong once the runtime can actually execute one). "At most one such edge in the whole
+  // flow" is a strictly sufficient v1 "one loop per flow" rule, same reasoning flow_compiler.hpp uses.
+  const loopBackEdges = edges.filter((e) => e.from_port === "loop_back");
+  if (loopBackEdges.length > 1) {
+    errs.push("flow has more than one loop_back edge — only one loop per flow is supported yet");
+  }
+  const forwardEdges = edges.filter((e) => e.from_port !== "loop_back");
+
   // Kahn's algorithm: topo-sort + cycle detection in one pass, same approach as the C++ compiler.
   const outgoing = new Map<string, string[]>();
   const indeg = new Map<string, number>();
   for (const id of ids) { outgoing.set(id, []); indeg.set(id, 0); }
-  for (const e of edges) {
+  for (const e of forwardEdges) {
     outgoing.get(e.from)!.push(e.to);
     indeg.set(e.to, (indeg.get(e.to) ?? 0) + 1);
   }
@@ -253,9 +271,12 @@ export function validateGraph(app: Application): string[] {
   }
 
   // A node reached by edges with more than one distinct branch label (including the empty
-  // "unconditional" label) can't be scheduled consistently — same rule as order_flow_graph.
+  // "unconditional" label) can't be scheduled consistently — same rule as order_flow_graph. A
+  // loop_back edge is excluded (forwardEdges) the same way it's excluded from adj/in_degree above —
+  // it never contributes a label to its target, mirroring incoming_labels[] only ever being populated
+  // from the forward-edge adjacency list on the C++ side.
   const labelsInto = new Map<string, Set<string>>();
-  for (const e of edges) {
+  for (const e of forwardEdges) {
     if (!labelsInto.has(e.to)) labelsInto.set(e.to, new Set());
     labelsInto.get(e.to)!.add(e.from_port ?? "");
   }
@@ -264,13 +285,31 @@ export function validateGraph(app: Application): string[] {
   }
 
   // ctx.active_branch is a single field, not a stack (019 §10) — only one branch-producing node per
-  // flow is supported.
-  const branchSources = new Set(edges.filter((e) => e.from_port).map((e) => e.from));
+  // flow is supported. A loop_back edge doesn't drive ctx.active_branch at all (it's a wholly separate
+  // ctx.loop_continue side channel, 020 §8.1), so it's excluded here too — a flow with one switch AND
+  // one loop is fine, not "two branch-producing nodes."
+  const branchSources = new Set(forwardEdges.filter((e) => e.from_port).map((e) => e.from));
   if (branchSources.size > 1) {
     errs.push(
       `flow has more than one branch-producing node (${[...branchSources].join(", ")}) — only one ` +
         "active switch point per flow is supported",
     );
+  }
+
+  // 020 §8.7: a loop_start reached only via a labeled branch edge breaks its "always runs exactly once
+  // before loop_back" assumption (branch labels don't propagate transitively) — a loop must be
+  // reachable unconditionally from the flow's root, mirroring order_flow_graph's own rejection.
+  for (const [id, labels] of labelsInto) {
+    if (labels.size !== 1) continue; // conflicting labels already reported above
+    const [label] = labels;
+    if (!label) continue; // unconditional — fine
+    const idx = app.flow.findIndex((n, i) => nodeId(n, i) === id);
+    if (idx >= 0 && app.flow[idx].type_id === LOOP_START_TYPE_ID) {
+      errs.push(
+        `node '${id}' (aero.flow.loop_start) is reached only via a labeled branch edge — a loop must ` +
+          "be reachable unconditionally from the flow's root",
+      );
+    }
   }
 
   return errs;

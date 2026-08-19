@@ -17,9 +17,17 @@
 //   `implicitEdges` was updated to never draw an edge INTO a Source node in the first place.
 // - "Body-branch" piece (`aero.flow.switch`): top notch + two bottom tabs (true/false), unchanged from
 //   the plain-handle version, just shaped now.
+// - "Body-loop-close" piece (`aero.flow.loop_back`, 020 §8): top notch + two bottom tabs — an
+//   unconditional exit (continues the flow after the loop) and a "loop_back"-labeled one the user
+//   drags back onto the loop body's first member (or onto this same card, self-referential, for an
+//   empty body — SelfConnectingEdge.tsx already renders that shape) to close the pair. Until that edge
+//   exists, aero.flow.loop_start/aero.flow.loop_back both render with this plain shape; once
+//   recognized (loopCavity.ts's computeLoops), loop_start's card is replaced by LoopBlockNode.tsx —
+//   loop_back keeps this same shape even then (see loopCavityLayout.ts's note on why it's never fused).
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { Button } from "./components";
 import type { CatalogEntry, Category } from "./catalog";
+import { LOOP_BACK_TYPE_ID, LOOP_START_TYPE_ID } from "./application";
 import { jigsawPath, DEFAULT_LOBE_DEPTH } from "./jigsawPath";
 
 // Exported (020 §4.2): SwitchBlockNode.tsx/switchCavityLayout.ts reuse the exact same type_id check and
@@ -56,14 +64,17 @@ export function FlowCanvasNode({ data }: NodeProps) {
   const d = data as FlowCanvasNodeData;
   const category = d.entry?.category;
   const isSwitch = d.typeId === SWITCH_TYPE_ID;
+  const isLoopBack = d.typeId === LOOP_BACK_TYPE_ID;
+  const isLoopStart = d.typeId === LOOP_START_TYPE_ID;
   const isSource = category === "Source";
   const path = jigsawPath({
     width: CARD_WIDTH,
     height: CARD_HEIGHT,
     topNotch: !isSource,
-    bottomTabs: isSwitch ? 2 : 1,
+    bottomTabs: isSwitch || isLoopBack ? 2 : 1,
   });
   const catClass = category ? CATEGORY_CLASS[category] : "";
+  const label = (isLoopStart || isLoopBack ? "⟲ " : "") + (d.entry?.label ?? d.typeId);
 
   return (
     <div
@@ -76,7 +87,7 @@ export function FlowCanvasNode({ data }: NodeProps) {
       {!isSource && <Handle type="target" position={Position.Top} />}
       <div className="node-content">
         <span className="badge">{category ?? "?"}</span>
-        <div className="node-label">{d.entry?.label ?? d.typeId}</div>
+        <div className="node-label">{label}</div>
         <div className="node-id">{d.typeId}</div>
         {/* stopPropagation at the row so a button click doesn't also fire the card's onSelect */}
         <div className="row-actions" onClick={(e) => e.stopPropagation()}>
@@ -92,6 +103,13 @@ export function FlowCanvasNode({ data }: NodeProps) {
           </Handle>
           <Handle type="source" id="false" position={Position.Bottom} style={{ left: "70%" }} className="branch-handle branch-false">
             <span className="branch-label">false</span>
+          </Handle>
+        </>
+      ) : isLoopBack ? (
+        <>
+          <Handle type="source" position={Position.Bottom} style={{ left: "30%" }} />
+          <Handle type="source" id="loop_back" position={Position.Bottom} style={{ left: "70%" }} className="branch-handle branch-loop">
+            <span className="branch-label">↺ loop</span>
           </Handle>
         </>
       ) : (

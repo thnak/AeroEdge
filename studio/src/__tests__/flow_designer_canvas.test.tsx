@@ -128,3 +128,81 @@ describe("FlowDesigner canvas — graph mode (019 §4)", () => {
     expect(after.edges?.length).toBe(3); // sw->hi and hi->out both dropped
   });
 });
+
+// 020 §8 (Studio side): a closed loop_start/loop_back pair renders as one C-block (loopBlock) with a
+// single "body" cavity, once graph mode recognizes the "loop_back"-labeled back edge.
+const LOOP_APP: Application = {
+  name: "looping", version: "0.1.0",
+  actor: { kind: "edge", key: 1 },
+  flow: [
+    { id: "src", type_id: "aero.source.decode" },
+    { id: "ls", type_id: "aero.flow.loop_start", config: { counter_tag: "i", start_expr: "0" } },
+    { id: "acc", type_id: "aero.transform.scale", config: { factor: 2 } },
+    { id: "lb", type_id: "aero.flow.loop_back", config: { counter_tag: "i", step_expr: "1", end_expr: "9" } },
+    { id: "out", type_id: "aero.output.sum" },
+  ],
+  edges: [
+    { from: "src", to: "ls" },
+    { from: "ls", to: "acc" },
+    { from: "acc", to: "lb" },
+    { from: "lb", from_port: "loop_back", to: "acc" },
+    { from: "lb", to: "out" },
+  ],
+};
+
+function LoopWrapper() {
+  const [model, setModel] = useState<FlowModel>(() => fromApplication(LOOP_APP));
+  return <FlowDesigner model={model} onChange={setModel} />;
+}
+
+describe("FlowDesigner canvas — loop C-block (020 §8)", () => {
+  it("renders the fused loop-block header + body cavity once the pair is closed", () => {
+    const { container } = render(<LoopWrapper />);
+    expect(screen.getByText("⟲ Loop")).toBeTruthy();
+    expect(screen.getByText("body")).toBeTruthy();
+    expect(container.querySelectorAll(".loop-block").length).toBe(1);
+    // "acc" is absorbed as a cavity member card (still a plain flow-node-card, just repositioned) —
+    // its own label stays visible, distinct from the fused header's "⟲ Loop".
+    expect(screen.getByText("Scale")).toBeTruthy();
+  });
+
+  it("still renders loop_back as its own selectable card, not folded into the header", () => {
+    render(<LoopWrapper />);
+    // humanize("aero.flow.loop_back") -> "Loop Back", prefixed with the loop glyph.
+    expect(screen.getByText("⟲ Loop Back")).toBeTruthy();
+  });
+
+  it("selecting the fused header's Configure panel shows loop_start's own fields", () => {
+    render(<LoopWrapper />);
+    fireEvent.click(screen.getByText("⟲ Loop"));
+    expect(screen.getByDisplayValue("i")).toBeTruthy(); // counter_tag
+    expect(screen.getByDisplayValue("0")).toBeTruthy(); // start_expr
+  });
+});
+
+const RULE_APP: Application = {
+  name: "rule-demo",
+  version: "1.0.0",
+  actor: { kind: "edge", key: 1 },
+  flow: [
+    { type_id: "aero.source.decode" },
+    { type_id: "aero.rule.expr", config: { expr: "raw > 50" } },
+    { type_id: "aero.output.sum" },
+  ],
+};
+
+function RuleWrapper() {
+  const [model, setModel] = useState<FlowModel>(() => fromApplication(RULE_APP));
+  return <FlowDesigner model={model} onChange={setModel} />;
+}
+
+describe("FlowDesigner Configure panel — expr-tree editor (020 §5)", () => {
+  it("mounts the block-tree editor, not a plain text input, for a selected rule node's expr field", () => {
+    render(<RuleWrapper />);
+    // Node 0 (Decode) is selected by default; select the rule node's card to see its Configure panel.
+    fireEvent.click(screen.getByText("Expr")); // humanize("aero.rule.expr") -> "Expr"
+    expect(screen.getByText("Greater than (>)")).toBeTruthy(); // the ">" block's kind-select option
+    expect(screen.getByDisplayValue("raw")).toBeTruthy(); // the tag leaf's inline input
+    expect(screen.getByDisplayValue("50")).toBeTruthy(); // the number leaf's inline input
+  });
+});

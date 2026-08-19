@@ -23,7 +23,10 @@ import {
 import "@xyflow/react/dist/style.css";
 import { getCatalog, catalogEntry } from "./catalog";
 import type { FlowModel, FlowNode, GraphEdge } from "./application";
-import { toApplication, implicitEdges, withEdge, withoutEdge, removeNodeAndEdges, nodeId } from "./application";
+import {
+  toApplication, implicitEdges, withEdge, withoutEdge, removeNodeAndEdges, nodeId,
+  LOOP_START_TYPE_ID, LOOP_BACK_TYPE_ID,
+} from "./application";
 import { Panel } from "./components";
 import { ConfigForm } from "./ConfigForm";
 import { FlowCanvasNode, SWITCH_TYPE_ID, CARD_WIDTH, CARD_VISUAL_HEIGHT, type FlowCanvasNodeData } from "./FlowCanvasNode";
@@ -31,11 +34,19 @@ import { SelfConnectingEdge } from "./SelfConnectingEdge";
 import { SwitchBlockNode, type SwitchBlockNodeData } from "./SwitchBlockNode";
 import { computeCavities, absorbedEdgeIds, attachToCavity, detachFromCavity, type BranchLabel } from "./cavity";
 import { cavityRect, cavityMemberPosition } from "./switchCavityLayout";
+import { LoopBlockNode, type LoopBlockNodeData } from "./LoopBlockNode";
+import { computeLoops, loopAbsorbedEdgeIds, attachToLoopCavity, detachFromLoopCavity } from "./loopCavity";
+import {
+  cavityRect as loopCavityRect, cavityMemberPosition as loopCavityMemberPosition,
+  loopBackPosition,
+} from "./loopCavityLayout";
+import { parseExpr, collectTagRefs } from "./exprAst";
 
-// 020 §4.2: a switch node renders as a C-block with nested cavities (switchBlock) once a flow has
-// opted into graph mode; in legacy/array-order mode it keeps the plain two-tab jigsaw card (flowNode) —
-// legacy mode has no `from_port` concept at all, so there is nothing to nest yet.
-const nodeTypes = { flowNode: FlowCanvasNode, switchBlock: SwitchBlockNode };
+// 020 §4.2/§8: a switch node renders as a C-block with nested cavities (switchBlock), and a loop_start
+// node paired with a loop_back renders as one with a single body cavity (loopBlock), once a flow has
+// opted into graph mode; in legacy/array-order mode both keep their plain jigsaw cards (flowNode) —
+// legacy mode has no `from_port` concept at all, so there is nothing to nest or pair yet.
+const nodeTypes = { flowNode: FlowCanvasNode, switchBlock: SwitchBlockNode, loopBlock: LoopBlockNode };
 // Registered as the "default" edge type (react-flow's own documented pattern) so every edge routes
 // through it; it only special-cases rendering when source === target, otherwise it's a plain bezier.
 const edgeTypes = { default: SelfConnectingEdge };
@@ -105,6 +116,22 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
 
   const app = toApplication(model);
 
+  // 020 §5: tag names to suggest in the expr-tree editor's tag-reference autocomplete. No server-side
+  // tag metadata exists (Modbus/JSON source tag names are payload-dependent, unknowable statically) —
+  // "raw" is the one hardcoded true constant (aero.source.decode's fixed literal tag), plus every tag
+  // name already referenced by some OTHER node's expr in this flow, best-effort and free-text either way.
+  const knownTags = useMemo(() => {
+    const tags = new Set<string>(["raw"]);
+    for (const n of model.nodes) {
+      const expr = n.config?.expr;
+      if (typeof expr === "string") {
+        const parsed = parseExpr(expr);
+        if (parsed.ok) for (const t of collectTagRefs(parsed.tree)) tags.add(t);
+      }
+    }
+    return [...tags].sort();
+  }, [model.nodes]);
+
   // Empty = legacy/array-order mode (same definition toApplication itself uses) — a switch node only
   // gets the C-block treatment once the flow has actually opted into edges[] (020 §4.2).
   const graphMode = model.edges.length > 0;
@@ -114,22 +141,28 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
   );
   const layout = useMemo(() => autoLayout(model.nodes, graphEdges), [model.nodes, graphEdges]);
 
-  // 020 §4.2: which nodes are nested inside a switch's cavities, purely a function of graphEdges — in
-  // legacy mode this is always empty (implicit edges never carry a from_port), so no separate gate is
-  // needed here, only where a switch's RENDER TYPE is chosen below.
+  // 020 §4.2/§8: which nodes are nested inside a switch's cavities or a loop's body cavity, purely a
+  // function of graphEdges — in legacy mode both are always empty (implicit edges never carry a
+  // from_port), so no separate gate is needed here, only where a RENDER TYPE is chosen below.
   const cavities = useMemo(() => computeCavities(graphEdges), [graphEdges]);
   const absorbed = useMemo(() => absorbedEdgeIds(graphEdges, cavities.chains), [graphEdges, cavities.chains]);
+  const loops = useMemo(() => computeLoops(graphEdges), [graphEdges]);
+  const loopAbsorbed = useMemo(() => loopAbsorbedEdgeIds(graphEdges, loops.pairs), [graphEdges, loops.pairs]);
 
-  // A cavity member's position is ALWAYS derived (switch's own absolute position + its fixed slot in
+  // A cavity member's position is ALWAYS derived (owner's own absolute position + its fixed slot in
   // the cavity) — never read from `positions`/`layout`, so it can't drift out of sync with the boxes
-  // SwitchBlockNode itself draws. A free (non-nested) node keeps the existing drag/auto-layout posture.
+  // SwitchBlockNode/LoopBlockNode themselves draw. A free (non-nested) node keeps the existing
+  // drag/auto-layout posture.
   const absolutePosition = (id: string) => positions[id] ?? layout[id] ?? { x: 0, y: 0 };
 
   const rfNodes: Node[] = useMemo(() => {
     const built = model.nodes.map((n, i) => {
       const id = nodeId(n, i);
       const mem = cavities.membership.get(id);
+      const loopMem = loops.membership.get(id);
       const isSwitch = n.type_id === SWITCH_TYPE_ID;
+      const isLoopStart = n.type_id === LOOP_START_TYPE_ID;
+      const isLoopBack = n.type_id === LOOP_BACK_TYPE_ID;
 
       if (mem) {
         const memBranches = cavities.chains.get(mem.switchId);
@@ -145,10 +178,25 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
         return {
           id, type: "flowNode",
           position: { x: switchPos.x + offset.x, y: switchPos.y + offset.y },
-          // Layer above the switch card's own SVG background WITHOUT reordering the `nodes` array —
+          // Layer above the owner card's own SVG background WITHOUT reordering the `nodes` array —
           // moving members later in the array (instead of using zIndex) would change their rendered DOM
           // order relative to model.nodes, which flow_designer_canvas.test.tsx's row-action button
           // indices (and any future code with the same assumption) depend on staying in model order.
+          zIndex: 1,
+          data,
+        };
+      }
+
+      if (loopMem) {
+        const offset = loopCavityMemberPosition(loopMem.index);
+        const startPos = absolutePosition(loopMem.loopStartId);
+        const data: FlowCanvasNodeData = {
+          index: i, typeId: n.type_id, entry: catalogEntry(n.type_id),
+          isSelected: selected === i, onSelect: setSelected, onMove: move, onRemove: removeNode,
+        };
+        return {
+          id, type: "flowNode",
+          position: { x: startPos.x + offset.x, y: startPos.y + offset.y },
           zIndex: 1,
           data,
         };
@@ -167,6 +215,39 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
         return { id, type: "switchBlock", position: positions[id] ?? layout[id] ?? { x: 0, y: i * 110 }, data };
       }
 
+      if (isLoopStart && graphMode && loops.pairs.has(id)) {
+        const pair = loops.pairs.get(id)!;
+        const data: LoopBlockNodeData = {
+          index: i, typeId: n.type_id,
+          counterTag: typeof n.config?.counter_tag === "string" ? n.config.counter_tag : undefined,
+          startExpr: typeof n.config?.start_expr === "string" ? n.config.start_expr : undefined,
+          isSelected: selected === i,
+          memberCount: pair.members.length,
+          onSelect: setSelected, onMove: move, onRemove: removeNode,
+        };
+        return { id, type: "loopBlock", position: positions[id] ?? layout[id] ?? { x: 0, y: i * 110 }, data };
+      }
+
+      // A loop_back that's the recognized closing half of a pair is positioned flush against that
+      // pair's cavity — still a plain FlowCanvasNode (loopCavityLayout.ts's note on why), not repointed
+      // to a fused render type the way switch/loop_start are, just repositioned like a cavity member.
+      if (isLoopBack && graphMode && loops.loopBackOf.has(id)) {
+        const loopStartId = loops.loopBackOf.get(id)!;
+        const pair = loops.pairs.get(loopStartId);
+        const offset = loopBackPosition(pair?.members.length ?? 0);
+        const startPos = absolutePosition(loopStartId);
+        const data: FlowCanvasNodeData = {
+          index: i, typeId: n.type_id, entry: catalogEntry(n.type_id),
+          isSelected: selected === i, onSelect: setSelected, onMove: move, onRemove: removeNode,
+        };
+        return {
+          id, type: "flowNode",
+          position: { x: startPos.x + offset.x, y: startPos.y + offset.y },
+          zIndex: 1,
+          data,
+        };
+      }
+
       const data: FlowCanvasNodeData = {
         index: i, typeId: n.type_id, entry: catalogEntry(n.type_id),
         isSelected: selected === i, onSelect: setSelected, onMove: move, onRemove: removeNode,
@@ -174,12 +255,12 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
       return { id, type: "flowNode", position: positions[id] ?? layout[id] ?? { x: 0, y: i * 110 }, data };
     });
     return built;
-  }, [model.nodes, selected, positions, layout, cavities, graphMode]);
+  }, [model.nodes, selected, positions, layout, cavities, loops, graphMode]);
 
   const rfEdges: Edge[] = useMemo(
     () =>
       graphEdges
-        .filter((e) => !absorbed.has(e.id))
+        .filter((e) => !absorbed.has(e.id) && !loopAbsorbed.has(e.id))
         .map((e) => ({
           id: e.id,
           source: e.from,
@@ -190,7 +271,7 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
           // off-page-connector case) — every chain-internal link was already filtered out above.
           className: cavities.membership.has(e.from) ? "edge-stub" : undefined,
         })),
-    [graphEdges, absorbed, cavities.membership],
+    [graphEdges, absorbed, loopAbsorbed, cavities.membership],
   );
 
   const onNodesChangeHandler = (changes: NodeChange[]) => {
@@ -198,7 +279,8 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
       let next = prev;
       for (const c of changes) {
         if (c.type === "position" && c.position) {
-          if (cavities.membership.has(c.id)) continue; // nested — position is always derived, never stored
+          // nested/paired — position is always derived, never stored
+          if (cavities.membership.has(c.id) || loops.membership.has(c.id) || loops.loopBackOf.has(c.id)) continue;
           if (next === prev) next = { ...prev };
           next[c.id] = c.position;
         }
@@ -220,19 +302,23 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
     onChange(next);
   };
 
-  // 020 §4.2 — the actual "physical snap": dropping a free node so it overlaps a switch's cavity nests
-  // it there (attachToCavity); dragging an already-nested node until it no longer overlaps its OWN
-  // cavity detaches it (detachFromCavity). No react-flow parentId/extent is ever set (see
-  // switchCavityLayout.ts's note on why), so `node.position` here is always an ABSOLUTE canvas
-  // coordinate — no parent-relative conversion needed either way.
+  // 020 §4.2/§8 — the actual "physical snap": dropping a free node so it overlaps a switch's cavity (or
+  // a loop's body cavity) nests it there (attachToCavity/attachToLoopCavity); dragging an already-nested
+  // node until it no longer overlaps its OWN cavity detaches it. No react-flow parentId/extent is ever
+  // set (see switchCavityLayout.ts's note on why), so `node.position` here is always an ABSOLUTE canvas
+  // coordinate — no parent-relative conversion needed either way. A structural node (switch, loop_start,
+  // loop_back) is never itself nestable into another cavity — dragging one just repositions it freely.
   const onNodeDragStop = (_event: unknown, node: Node) => {
     if (!graphMode) return; // legacy mode has no cavities to snap into at all
     const draggedIdx = model.nodes.findIndex((n, i) => nodeId(n, i) === node.id);
-    if (draggedIdx === -1 || model.nodes[draggedIdx].type_id === SWITCH_TYPE_ID) return;
+    if (draggedIdx === -1) return;
+    const draggedType = model.nodes[draggedIdx].type_id;
+    if (draggedType === SWITCH_TYPE_ID || draggedType === LOOP_START_TYPE_ID || draggedType === LOOP_BACK_TYPE_ID) return;
 
     const centerX = node.position.x + CARD_WIDTH / 2;
     const centerY = node.position.y + CARD_VISUAL_HEIGHT / 2;
-    let landed: { switchId: string; label: BranchLabel } | undefined;
+
+    let landedSwitch: { switchId: string; label: BranchLabel } | undefined;
     model.nodes.forEach((n, i) => {
       if (n.type_id !== SWITCH_TYPE_ID) return;
       const switchId = nodeId(n, i);
@@ -246,19 +332,45 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
         const left = switchPos.x + rect.x;
         const top = switchPos.y + rect.y;
         if (centerX >= left && centerX <= left + rect.width && centerY >= top && centerY <= top + rect.height) {
-          landed = { switchId, label };
+          landedSwitch = { switchId, label };
         }
       });
     });
 
-    const current = cavities.membership.get(node.id);
-    if (landed) {
-      if (!current || current.switchId !== landed.switchId || current.label !== landed.label) {
-        onChange(attachToCavity(model, node.id, landed.switchId, landed.label));
+    let landedLoop: { loopStartId: string; loopBackId: string } | undefined;
+    if (!landedSwitch) {
+      for (const [loopStartId, pair] of loops.pairs) {
+        if (loopStartId === node.id || pair.loopBackId === node.id) continue;
+        const startPos = absolutePosition(loopStartId);
+        const rect = loopCavityRect(pair.members.length);
+        const left = startPos.x + rect.x;
+        const top = startPos.y + rect.y;
+        if (centerX >= left && centerX <= left + rect.width && centerY >= top && centerY <= top + rect.height) {
+          landedLoop = { loopStartId, loopBackId: pair.loopBackId };
+          break;
+        }
       }
-    } else if (current) {
-      onChange(detachFromCavity(model, node.id));
     }
+
+    const currentSwitchMem = cavities.membership.get(node.id);
+    const currentLoopMem = loops.membership.get(node.id);
+
+    if (landedSwitch) {
+      if (currentLoopMem) { onChange(detachFromLoopCavity(model, node.id)); return; }
+      if (!currentSwitchMem || currentSwitchMem.switchId !== landedSwitch.switchId || currentSwitchMem.label !== landedSwitch.label) {
+        onChange(attachToCavity(model, node.id, landedSwitch.switchId, landedSwitch.label));
+      }
+      return;
+    }
+    if (landedLoop) {
+      if (currentSwitchMem) { onChange(detachFromCavity(model, node.id)); return; }
+      if (!currentLoopMem || currentLoopMem.loopStartId !== landedLoop.loopStartId) {
+        onChange(attachToLoopCavity(model, node.id, landedLoop.loopStartId, landedLoop.loopBackId));
+      }
+      return;
+    }
+    if (currentSwitchMem) onChange(detachFromCavity(model, node.id));
+    else if (currentLoopMem) onChange(detachFromLoopCavity(model, node.id));
   };
 
   return (
@@ -301,6 +413,7 @@ export function FlowDesigner({ model, onChange }: { model: FlowModel; onChange: 
             entry={catalogEntry(model.nodes[selected].type_id)!}
             config={model.nodes[selected].config ?? {}}
             onChange={(c) => setConfig(selected, c)}
+            knownTags={knownTags}
           />
         ) : (
           <p className="muted">Select a node to configure it.</p>

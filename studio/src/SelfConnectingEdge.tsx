@@ -1,9 +1,18 @@
 // A custom edge that arcs around a node when source === target (a loop-back/self-referencing edge),
-// following react-flow's own documented pattern (reactflow.dev/examples/edges/custom-edges). The
-// runtime cannot execute a cycle (I3: a flow compiles once into a flat array walked in a single
-// zero-alloc pass — no loop-iteration semantics exist), so `validateGraph`'s cycle check already
-// rejects one at the errors banner. This component is purely so a user CAN draw one and see it
-// clearly instead of a zero-length/invisible edge — UI-completeness, not new execution capability.
+// following react-flow's own documented pattern (reactflow.dev/examples/edges/custom-edges). Originally
+// written when the runtime could not execute any cycle at all (I3: a flow compiled once into a flat
+// array walked in a single zero-alloc pass, no loop-iteration semantics) — `validateGraph`'s cycle
+// check rejected every self-edge at the errors banner, and this component existed purely so a user
+// could still draw one and see it clearly instead of a zero-length/invisible edge (UI-completeness,
+// not execution capability).
+//
+// 020 §8 changed that for exactly one case: a `from_port === "loop_back"` self-edge on an
+// `aero.flow.loop_back` node (the empty-body loop shape, closing directly on itself) is now a REAL,
+// runtime-executable construct — `validateGraph` excludes it from the cycle check entirely (mirroring
+// order_flow_graph's own exclusion), and loopCavity.ts's computeLoops recognizes it as a closed pair.
+// This component's arc rendering is unchanged either way; only the meaning of what it's drawing split
+// in two: a genuine validation error for any OTHER self-edge, or a legitimate empty loop body for this
+// one specific from_port.
 import { BaseEdge, getBezierPath, type EdgeProps } from "@xyflow/react";
 
 export function SelfConnectingEdge(props: EdgeProps) {

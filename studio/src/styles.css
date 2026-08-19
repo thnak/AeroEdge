@@ -77,6 +77,7 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system
 .flow-canvas .cat-output .react-flow__handle { background: var(--cat-output); }
 .flow-canvas .react-flow__handle.branch-handle.branch-true { background: #4caf50; }
 .flow-canvas .react-flow__handle.branch-handle.branch-false { background: var(--danger); }
+.flow-canvas .react-flow__handle.branch-handle.branch-loop { background: #a074e0; }
 .flow-canvas .branch-label {
   position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
   font-size: 10px; color: var(--muted); white-space: nowrap; pointer-events: none;
@@ -123,6 +124,28 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system
 .cavity-true .cavity-label { background: rgba(76, 175, 80, .2); color: #4caf50; }
 .cavity-false .cavity-label { background: rgba(229, 83, 75, .2); color: var(--danger); }
 
+/* ---- Loop C-block (020 §8): aero.flow.loop_start renders as a header card with one nested "body"
+   cavity drawn INSIDE it (LoopBlockNode.tsx), once a flow is in graph mode AND a matching
+   aero.flow.loop_back has been paired via a "loop_back"-labeled edge (loopCavity.ts). Unlike switch,
+   loop_back itself stays a plain jigsaw card (FlowCanvasNode) positioned flush below the cavity, not
+   fused into this SVG — see loopCavityLayout.ts's own note on why. ---- */
+.loop-block { position: relative; cursor: pointer; }
+.loop-block .jigsaw-shape path { fill: var(--panel); stroke: var(--cat-rule); stroke-width: 2.5; }
+.loop-block.sel .jigsaw-shape path { fill: #12233b; stroke: var(--accent); stroke-width: 3; }
+.loop-block-header {
+  position: relative; z-index: 1; padding: 10px 14px;
+  background: rgba(160, 116, 224, .12); border-bottom: 1px solid rgba(160, 116, 224, .35);
+}
+.loop-block-header .badge { color: var(--cat-rule); }
+.loop-block-header .node-label { font-size: 15px; }
+.loop-summary {
+  font-family: monospace; font-size: 11px; color: var(--fg); background: #0d141b;
+  border-radius: 4px; padding: 2px 6px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cavity-loop { border-color: rgba(160, 116, 224, .5); }
+.cavity-loop .cavity-label { background: rgba(160, 116, 224, .2); color: #a074e0; }
+
 /* ---- Jigsaw/puzzle-piece node shape (019 §4 follow-up, jigsawPath.ts): the card boundary is an SVG
    path (fill/stroke) instead of a div border, sized to a fixed box so the notch/tab geometry (which
    assumes known width/height) stays correct. Content overlays the SVG as a transparent layer. ---- */
@@ -154,6 +177,34 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system
 .json { background: #0d141b; border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow: auto; font-size: 12px; max-height: 320px; }
 .regmap table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .regmap th, .regmap td { border: 1px solid var(--line); padding: 2px 4px; }
+
+/* ---- Reporter/Boolean value-block editor (020 §5, ExprTreeEditor.tsx) — Reporter = rounded pill
+   (produces a number), Boolean = hexagon via clip-path (produces true/false), matching Scratch/Blockly's
+   own oval-vs-hexagon shape convention. Colors reuse the existing category palette (no new accent
+   introduced): Reporter borrows cat-transform (arithmetic-flavored), Boolean borrows cat-rule (this
+   feature lives inside aero.rule.expr/aero.flow.switch, both Rule category already amber). ---- */
+.expr-tree { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.expr-block {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+  border: 1.5px solid var(--line); background: #0d141b; font-size: 12px;
+}
+.expr-block-reporter { border-radius: 999px; border-color: var(--cat-transform); }
+.expr-block-boolean {
+  border-color: var(--cat-rule);
+  clip-path: polygon(10px 0%, calc(100% - 10px) 0%, 100% 50%, calc(100% - 10px) 100%, 10px 100%, 0% 50%);
+  padding-left: 16px; padding-right: 16px;
+}
+.expr-block-children { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* Extra ancestor class beats the generic `.field select { width: 100% }` rule (catalog.ts/ConfigForm.tsx's
+   Tier-1 form default), which otherwise wins on specificity and stretches every select/input full-width. */
+.expr-block .expr-kind-select, .expr-block .expr-leaf-input {
+  width: auto; min-width: 44px; padding: 2px 4px; font-size: 12px;
+}
+.expr-block .expr-leaf-input { width: 64px; }
+.expr-tree-actions { margin-top: 2px; }
+.expr-raw { display: flex; flex-direction: column; gap: 6px; }
+.expr-raw-input { width: 100%; font-family: monospace; font-size: 12px; resize: vertical; }
+.expr-raw-actions { display: flex; gap: 6px; }
 .status { display: flex; gap: 18px; flex-wrap: wrap; }
 .status dt { font-size: 11px; color: var(--muted); }
 .status dd { margin: 0; font-size: 16px; }
