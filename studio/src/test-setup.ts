@@ -46,9 +46,8 @@ setCatalog({
           help: "Same DSL as aero.rule.expr. Routes to edges labeled \"true\"/\"false\" — never stops the flow (019 §5).",
           tier2: "expr-tree" },
       ] },
-    // 020 §8 (backend on the sibling runtime/020-set-node-and-dsl-math branch, not yet merged here) —
-    // field lists mirror loop_nodes.hpp's kFields exactly so Studio-side loop tests exercise the same
-    // shape production will serve once the branches reconcile.
+    // 020 §8 — field lists mirror loop_nodes.hpp's kFields exactly, same "match real production" policy
+    // as every other entry in this fixture.
     { type_id: "aero.flow.loop_start", category: "Rule",
       fields: [
         { key: "counter_tag", label: "Counter tag", type: "string", required: true },
@@ -63,7 +62,7 @@ setCatalog({
         { key: "step_expr", label: "Step expression", type: "string", default: "1" },
         { key: "end_expr", label: "End expression (inclusive)", type: "string", required: true },
       ] },
-    { type_id: "aero.output.sum", category: "Output", fields: [] },
+    { type_id: "aero.output.sum", category: "Output", terminal: true, fields: [] },
     { type_id: "aero.output.mes", category: "Output",
       fields: [
         { key: "line", label: "Line/device id", type: "string", required: true, default: "line-1" },

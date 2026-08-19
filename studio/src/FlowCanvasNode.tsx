@@ -24,6 +24,13 @@
 //   exists, aero.flow.loop_start/aero.flow.loop_back both render with this plain shape; once
 //   recognized (loopCavity.ts's computeLoops), loop_start's card is replaced by LoopBlockNode.tsx —
 //   loop_back keeps this same shape even then (see loopCavityLayout.ts's note on why it's never fused).
+// - "Cap" piece (a `terminal` catalog entry, 020 §4.3 — today only `aero.output.sum`): top notch, NO
+//   bottom tab — the deploy-time-enforced "nothing may follow this node" made visible as a shape, not
+//   just a validation message. Symmetric with Source's target-handle gating: only Output-category
+//   nodes can be flagged terminal server-side, so this never collides with the switch/loop-back
+//   multi-handle cases above. `implicitEdges` (application.ts) was updated the same way it already was
+//   for Source's target handle — never draw an edge OUT OF a terminal node — to avoid the same
+//   react-flow error #008 that fix exists to prevent.
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { Button } from "./components";
 import type { CatalogEntry, Category } from "./catalog";
@@ -67,11 +74,12 @@ export function FlowCanvasNode({ data }: NodeProps) {
   const isLoopBack = d.typeId === LOOP_BACK_TYPE_ID;
   const isLoopStart = d.typeId === LOOP_START_TYPE_ID;
   const isSource = category === "Source";
+  const isTerminal = d.entry?.terminal === true;
   const path = jigsawPath({
     width: CARD_WIDTH,
     height: CARD_HEIGHT,
     topNotch: !isSource,
-    bottomTabs: isSwitch || isLoopBack ? 2 : 1,
+    bottomTabs: isSwitch || isLoopBack ? 2 : isTerminal ? 0 : 1,
   });
   const catClass = category ? CATEGORY_CLASS[category] : "";
   const label = (isLoopStart || isLoopBack ? "⟲ " : "") + (d.entry?.label ?? d.typeId);
@@ -112,7 +120,7 @@ export function FlowCanvasNode({ data }: NodeProps) {
             <span className="branch-label">↺ loop</span>
           </Handle>
         </>
-      ) : (
+      ) : isTerminal ? null : (
         <Handle type="source" position={Position.Bottom} />
       )}
     </div>

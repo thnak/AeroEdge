@@ -137,10 +137,16 @@ export function fromApplication(app: Application): FlowModel {
 // handle on a Source card (019 §4 jigsaw slice: a Source is a "hat" piece, nothing plugs into it) —
 // drawing that edge would hit react-flow's "couldn't create edge for target handle" error the same
 // way an Output's hidden source handle once did (found and reverted during the first canvas slice).
+// Symmetrically skips any edge whose SOURCE is a `terminal`-flagged node (020 §4.3: a Cap shape has no
+// bottom tab/source handle at all) — the exact same react-flow failure mode, mirrored on the other end.
+// Either way the resulting array-order arrangement (a Source-targeting or terminal-sourced edge)
+// already fails `validate_terminal_placement`/the Source-root check at deploy; skipping the DRAWN edge
+// here is purely about not crashing the canvas, not about hiding a real validation error from the user.
 export function implicitEdges(nodes: FlowNode[]): GraphEdge[] {
   const edges: GraphEdge[] = [];
   for (let i = 0; i < nodes.length - 1; i++) {
     if (catalogEntry(nodes[i + 1].type_id)?.category === "Source") continue;
+    if (catalogEntry(nodes[i].type_id)?.terminal === true) continue;
     edges.push({ id: `implicit-${i}`, from: nodeId(nodes[i], i), to: nodeId(nodes[i + 1], i + 1) });
   }
   return edges;

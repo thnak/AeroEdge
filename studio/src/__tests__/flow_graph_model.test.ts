@@ -54,6 +54,19 @@ describe("implicitEdges", () => {
     ]);
     expect(chain).toEqual([{ id: "implicit-1", from: "b", to: "c" }]); // a->b skipped, b->c kept
   });
+
+  // 020 §4.3: symmetric with the Source-target skip above — a `terminal`-flagged node has no source
+  // (bottom) handle either (FlowCanvasNode.tsx's Cap shape), so an edge OUT of one would hit the same
+  // react-flow failure. This arrangement (something placed after a terminal node) already fails
+  // validate_terminal_placement at deploy regardless; this is purely about not crashing the canvas.
+  it("skips the implicit edge out of a terminal-flagged node", () => {
+    const chain = implicitEdges([
+      { id: "a", type_id: "aero.source.decode" },
+      { id: "b", type_id: "aero.output.sum" }, // terminal: true in the catalog fixture
+      { id: "c", type_id: "aero.transform.scale" }, // placed after it — invalid, but shouldn't crash
+    ]);
+    expect(chain).toEqual([{ id: "implicit-0", from: "a", to: "b" }]); // a->b kept, b->c skipped
+  });
 });
 
 describe("withEdge / withoutEdge — materialize-on-first-edit", () => {
