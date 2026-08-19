@@ -5,11 +5,16 @@ import { validateConfig } from "./catalog";
 import type { NodeConfig } from "./application";
 import { Field } from "./components";
 import { ModbusRegisterMap } from "./tier2/ModbusRegisterMap";
+import { ExprTreeEditor } from "./tier2/ExprTreeEditor";
 
-export function ConfigForm({ entry, config, onChange }: {
+export function ConfigForm({ entry, config, onChange, knownTags }: {
   entry: CatalogEntry;
   config: NodeConfig;
   onChange: (c: NodeConfig) => void;
+  // Tag names to suggest in the expr-tree editor's tag-reference autocomplete (020 §5) — no server-side
+  // tag metadata exists, so this is scraped client-side from the rest of the flow (FlowDesigner.tsx).
+  // Optional so any other ConfigForm caller (none exist today) doesn't have to supply it.
+  knownTags?: string[];
 }) {
   const errors = validateConfig(entry, config);
 
@@ -32,6 +37,17 @@ export function ConfigForm({ entry, config, onChange }: {
               <ModbusRegisterMap
                 value={typeof config[f.key] === "string" ? (config[f.key] as string) : ""}
                 onChange={(json) => onChange({ ...config, [f.key]: json })}
+              />
+            </Field>
+          );
+        }
+        if (f.tier2 === "expr-tree") {
+          return (
+            <Field key={f.key} label={f.label} help={f.help} error={errors[f.key]}>
+              <ExprTreeEditor
+                value={typeof config[f.key] === "string" ? (config[f.key] as string) : ""}
+                onChange={(expr) => onChange({ ...config, [f.key]: expr })}
+                knownTags={knownTags ?? []}
               />
             </Field>
           );

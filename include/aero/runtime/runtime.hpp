@@ -54,6 +54,7 @@
 #include "aero/nodes/compute_nodes.hpp"
 #include "aero/nodes/expr_rule_node.hpp"
 #include "aero/nodes/http_output_node.hpp"
+#include "aero/nodes/loop_nodes.hpp"
 #include "aero/nodes/mes_nodes.hpp"
 #include "aero/nodes/set_node.hpp"
 #include "aero/nodes/switch_node.hpp"
@@ -183,6 +184,25 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
         [](const nlohmann::json& c) -> std::unique_ptr<INode> {
         auto prog = aero::nodes::SetNode::compile(c.value("expr", std::string{}));
         return std::make_unique<aero::nodes::SetNode>(std::move(prog), c.value("tag", std::string{}));
+    });
+
+    // 020 §8: aero.flow.loop_start / aero.flow.loop_back — a bounded, runtime-computed loop, the one
+    // construct needing genuine new CompiledFlow::execute() capability (a jump-back). Both reuse
+    // ExprRuleNode::compile, same parse-once-at-deploy posture as every DSL-consuming node above.
+    node_reg.register_type("aero.flow.loop_start", aero::nodes::LoopStartNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+        auto prog = aero::nodes::LoopStartNode::compile(c.value("start_expr", std::string{}));
+        return std::make_unique<aero::nodes::LoopStartNode>(
+            std::move(prog), c.value("counter_tag", std::string{}),
+            static_cast<std::size_t>(c.value("max_iterations", 0)),
+            std::chrono::milliseconds(c.value("max_duration_ms", 0)));
+    });
+    node_reg.register_type("aero.flow.loop_back", aero::nodes::LoopBackNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+        auto step_prog = aero::nodes::LoopBackNode::compile(c.value("step_expr", std::string{"1"}));
+        auto end_prog = aero::nodes::LoopBackNode::compile(c.value("end_expr", std::string{}));
+        return std::make_unique<aero::nodes::LoopBackNode>(
+            c.value("counter_tag", std::string{}), std::move(step_prog), std::move(end_prog));
     });
 
     // 019 slice: generic HTTP output (see nodes/http_output_node.hpp's banner for scope/non-durability).

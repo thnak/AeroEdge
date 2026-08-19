@@ -36,13 +36,32 @@ setCatalog({
     { type_id: "aero.rule.expr", category: "Rule",
       fields: [
         { key: "expr", label: "Expression", type: "string", required: true,
-          help: "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop." },
+          help: "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop.",
+          tier2: "expr-tree" },
         { key: "alarm", label: "Alarm event", type: "string", default: "AlarmRaised" },
       ] },
     { type_id: "aero.flow.switch", category: "Rule",
       fields: [
         { key: "expr", label: "Expression", type: "string", required: true,
-          help: "Same DSL as aero.rule.expr. Routes to edges labeled \"true\"/\"false\" — never stops the flow (019 §5)." },
+          help: "Same DSL as aero.rule.expr. Routes to edges labeled \"true\"/\"false\" — never stops the flow (019 §5).",
+          tier2: "expr-tree" },
+      ] },
+    // 020 §8 (backend on the sibling runtime/020-set-node-and-dsl-math branch, not yet merged here) —
+    // field lists mirror loop_nodes.hpp's kFields exactly so Studio-side loop tests exercise the same
+    // shape production will serve once the branches reconcile.
+    { type_id: "aero.flow.loop_start", category: "Rule",
+      fields: [
+        { key: "counter_tag", label: "Counter tag", type: "string", required: true },
+        { key: "start_expr", label: "Start expression", type: "string", required: true,
+          help: "Same DSL as aero.rule.expr. Evaluated once, written into counter_tag." },
+        { key: "max_iterations", label: "Max iterations", type: "int", required: true, min: 1 },
+        { key: "max_duration_ms", label: "Max duration (ms)", type: "int", required: true, min: 1 },
+      ] },
+    { type_id: "aero.flow.loop_back", category: "Rule",
+      fields: [
+        { key: "counter_tag", label: "Counter tag", type: "string", required: true },
+        { key: "step_expr", label: "Step expression", type: "string", default: "1" },
+        { key: "end_expr", label: "End expression (inclusive)", type: "string", required: true },
       ] },
     { type_id: "aero.output.sum", category: "Output", fields: [] },
     { type_id: "aero.output.mes", category: "Output",

@@ -2,12 +2,14 @@
 // (I3 / 003 §4). We override global new/delete to count allocations, warm the reused
 // ProcessingContext once (which grows its buffers), then execute the compiled flow many times and
 // assert the allocation counter never moves. This is a pass/fail invariant gate, not a benchmark.
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
 
 #include "aero/core/compiled_flow.hpp"
 #include "aero/nodes/builtin_nodes.hpp"
+#include "aero/nodes/loop_nodes.hpp"
 
 namespace {
 volatile bool g_count = false;  // only count inside the measured window
@@ -55,7 +57,51 @@ int main() {
     std::printf("heap allocations: %ld  (expected 0)\n", g_allocs);
     std::printf("checksum        : %.0f  (non-zero => work happened)\n", checksum);
 
-    const bool ok = g_allocs == 0 && checksum > 0.0;
+    bool ok = g_allocs == 0 && checksum > 0.0;
     std::printf("%s\n", ok ? "OK" : "FAIL");
+
+    // 020 §8.6: a loop's own gate — this file has never exercised the "same step called N times in one
+    // Command" shape before loops existed, so it needs its own case, not just an assumption that
+    // composing 0-alloc nodes stays 0-alloc under a jump-back. Minimal valid loop: loop_back's own step
+    // jumps to ITSELF (an empty body — just increments a counter), so ~1000 loop_back passes all happen
+    // inside ONE ProcessingContext::reset() + execute() call, not 1000 outer executions.
+    {
+        using aero::nodes::LoopBackNode;
+        using aero::nodes::LoopStartNode;
+
+        LoopStartNode loop_start(LoopStartNode::compile("0"), "i", /*max_iterations*/ 2000,
+                                  std::chrono::milliseconds(5000));
+        LoopBackNode loop_back("i", LoopBackNode::compile("1"), LoopBackNode::compile("999"));
+        aero::CompiledFlow loop_flow;
+        loop_flow.add(loop_start).add(loop_back, /*required_label*/ {}, /*loop_back_target*/ 1);
+
+        aero::ProcessingContext lctx;
+        lctx.reserve(/*tags*/ 8, /*out*/ 8, /*events*/ 8);
+
+        aero::Frame warm{1};
+        lctx.reset(&warm);
+        loop_flow.execute(lctx);  // warm-up: first-touch growth happens here, before counting starts
+
+        g_allocs = 0;
+        g_count = true;
+        aero::Frame f{2};
+        lctx.reset(&f);
+        loop_flow.execute(lctx);  // ONE Command, ~1000 internal loop_back passes
+        g_count = false;
+
+        double final_i = -1.0;
+        for (const auto& t : lctx.tags) {
+            if (t.name == "i") final_i = t.value;
+        }
+
+        std::printf("loop passes     : ~1000, in ONE Command\n");
+        std::printf("heap allocations: %ld  (expected 0)\n", g_allocs);
+        std::printf("final counter   : %.0f  (expected 1000)\n", final_i);
+
+        const bool loop_ok = g_allocs == 0 && final_i == 1000.0;
+        std::printf("%s\n", loop_ok ? "OK (loop)" : "FAIL (loop)");
+        ok = ok && loop_ok;
+    }
+
     return ok ? 0 : 1;
 }
