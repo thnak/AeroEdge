@@ -13,11 +13,18 @@
 //   equ     := cmp    ( ('=='|'!=') cmp )*
 //   cmp     := add    ( ('<'|'>'|'<='|'>=') add )*
 //   add     := mul    ( ('+'|'-') mul )*
-//   mul     := unary  ( ('*'|'/') unary )*
+//   mul     := unary  ( ('*'|'/'|'%') unary )*             // '%' = mod, 020 §6.1
 //   unary   := ('!'|'-') unary | primary
-//   primary := number | tagref | '(' expr ')'
-//   tagref  := 'tag' '(' '"' NAME '"' ')' | IDENT          // `tag("name")` or a bare `raw`
+//   primary := number | tagref | funccall | '(' expr ')'
+//   tagref  := 'tag' '(' '"' NAME '"' ')' | IDENT           // `tag("name")` or a bare `raw`
+//   funccall:= IDENT '(' expr (',' expr)? ')'               // 020 §6.2/§6.3 math functions
 // Values are doubles; booleans are 1.0 (true) / 0.0 (false). A missing tag reads as 0.0.
+//
+// FUNCTIONS (020 §6.2/§6.3, grounded in Scratch's `() of ()` operator's 14-function set, minus its
+// e^/10^ pair which is generalized here as pow()/exp()): unary — abs, floor, ceil, round, sqrt, sin,
+// cos, tan, asin, acos, atan, ln, log, exp; binary — pow(base, exp), min(a, b), max(a, b). An IDENT
+// immediately followed by '(' that isn't `tag` or a known function name is a parse error (unknown
+// function), not a silent misparse.
 //
 // PARSE-ONCE / 0-ALLOC EVAL (N1/N3): compile() parses the text ONCE (at configure/deploy) into a
 // flat RPN `Program`. process() walks that vector with a fixed-size value stack — no heap, no
@@ -28,9 +35,13 @@
 // short-circuit the flow; otherwise it returns Continue and the pipeline proceeds.
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "aero/sdk/node.hpp"
@@ -42,7 +53,11 @@ namespace expr_detail {
 enum class Op : std::uint8_t {
     Const, Tag,                       // push a literal / a tag value
     Neg, Not,                         // unary
-    Add, Sub, Mul, Div,               // arithmetic
+    Abs, Floor, Ceil, Round, Sqrt,     // unary math (020 §6.2)
+    Sin, Cos, Tan, Asin, Acos, Atan,   // unary math (020 §6.2)
+    Ln, Log, Exp,                      // unary math (020 §6.2) — ln = natural log, log = base-10
+    Add, Sub, Mul, Div, Mod,          // arithmetic (Mod: 020 §6.1)
+    Pow, Min, Max,                    // binary math (020 §6.2/§6.3)
     Lt, Gt, Le, Ge, Eq, Ne,           // comparison
     And, Or,                          // boolean
 };
@@ -61,6 +76,90 @@ struct Program {
     std::size_t max_depth = 0;        // peak value-stack depth (bounds the eval stack)
     bool ok = false;
     std::string error;
+
+    // 0-alloc RPN eval over a fixed value stack (N1), bounded by `max_depth`. A public method on
+    // `Program` itself (not a private helper on whichever node owns one) so any node compiling an
+    // expression — `ExprRuleNode`, `aero.flow.switch` (switch_node.hpp) — shares one evaluator instead
+    // of duplicating the interpreter loop.
+    //
+    // `saw_nan` (020 §6.4, optional, 0-cost when null): set to true if ANY instruction produces a NaN
+    // during this evaluation — not just a NaN that survives to the final result. A comparison op (Lt/
+    // Gt/...) collapses a NaN operand to a clean 0.0/1.0 (IEEE754: every ordered comparison against NaN
+    // is false), so checking only the returned value would miss exactly the "goes quiet" case §6.4
+    // documents — a comparison-shaped expression like `sqrt(tag("x")) > 5` never returns NaN itself even
+    // though it evaluated one internally. Checking after every instruction catches it upstream of that
+    // collapse, giving the "operational signal... this fired/didn't-fire because of NaN" both shapes
+    // need, not just the bare-arithmetic-shaped one where NaN happens to survive to the top.
+    [[nodiscard]] double evaluate(const aero::ProcessingContext& ctx,
+                                   bool* saw_nan = nullptr) const noexcept {
+        static constexpr std::size_t kMaxStack = 128;
+        double stack[kMaxStack];
+        std::size_t sp = 0;
+        for (const auto& in : code) {
+            switch (in.op) {
+                case Op::Const: stack[sp++] = in.k; break;
+                case Op::Tag:   stack[sp++] = tag_value(ctx, in.tag); break;
+                case Op::Neg:   stack[sp - 1] = -stack[sp - 1]; break;
+                case Op::Not:   stack[sp - 1] = (stack[sp - 1] == 0.0) ? 1.0 : 0.0; break;
+                // Unary math functions (020 §6.2). Domain-restricted ones (Sqrt/Asin/Acos/Ln/Log) let
+                // NaN propagate on out-of-domain input — a deliberate split from Div's guard-to-0.0
+                // below (020 §6.4): an out-of-domain input here is closer to a config mistake than a
+                // routine edge case, and papering over it with a guard would make a broken expression
+                // *look* like it's working.
+                case Op::Abs:   stack[sp - 1] = std::fabs(stack[sp - 1]); break;
+                case Op::Floor: stack[sp - 1] = std::floor(stack[sp - 1]); break;
+                case Op::Ceil:  stack[sp - 1] = std::ceil(stack[sp - 1]); break;
+                case Op::Round: stack[sp - 1] = std::round(stack[sp - 1]); break;
+                case Op::Sqrt:  stack[sp - 1] = std::sqrt(stack[sp - 1]); break;
+                case Op::Sin:   stack[sp - 1] = std::sin(stack[sp - 1]); break;
+                case Op::Cos:   stack[sp - 1] = std::cos(stack[sp - 1]); break;
+                case Op::Tan:   stack[sp - 1] = std::tan(stack[sp - 1]); break;
+                case Op::Asin:  stack[sp - 1] = std::asin(stack[sp - 1]); break;
+                case Op::Acos:  stack[sp - 1] = std::acos(stack[sp - 1]); break;
+                case Op::Atan:  stack[sp - 1] = std::atan(stack[sp - 1]); break;
+                case Op::Ln:    stack[sp - 1] = std::log(stack[sp - 1]); break;
+                case Op::Log:   stack[sp - 1] = std::log10(stack[sp - 1]); break;
+                case Op::Exp:   stack[sp - 1] = std::exp(stack[sp - 1]); break;
+                default: {
+                    const double b = stack[--sp];
+                    const double a = stack[--sp];
+                    double r = 0.0;
+                    switch (in.op) {
+                        case Op::Add: r = a + b; break;
+                        case Op::Sub: r = a - b; break;
+                        case Op::Mul: r = a * b; break;
+                        case Op::Div: r = (b == 0.0) ? 0.0 : a / b; break;  // guarded — no trap (E-safe)
+                        case Op::Mod: r = (b == 0.0) ? 0.0 : std::fmod(a, b); break;  // guarded like Div
+                        case Op::Pow: r = std::pow(a, b); break;
+                        case Op::Min: r = std::min(a, b); break;
+                        case Op::Max: r = std::max(a, b); break;
+                        case Op::Lt:  r = (a <  b) ? 1.0 : 0.0; break;
+                        case Op::Gt:  r = (a >  b) ? 1.0 : 0.0; break;
+                        case Op::Le:  r = (a <= b) ? 1.0 : 0.0; break;
+                        case Op::Ge:  r = (a >= b) ? 1.0 : 0.0; break;
+                        case Op::Eq:  r = (a == b) ? 1.0 : 0.0; break;
+                        case Op::Ne:  r = (a != b) ? 1.0 : 0.0; break;
+                        case Op::And: r = (a != 0.0 && b != 0.0) ? 1.0 : 0.0; break;
+                        case Op::Or:  r = (a != 0.0 || b != 0.0) ? 1.0 : 0.0; break;
+                        default: break;
+                    }
+                    stack[sp++] = r;
+                }
+            }
+            if (saw_nan != nullptr && sp > 0 && std::isnan(stack[sp - 1])) *saw_nan = true;
+            if (sp >= kMaxStack) break;  // parse bounds depth < kMaxStack; belt-and-suspenders
+        }
+        return sp > 0 ? stack[sp - 1] : 0.0;
+    }
+
+private:
+    double tag_value(const aero::ProcessingContext& ctx, std::uint32_t idx) const noexcept {
+        const std::string& nm = names[idx];
+        for (const auto& t : ctx.tags) {
+            if (t.name == nm) return t.value;
+        }
+        return 0.0;  // missing tag reads as 0.0 (008 §6 open question: could be a config error later)
+    }
 };
 
 // A tiny recursive-descent / precedence-climbing parser. It emits RPN as it recurses, so the output
@@ -139,6 +238,7 @@ private:
             skip_ws();
             if (match1('*')) { parse_unary(p); emit(p, Op::Mul); }
             else if (match1('/')) { parse_unary(p); emit(p, Op::Div); }
+            else if (match1('%')) { parse_unary(p); emit(p, Op::Mod); }  // 020 §6.1
             else break;
         }
     }
@@ -199,8 +299,44 @@ private:
             if (!match1(')')) fail("expected ')' closing tag(...)");
             return;
         }
+        skip_ws();
+        if (peek() == '(') { parse_function_call(p, ident); return; }
         // A bare identifier IS a tag reference (e.g. `raw`).
         emit_tag(p, std::string(ident));
+    }
+
+    // 020 §6.2/§6.3: IDENT '(' expr (',' expr)? ')' — unary math functions take one argument,
+    // pow/min/max take two. `ident` reached here is anything but `tag`; a name matching neither table
+    // below is a parse error ("unknown function"), never a silent misparse.
+    void parse_function_call(Program& p, std::string_view name) {
+        static constexpr std::pair<std::string_view, Op> kUnary[] = {
+            {"abs", Op::Abs}, {"floor", Op::Floor}, {"ceil", Op::Ceil}, {"round", Op::Round},
+            {"sqrt", Op::Sqrt}, {"sin", Op::Sin}, {"cos", Op::Cos}, {"tan", Op::Tan},
+            {"asin", Op::Asin}, {"acos", Op::Acos}, {"atan", Op::Atan},
+            {"ln", Op::Ln}, {"log", Op::Log}, {"exp", Op::Exp},
+        };
+        static constexpr std::pair<std::string_view, Op> kBinary[] = {
+            {"pow", Op::Pow}, {"min", Op::Min}, {"max", Op::Max},
+        };
+
+        Op fn_op{};
+        bool is_unary = false, is_binary = false;
+        for (const auto& [n, op] : kUnary) { if (n == name) { fn_op = op; is_unary = true; break; } }
+        if (!is_unary) {
+            for (const auto& [n, op] : kBinary) { if (n == name) { fn_op = op; is_binary = true; break; } }
+        }
+        if (!is_unary && !is_binary) { fail("unknown function '" + std::string(name) + "'"); return; }
+
+        if (!match1('(')) { fail("expected '(' after '" + std::string(name) + "'"); return; }
+        parse_or(p);  // first argument
+        if (is_binary) {
+            skip_ws();
+            if (!match1(',')) { fail("function '" + std::string(name) + "' requires 2 arguments"); return; }
+            parse_or(p);  // second argument
+        }
+        skip_ws();
+        if (!match1(')')) { fail("expected ')' closing '" + std::string(name) + "(...)'"); return; }
+        emit(p, fn_op);
     }
 
     void parse_string_tag(Program& p) { parse_string_body(p); }
@@ -232,9 +368,23 @@ private:
     void emit(Program& p, Op op) {
         if (failed_) return;
         p.code.push_back({op, 0.0, 0});
-        if (op != Op::Neg && op != Op::Not) --depth_;  // binary ops pop 2 push 1 (net -1)
+        if (!is_unary_op(op)) --depth_;  // binary ops pop 2 push 1 (net -1); unary ops net 0
     }
     void push_depth() { ++depth_; if (depth_ > max_depth_) max_depth_ = depth_; }
+
+    // Unary ops pop 1 push 1 (net-0 depth change) — everything else emitted via `emit()` is binary
+    // (pop 2 push 1). 020 §6.2's math functions extend the original Neg/Not-only set.
+    static bool is_unary_op(Op op) noexcept {
+        switch (op) {
+            case Op::Neg: case Op::Not:
+            case Op::Abs: case Op::Floor: case Op::Ceil: case Op::Round: case Op::Sqrt:
+            case Op::Sin: case Op::Cos: case Op::Tan: case Op::Asin: case Op::Acos: case Op::Atan:
+            case Op::Ln: case Op::Log: case Op::Exp:
+                return true;
+            default:
+                return false;
+        }
+    }
 
     // --- lexing primitives ---
     char peek() const noexcept { return pos_ < src_.size() ? src_[pos_] : '\0'; }
@@ -262,6 +412,13 @@ private:
     std::size_t max_depth_ = 0;
 };
 
+// 020 §6.4: a NaN result is allowed to propagate (a deliberate split from Div's guard-to-0.0) — but it
+// must never be entirely silent either. `NaN != 0.0` is true, so a NaN can spuriously FIRE a
+// comparison-shaped rule instead of just suppressing one — both ExprRuleNode and SwitchNode stage this
+// diagnostic Event whenever they evaluate a NaN, so there's at least an operational signal for "this
+// fired/didn't-fire because of NaN," never silence either way.
+inline constexpr std::string_view kNaNEventType = "ExprNaN";
+
 }  // namespace expr_detail
 
 class ExprRuleNode final : public INode {
@@ -279,7 +436,9 @@ public:
 
     NodeResult process(ProcessingContext& ctx) noexcept override {
         if (!prog_.ok) return NodeResult::Error;  // defensive: deploy validation rejects bad exprs
-        const double v = eval(ctx);
+        bool saw_nan = false;
+        const double v = prog_.evaluate(ctx, &saw_nan);
+        if (saw_nan) ctx.events.push_back(Event{expr_detail::kNaNEventType, v});  // 020 §6.4
         if (v != 0.0) {
             // Rule fired: raise the alarm and short-circuit (008 §6). `alarm_` outlives the flow (the
             // node is pinned in the CompiledPlan), so a borrowing Event::type view is safe.
@@ -294,57 +453,15 @@ public:
     [[nodiscard]] bool valid() const noexcept { return prog_.ok; }
     [[nodiscard]] const std::string& error() const noexcept { return prog_.error; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Rule, "aero.rule.expr"};
+    static constexpr std::array<FieldSpec, 2> kFields{{
+        {.key = "expr", .label = "Expression", .type = FieldType::String, .required = true,
+         .help = "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop."},
+        {.key = "alarm", .label = "Alarm event", .type = FieldType::String,
+         .default_string = "AlarmRaised"},
+    }};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Rule, "aero.rule.expr", kFields};
 
 private:
-    // 0-alloc RPN eval over a fixed value stack (N1). Bounded by the program's compiled depth.
-    static constexpr std::size_t kMaxStack = 128;
-
-    double eval(const ProcessingContext& ctx) const noexcept {
-        double stack[kMaxStack];
-        std::size_t sp = 0;
-        for (const auto& in : prog_.code) {
-            using expr_detail::Op;
-            switch (in.op) {
-                case Op::Const: stack[sp++] = in.k; break;
-                case Op::Tag:   stack[sp++] = tag_value(ctx, in.tag); break;
-                case Op::Neg:   stack[sp - 1] = -stack[sp - 1]; break;
-                case Op::Not:   stack[sp - 1] = (stack[sp - 1] == 0.0) ? 1.0 : 0.0; break;
-                default: {
-                    const double b = stack[--sp];
-                    const double a = stack[--sp];
-                    double r = 0.0;
-                    switch (in.op) {
-                        case Op::Add: r = a + b; break;
-                        case Op::Sub: r = a - b; break;
-                        case Op::Mul: r = a * b; break;
-                        case Op::Div: r = (b == 0.0) ? 0.0 : a / b; break;  // guarded — no trap (E-safe)
-                        case Op::Lt:  r = (a <  b) ? 1.0 : 0.0; break;
-                        case Op::Gt:  r = (a >  b) ? 1.0 : 0.0; break;
-                        case Op::Le:  r = (a <= b) ? 1.0 : 0.0; break;
-                        case Op::Ge:  r = (a >= b) ? 1.0 : 0.0; break;
-                        case Op::Eq:  r = (a == b) ? 1.0 : 0.0; break;
-                        case Op::Ne:  r = (a != b) ? 1.0 : 0.0; break;
-                        case Op::And: r = (a != 0.0 && b != 0.0) ? 1.0 : 0.0; break;
-                        case Op::Or:  r = (a != 0.0 || b != 0.0) ? 1.0 : 0.0; break;
-                        default: break;
-                    }
-                    stack[sp++] = r;
-                }
-            }
-            if (sp >= kMaxStack) break;  // parse bounds depth < kMaxStack; belt-and-suspenders
-        }
-        return sp > 0 ? stack[sp - 1] : 0.0;
-    }
-
-    double tag_value(const ProcessingContext& ctx, std::uint32_t idx) const noexcept {
-        const std::string& nm = prog_.names[idx];
-        for (const auto& t : ctx.tags) {
-            if (t.name == nm) return t.value;
-        }
-        return 0.0;  // missing tag reads as 0.0 (008 §6 open question: could be a config error later)
-    }
-
     Program prog_;
     std::string alarm_;
 };

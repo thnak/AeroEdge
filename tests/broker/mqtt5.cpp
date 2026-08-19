@@ -62,6 +62,21 @@
 // "017 M7.2 PR B coverage" section below: both fields surviving PUBLISH -> subscriber, User Properties
 // (including a duplicate key) surviving in order, a retained replay carrying both fields, Response Topic
 // wildcard rejection (DISCONNECT reason 0x90), and a Will carrying Response Topic + a User Property.
+//
+// 017 M7.2 PR C (outbound Topic Alias — the broker->subscriber compression direction; M7.1 only shipped
+// the client->broker half) is tested in "017 M7.2 PR C coverage" further below: a subscriber advertising
+// Topic Alias Maximum in CONNECT gets an alias established on first delivery per topic and reused (empty
+// topic name) on repeats, capped at its advertised maximum with a legal uncompressed fallback once
+// exhausted, and a control subscriber that never advertised one never receives an alias (§3.1.2.11.2).
+//
+// 017 M7.2 PR D (Shared Subscriptions, `$share/<group>/<filter>`, §4.8.2) is tested in "017 M7.2 PR D
+// coverage" further below: two members of the same (group, filter) each get exactly one message out of a
+// round-robin sequence (deterministic here — see route_publish()'s own comment on why), an ordinary
+// (non-shared) subscriber to the same topic proves regular fan-out is unaffected, a shared member's
+// SUBSCRIBE deliberately does NOT get an immediate retained-message replay (§4.8.2's own "no guarantee",
+// unlike an ordinary subscriber which still does), and a structurally malformed share (missing ShareName,
+// missing TopicFilter after it, or a ShareName containing a wildcard character) is a Protocol Error —
+// DISCONNECT 0x82, the SUBSCRIBE never granted.
 // Deterministic, exit-code-gated (0 = pass); bounded polling; clean shutdown.
 #include <atomic>
 #include <chrono>
@@ -1154,6 +1169,171 @@ bool test_will_response_topic_and_user_properties_honored() {
     return ok;
 }
 
+// ===== 017 M7.2 PR C coverage: outbound Topic Alias (broker -> subscriber compression) ================
+// A v5 subscriber that advertises Topic Alias Maximum=2 (0x22) in its own CONNECT gets its FIRST
+// delivery for each of up to 2 distinct topics with the full topic name AND a freshly-assigned Topic
+// Alias (establishing); every SUBSEQUENT delivery for an already-aliased topic gets an EMPTY topic name +
+// the SAME alias (reuse — the actual compression, mirrors test_topic_alias_inbound's client->broker
+// direction). A THIRD distinct topic, once both alias slots are taken, falls back to a full topic name
+// with NO alias (a legal uncompressed delivery, never an error). A control subscriber that never
+// advertised a Topic Alias Maximum — the CONNECT shape every other v5 test in this file already uses —
+// proves §3.1.2.11.2's "absent => never send me one": every delivery to it keeps its full topic name and
+// no alias, unregressed.
+bool test_topic_alias_outbound() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    std::vector<std::byte> sub_connect_props;
+    put_prop_u16(sub_connect_props, 0x22, 2);  // Topic Alias Maximum = 2
+    V5TestClient sub;
+    ok &= sub.connect_raw(port, "alias-out-sub", 0x05, sub_connect_props).ok;
+    ok &= sub.subscribe_v5("out/#", /*qos=*/1, /*is_v5=*/true).has_value();
+
+    V5TestClient ctrl;  // no Topic Alias Maximum advertised
+    ok &= ctrl.connect_raw(port, "alias-out-ctrl", 0x05).ok;
+    ok &= ctrl.subscribe_v5("out/#", /*qos=*/1, /*is_v5=*/true).has_value();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "alias-out-pub", 0x05).ok;
+
+    // 1st delivery of "out/a" — establishes alias 1: full topic name + Topic Alias property.
+    ok &= pub.publish_v5("out/a", "p1", /*qos=*/1, /*retain=*/false, /*is_v5=*/true);
+    auto g1 = sub.wait_publish_v5_extras();
+    ok &= g1.has_value() && g1->topic == "out/a" && g1->payload == "p1" &&
+          g1->props.topic_alias.has_value() && *g1->props.topic_alias == 1;
+    auto gc1 = ctrl.wait_publish_v5_extras();
+    ok &= gc1.has_value() && gc1->topic == "out/a" && !gc1->props.topic_alias.has_value();
+
+    // 2nd delivery of "out/a" — reuses alias 1: EMPTY topic name + the SAME Topic Alias property.
+    ok &= pub.publish_v5("out/a", "p2", /*qos=*/1, /*retain=*/false, /*is_v5=*/true);
+    auto g2 = sub.wait_publish_v5_extras();
+    ok &= g2.has_value() && g2->topic.empty() && g2->payload == "p2" &&
+          g2->props.topic_alias.has_value() && *g2->props.topic_alias == 1;
+    auto gc2 = ctrl.wait_publish_v5_extras();
+    ok &= gc2.has_value() && gc2->topic == "out/a" && !gc2->props.topic_alias.has_value();
+
+    // 1st delivery of "out/b" — a NEW topic, second (and last, max=2) alias slot: full topic + alias 2.
+    ok &= pub.publish_v5("out/b", "p3", /*qos=*/1, /*retain=*/false, /*is_v5=*/true);
+    auto g3 = sub.wait_publish_v5_extras();
+    ok &= g3.has_value() && g3->topic == "out/b" && g3->payload == "p3" &&
+          g3->props.topic_alias.has_value() && *g3->props.topic_alias == 2;
+
+    // 1st delivery of "out/c" — a THIRD distinct topic, both alias slots already taken: full topic name,
+    // NO alias (legal uncompressed fallback, not an error).
+    ok &= pub.publish_v5("out/c", "p4", /*qos=*/1, /*retain=*/false, /*is_v5=*/true);
+    auto g4 = sub.wait_publish_v5_extras();
+    ok &= g4.has_value() && g4->topic == "out/c" && g4->payload == "p4" &&
+          !g4->props.topic_alias.has_value();
+
+    pub.close();
+    sub.close();
+    ctrl.close();
+    broker.stop();
+    return ok;
+}
+
+// ===== 017 M7.2 PR D coverage: Shared Subscriptions (`$share/<group>/<filter>`, MQTT 5 §4.8.2) =========
+// Two subscribers join the SAME shared-subscription group+filter — each PUBLISH goes to exactly ONE
+// member (round-robin — NOT necessarily subA-then-subB: route_publish()'s candidate order comes from
+// topic_index_candidates(), which sorts by shared_ptr<Session> IDENTITY, not SUBSCRIBE order, so which
+// member gets picked FIRST is an unpredictable implementation detail. This test discovers that winner
+// from the first fresh delivery, then asserts strict alternation from there on — the property under test
+// is "exactly one member per message, and it keeps rotating," not "which physical client goes first").
+// A THIRD, ORDINARY (non-shared) subscriber to the same topic proves regular fan-out is completely
+// unaffected — it gets every single message, unlike the two shared members who only ever get every other
+// one. A retained message published BEFORE either shared member subscribes is deliberately NOT replayed to
+// them on SUBSCRIBE (§4.8.2's own "no guarantee" — see handle_subscribe's retained-replay loop comment);
+// the ordinary subscriber still gets its usual immediate replay, proving that's not accidentally broken.
+bool test_shared_subscription_round_robin() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    V5TestClient pub;
+    ok &= pub.connect_raw(port, "share-pub", 0x05).ok;
+    // Retained message published BEFORE anyone subscribes — establishes the "already retained" precondition.
+    ok &= pub.publish_v5("share/work", "stale-retained", /*qos=*/1, /*retain=*/true, /*is_v5=*/true);
+
+    V5TestClient subA;
+    ok &= subA.connect_raw(port, "share-a", 0x05).ok;
+    ok &= subA.subscribe_v5("$share/grp/share/work", /*qos=*/1, /*is_v5=*/true).has_value();
+    ok &= !subA.wait_publish(500).has_value();  // shared member: no immediate retained replay
+
+    V5TestClient subB;
+    ok &= subB.connect_raw(port, "share-b", 0x05).ok;
+    ok &= subB.subscribe_v5("$share/grp/share/work", /*qos=*/1, /*is_v5=*/true).has_value();
+    ok &= !subB.wait_publish(500).has_value();
+
+    V5TestClient ctrl;  // ordinary (non-shared) subscriber to the same topic
+    ok &= ctrl.connect_raw(port, "share-ctrl", 0x05).ok;
+    ok &= ctrl.subscribe_v5("share/work", /*qos=*/1, /*is_v5=*/true).has_value();
+    auto retained_replay = ctrl.wait_publish();  // ordinary subscriber DOES get it, unregressed
+    ok &= retained_replay.has_value() && retained_replay->second == "stale-retained";
+
+    // 4 fresh publishes: round-robin distributes them alternately across the two shared members, in an
+    // order this test discovers from the first delivery rather than assumes; ctrl gets all 4 regardless.
+    V5TestClient* members[2] = {&subA, &subB};
+    int winner_idx = -1;  // index into `members` of whoever got message 0 — set on the first iteration
+    for (int i = 0; i < 4; ++i) {
+        const std::string payload = "m" + std::to_string(i);
+        ok &= pub.publish_v5("share/work", payload, /*qos=*/1, /*retain=*/false, /*is_v5=*/true);
+        auto c = ctrl.wait_publish();
+        ok &= c.has_value() && c->second == payload;
+
+        if (winner_idx < 0) {
+            auto a = subA.wait_publish(1500);
+            if (a.has_value()) {
+                ok &= a->second == payload;
+                ok &= !subB.wait_publish(500).has_value();
+                winner_idx = 0;
+            } else {
+                auto b = subB.wait_publish(500);
+                ok &= b.has_value() && b->second == payload;
+                winner_idx = 1;
+            }
+            continue;
+        }
+        const int expected = (winner_idx + i) % 2;
+        auto got = members[expected]->wait_publish(1500);
+        ok &= got.has_value() && got->second == payload;
+        ok &= !members[1 - expected]->wait_publish(500).has_value();
+    }
+
+    pub.close();
+    subA.close();
+    subB.close();
+    ctrl.close();
+    broker.stop();
+    return ok;
+}
+
+// A structurally malformed Shared Subscription filter — missing ShareName, missing TopicFilter after the
+// ShareName, or a ShareName containing a wildcard character — is a Protocol Error (§4.8.2): the whole
+// SUBSCRIBE is rejected via DISCONNECT 0x82 (never a SUBACK), mirroring
+// test_response_topic_wildcard_rejected's own Protocol Error pattern on the PUBLISH side.
+bool test_shared_subscription_malformed_protocol_error() {
+    bool ok = true;
+    NativeBroker broker(Config{"127.0.0.1", /*listen_port=*/0});
+    ok &= broker.start().has_value();
+    const std::uint16_t port = broker.listen_port();
+
+    for (const std::string& bad_filter : {std::string("$share/"), std::string("$share/g"),
+                                          std::string("$share/g+r/topic")}) {
+        V5TestClient c;
+        ok &= c.connect_raw(port, "share-bad", 0x05).ok;
+        auto ack = c.subscribe_v5(bad_filter, /*qos=*/1, /*is_v5=*/true);
+        ok &= !ack.has_value();  // no SUBACK — the SUBSCRIBE was rejected outright
+        auto dc = c.wait_for_packet(0xE0, 1000);
+        ok &= dc.has_value() && !dc->empty() && std::to_integer<std::uint8_t>((*dc)[0]) == 0x82;
+        c.close();
+    }
+    broker.stop();
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1175,6 +1355,7 @@ int main() {
          test_disconnect_reason_keep_alive_timeout_v4_no_regression},
         {"test_disconnect_reason_session_taken_over", test_disconnect_reason_session_taken_over},
         {"test_topic_alias_inbound", test_topic_alias_inbound},
+        {"test_topic_alias_outbound", test_topic_alias_outbound},
         {"test_message_expiry_delivered_when_fresh", test_message_expiry_delivered_when_fresh},
         {"test_message_expiry_dropped_when_stale", test_message_expiry_dropped_when_stale},
         {"test_max_packet_size_enforced", test_max_packet_size_enforced},
@@ -1186,6 +1367,9 @@ int main() {
         {"test_response_topic_wildcard_rejected", test_response_topic_wildcard_rejected},
         {"test_will_response_topic_and_user_properties_honored",
          test_will_response_topic_and_user_properties_honored},
+        {"test_shared_subscription_round_robin", test_shared_subscription_round_robin},
+        {"test_shared_subscription_malformed_protocol_error",
+         test_shared_subscription_malformed_protocol_error},
     };
     bool ok = true;
     for (const auto& t : tests) {

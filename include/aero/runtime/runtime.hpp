@@ -21,6 +21,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -38,8 +39,11 @@
 #include "aero/core/compiled_flow.hpp"
 #include "aero/core/registry.hpp"
 #include "aero/drivers/generator_driver.hpp"
+#include "aero/drivers/modbus_rtu_driver.hpp"
 #include "aero/drivers/modbus_tcp_driver.hpp"
 #include "aero/drivers/opcua_driver.hpp"
+#include "aero/drivers/opcua_subscription_driver.hpp"
+#include "aero/egress/http_egress_actor.hpp"
 #include "aero/ext/native_loader.hpp"
 #include "aero/mes/mes.hpp"
 #include "aero/mes/outbox.hpp"
@@ -49,7 +53,10 @@
 #include "aero/nodes/builtin_nodes.hpp"
 #include "aero/nodes/compute_nodes.hpp"
 #include "aero/nodes/expr_rule_node.hpp"
+#include "aero/nodes/http_output_node.hpp"
 #include "aero/nodes/mes_nodes.hpp"
+#include "aero/nodes/set_node.hpp"
+#include "aero/nodes/switch_node.hpp"
 #include "aero/runtime/flow_actor.hpp"
 #include "aero/runtime/flow_compiler.hpp"
 #include "aero/schema/application.hpp"
@@ -58,6 +65,7 @@
 #include "nlohmann/json.hpp"
 #include "quark/core/actor_ref.hpp"
 #include "quark/core/activation.hpp"
+#include "quark/core/cluster.hpp"  // SwimMembership (021) — configure_fleet()'s optional real membership
 #include "quark/core/engine.hpp"
 #include "quark/core/engine_config.hpp"
 #include "quark/core/ids.hpp"
@@ -67,58 +75,86 @@
 
 namespace aero::runtime {
 
+// M9.4 (018 §8): reads an optional nested "security" JSON object into an OpcUaSecurityConfig — shared by
+// both aero.driver.opcua and aero.driver.opcua_subscribe's factories below. Absent object == every field
+// stays default-constructed == disabled (opcua_security.hpp's own "certificate_file.empty()" gate).
+inline aero::drivers::OpcUaSecurityConfig parse_opcua_security(const nlohmann::json& c) {
+    aero::drivers::OpcUaSecurityConfig sec;
+    const auto it = c.find("security");
+    if (it == c.end() || !it->is_object()) return sec;
+    sec.certificate_file = it->value("certificate_file", std::string{});
+    sec.private_key_file = it->value("private_key_file", std::string{});
+    sec.trusted_server_certificate_file = it->value("trusted_server_certificate_file", std::string{});
+    sec.sign_and_encrypt = it->value("sign_and_encrypt", true);
+    sec.security_policy_uri = it->value("security_policy_uri", std::string{});
+    return sec;
+}
+
 // Populate the registries with the Phase-4 built-in node/driver factories (005 §5). Lives here (not in
 // aero-core/registry.hpp) because it #includes aero-nodes/aero-drivers — the one-way layering (R1)
 // forbids aero-core depending upward on them.
 inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg) {
-    node_reg.register_type("aero.source.decode", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.decode", aero::nodes::DecodeSourceNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::DecodeSourceNode>();
     });
-    node_reg.register_type("aero.transform.scale", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.transform.scale", aero::nodes::ScaleNode::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::nodes::ScaleNode>(c.value("factor", 1.0));
     });
-    node_reg.register_type("aero.transform.moving_average", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.transform.moving_average", aero::nodes::RuntimeMovingAverageNode::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::nodes::RuntimeMovingAverageNode>(c.value("window", std::size_t{1}));
     });
-    node_reg.register_type("aero.output.sum", [](const nlohmann::json&) {
+    node_reg.register_type("aero.output.sum", aero::nodes::SumOutputNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::SumOutputNode>();
     });
     // Low-code Rule DSL (008 §6): parse the expression ONCE here (deploy), 0-alloc eval per Command.
     // A malformed 'expr' is rejected earlier by the flow compiler (validate_node_config); this factory
     // parses again and, defensively, a bad program yields a node whose process() returns Error.
-    node_reg.register_type("aero.rule.expr", [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+    node_reg.register_type("aero.rule.expr", aero::nodes::ExprRuleNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
         auto prog = aero::nodes::ExprRuleNode::compile(c.value("expr", std::string{}));
         return std::make_unique<aero::nodes::ExprRuleNode>(
             std::move(prog), c.value("alarm", std::string{"AlarmRaised"}));
     });
 
     // Phase-10 compute-node breadth (005 §2): pure, socket-free transforms/sources (compute_nodes.hpp).
-    node_reg.register_type("aero.transform.mean", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.mean", aero::nodes::MeanNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::MeanNode>();
     });
-    node_reg.register_type("aero.transform.minmax", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.minmax", aero::nodes::MinMaxNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::MinMaxNode>();
     });
-    node_reg.register_type("aero.transform.sum", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.sum", aero::nodes::SumNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::SumNode>();
     });
-    node_reg.register_type("aero.transform.crc", [](const nlohmann::json&) {
+    node_reg.register_type("aero.transform.crc", aero::nodes::CrcNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::CrcNode>();
     });
     // Modbus register-map DECODE over already-arrived bytes (no socket; the Modbus-TCP transport is gated).
-    node_reg.register_type("aero.source.modbus", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.modbus", aero::nodes::ModbusDecodeNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::ModbusDecodeNode>();
     });
     // Modbus coil/discrete-input (bit-packed) DECODE — the FC01/FC02 counterpart, M9.1 PR D.
-    node_reg.register_type("aero.source.modbus_bits", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.modbus_bits", aero::nodes::ModbusBitsDecodeNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::ModbusBitsDecodeNode>();
     });
-    node_reg.register_type("aero.source.json", [](const nlohmann::json&) {
+    node_reg.register_type("aero.source.json", aero::nodes::JsonParseNode::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::nodes::JsonParseNode>();
     });
 
     // Phase-10 MES hook (012 §4): the outbound report Output node + the inbound order Source node.
-    node_reg.register_type("aero.output.mes", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.output.mes", aero::nodes::MesReportNode::kDesc,
+        [](const nlohmann::json& c) {
         auto kind = aero::StagedMesReport::Kind::Production;
         const std::string k = c.value("kind", std::string{"production"});
         if (k == "alarm") kind = aero::StagedMesReport::Kind::Alarm;
@@ -126,11 +162,40 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
         return std::make_unique<aero::nodes::MesReportNode>(
             c.value("line", std::string{"line-1"}), c.value("label", std::string{"produced"}), kind);
     });
-    node_reg.register_type("aero.source.mes_order", [](const nlohmann::json& c) {
+    node_reg.register_type("aero.source.mes_order", aero::nodes::MesOrderSourceNode::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::nodes::MesOrderSourceNode>(c.value("order_qty", 0.0));
     });
 
-    driver_reg.register_type("aero.driver.generator", [](const nlohmann::json&) {
+    // 019 §5: the graph-model router (see nodes/switch_node.hpp's banner — the only utility node that
+    // needed new runtime machinery; fan-out/merge are free once edges[] exists). Parses ONCE here
+    // (deploy), mirroring aero.rule.expr's factory just above — 0-alloc eval per Command.
+    node_reg.register_type("aero.flow.switch", aero::nodes::SwitchNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+        auto prog = aero::nodes::SwitchNode::compile(c.value("expr", std::string{}));
+        return std::make_unique<aero::nodes::SwitchNode>(std::move(prog));
+    });
+
+    // 020 §7: aero.transform.set — write a DSL expression's result into a working-set tag. Parses ONCE
+    // here (deploy), reusing ExprRuleNode::compile — the same pattern aero.flow.switch's factory above
+    // already established, a third reuse of the same evaluator.
+    node_reg.register_type("aero.transform.set", aero::nodes::SetNode::kDesc,
+        [](const nlohmann::json& c) -> std::unique_ptr<INode> {
+        auto prog = aero::nodes::SetNode::compile(c.value("expr", std::string{}));
+        return std::make_unique<aero::nodes::SetNode>(std::move(prog), c.value("tag", std::string{}));
+    });
+
+    // 019 slice: generic HTTP output (see nodes/http_output_node.hpp's banner for scope/non-durability).
+    node_reg.register_type("aero.output.http", aero::nodes::HttpOutputNode::kDesc,
+        [](const nlohmann::json& c) {
+        return std::make_unique<aero::nodes::HttpOutputNode>(
+            c.value("url", std::string{}), c.value("method", std::string{"POST"}),
+            c.contains("headers") && c["headers"].is_object() ? c["headers"].dump() : std::string{"{}"},
+            c.value("timeout_ms", 2000));
+    });
+
+    driver_reg.register_type("aero.driver.generator", aero::drivers::GeneratorDriver::kDesc,
+        [](const nlohmann::json&) {
         return std::make_unique<aero::drivers::GeneratorDriver>();
     });
     // M9a (018 §Multi-protocol southbound): a real Modbus-TCP PULL driver. Config is read straight out
@@ -140,7 +205,8 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // "discrete_inputs" (FC02) — M9.1 PR B/PR D. For "coils"/"discrete_inputs", "register_count" means
     // coil/discrete-input count, not register count (pair with "aero.source.modbus_bits", not
     // "aero.source.modbus", downstream).
-    driver_reg.register_type("aero.driver.modbus_tcp", [](const nlohmann::json& c) {
+    driver_reg.register_type("aero.driver.modbus_tcp", aero::drivers::ModbusTcpDriver::kDesc,
+        [](const nlohmann::json& c) {
         using RF = aero::drivers::ModbusTcpDriver::ReadFunction;
         auto read_fn = RF::HoldingRegisters;
         const std::string rt = c.value("register_type", std::string{"holding"});
@@ -155,12 +221,107 @@ inline void register_builtins(NodeRegistry& node_reg, DriverRegistry& driver_reg
     // M9b (018 §Multi-protocol southbound): a real OPC-UA client PULL driver (open62541-backed). Config
     // is read straight out of the deploy-time JSON at construction, same reasoning as
     // aero.driver.modbus_tcp above (DriverConfig's narrow fields don't fit this driver's shape either).
-    driver_reg.register_type("aero.driver.opcua", [](const nlohmann::json& c) {
+    // M9.4 (018 §8): an optional nested "security" object opts into Sign/SignAndEncrypt over a client
+    // cert (opcua_security.hpp) — absent/empty object == disabled (MessageSecurityMode::None), matching
+    // every deploy config written before M9.4. Cert/key material is loaded from DER FILE PATHS (not
+    // inline bytes in this JSON — see opcua_security.hpp's banner for why).
+    driver_reg.register_type("aero.driver.opcua", aero::drivers::OpcUaDriver::kDesc,
+        [](const nlohmann::json& c) {
         return std::make_unique<aero::drivers::OpcUaDriver>(
             c.value("endpoint", std::string{}),
             c.value("node_ids", std::vector<std::string>{}),
-            c.value("browse_root", std::string{}));
+            c.value("browse_root", std::string{}),
+            parse_opcua_security(c));
     });
+    // M9.3 (018 §8): OPC-UA Subscriptions/MonitoredItems — the PUSH counterpart to aero.driver.opcua
+    // above, a SEPARATE type_id/class (opcua_subscription_driver.hpp's own banner explains why: push vs
+    // pull is a different IDriver invocation contract, not a mode flag on one driver).
+    driver_reg.register_type("aero.driver.opcua_subscribe", aero::drivers::OpcUaSubscriptionDriver::kDesc,
+        [](const nlohmann::json& c) {
+        return std::make_unique<aero::drivers::OpcUaSubscriptionDriver>(
+            c.value("endpoint", std::string{}), c.value("node_ids", std::vector<std::string>{}),
+            parse_opcua_security(c));
+    });
+    // M9.1 PR H (018 §8): Modbus RTU/serial counterpart to aero.driver.modbus_tcp above — same
+    // "register_type" selector and defaults, plus serial-specific fields (port name, baud, parity,
+    // stop_bits, slave_address in place of host/port/unit_id).
+    driver_reg.register_type("aero.driver.modbus_rtu", aero::drivers::ModbusRtuDriver::kDesc,
+        [](const nlohmann::json& c) {
+        using RF = aero::drivers::ModbusRtuDriver::ReadFunction;
+        auto read_fn = RF::HoldingRegisters;
+        const std::string rt = c.value("register_type", std::string{"holding"});
+        if (rt == "input") read_fn = RF::InputRegisters;
+        else if (rt == "coils") read_fn = RF::Coils;
+        else if (rt == "discrete_inputs") read_fn = RF::DiscreteInputs;
+        const std::string parity_s = c.value("parity", std::string{"N"});
+        const char parity = parity_s.empty() ? 'N' : parity_s[0];
+        return std::make_unique<aero::drivers::ModbusRtuDriver>(
+            c.value("port", std::string{}), c.value("baud_rate", std::uint32_t{9600}),
+            c.value("slave_address", std::uint8_t{1}), c.value("start_address", std::uint16_t{0}),
+            c.value("register_count", std::uint16_t{8}), read_fn, parity,
+            c.value("stop_bits", std::uint8_t{1}));
+    });
+}
+
+// Enumerate the registries into the `GET /catalog` shape (015 U1) — the single source of truth for what
+// the Studio's node/driver picker offers, generated from the same descriptors the registry itself uses
+// (013 T3: Studio and runtime cannot drift). Free function (not a Runtime method) so it only needs the
+// registries, not a live Runtime instance — usable straight after register_builtins().
+inline nlohmann::json build_catalog(const NodeRegistry& node_reg, const DriverRegistry& driver_reg) {
+    auto field_json = [](const FieldSpec& f) {
+        nlohmann::json j;
+        j["key"] = f.key;
+        j["label"] = f.label;
+        switch (f.type) {
+            case FieldType::Number: j["type"] = "number"; break;
+            case FieldType::Int: j["type"] = "int"; break;
+            case FieldType::String: j["type"] = "string"; break;
+            case FieldType::Bool: j["type"] = "boolean"; break;
+            case FieldType::Enum: j["type"] = "enum"; break;
+            case FieldType::StringArray: j["type"] = "string_array"; break;
+            case FieldType::Object: j["type"] = "object"; break;
+        }
+        j["required"] = f.required;
+        if (f.type == FieldType::Number || f.type == FieldType::Int) j["default"] = f.default_number;
+        else if (f.type == FieldType::Bool) j["default"] = f.default_bool;
+        else if (!f.default_string.empty()) j["default"] = f.default_string;
+        if (f.has_min) j["min"] = f.min;
+        if (!f.help.empty()) j["help"] = f.help;
+        if (!f.tier2_hint.empty()) j["tier2"] = f.tier2_hint;
+        if (!f.enum_options.empty()) {
+            j["options"] = nlohmann::json::array();
+            for (const auto& o : f.enum_options) j["options"].push_back(o);
+        }
+        return j;
+    };
+
+    nlohmann::json out;
+    out["nodes"] = nlohmann::json::array();
+    node_reg.for_each([&](const std::string& type_id, const NodeDescriptor& d) {
+        nlohmann::json j;
+        j["type_id"] = type_id;
+        switch (d.category) {
+            case NodeCategory::Source: j["category"] = "Source"; break;
+            case NodeCategory::Transform: j["category"] = "Transform"; break;
+            case NodeCategory::Rule: j["category"] = "Rule"; break;
+            case NodeCategory::Output: j["category"] = "Output"; break;
+        }
+        j["terminal"] = d.terminal;  // 020 §4.3: Cap (nothing may follow) vs. Stack shape
+        j["fields"] = nlohmann::json::array();
+        for (const auto& f : d.config_fields) j["fields"].push_back(field_json(f));
+        out["nodes"].push_back(std::move(j));
+    });
+    out["drivers"] = nlohmann::json::array();
+    driver_reg.for_each([&](const std::string& type_id, const DriverDescriptor& d) {
+        nlohmann::json j;
+        j["type_id"] = type_id;
+        j["writable"] = d.writable;
+        j["poll_driven"] = d.poll_driven;
+        j["fields"] = nlohmann::json::array();
+        for (const auto& f : d.config_fields) j["fields"].push_back(field_json(f));
+        out["drivers"].push_back(std::move(j));
+    });
+    return out;
 }
 
 class Runtime {
@@ -169,6 +330,7 @@ public:
     ~Runtime() {
         (void)undeploy();
         if (mes_engine_) mes_engine_->stop();
+        if (http_egress_engine_) http_egress_engine_->stop();
         // Order matters (017 M6): stop the broker's accept loop + every session thread BEFORE the cluster
         // — that guarantees no locally-originated PUBLISH can still be mid-flight into
         // NativeBroker::deliver_publish() (and so into peer_forwarder_) once broker_cluster_ starts tearing
@@ -176,6 +338,15 @@ public:
         // subsystem was never configured / already stopped).
         if (broker_) broker_->stop();
         if (broker_cluster_) broker_cluster_->stop();
+        // Real cluster membership (010 §5 follow-up): stop the tick thread BEFORE the transport it
+        // drives SwimMembership over — swim_tick_running_ false + join() guarantees no further tick()/
+        // refresh() call can start touching cluster_transport_/cluster_/swim_ once this returns, so
+        // tearing those down after is race-free (mirrors BrokerCluster::stop()'s own ordering rationale).
+        if (swim_tick_thread_.joinable()) {
+            swim_tick_running_.store(false, std::memory_order_release);
+            swim_tick_thread_.join();
+        }
+        if (cluster_transport_) cluster_transport_->stop();
     }
 
     Runtime(const Runtime&) = delete;
@@ -250,46 +421,108 @@ public:
                 return std::unexpected("driver.open failed for '" + app.driver->type_id + "'");
             }
 
-            quark::StreamActivation<aero::Frame>::Config scfg;
-            scfg.capacity = 256;  // ring == max credit == max in-flight frames (006 §3)
-            d->mr = std::make_unique<std::pmr::monotonic_buffer_resource>();
-            d->stream = std::make_unique<quark::StreamActivation<aero::Frame>>(scfg, d->mr.get());
-            auto tok = quark::open_stream(*d->stream);  // single-writer token (024, D1)
-            if (!tok) {
-                d->engine->stop();
-                return std::unexpected("open_stream failed");
-            }
-            aero::StreamSink<aero::Frame> sink(std::move(tok.value()));
             d->has_driver = true;
 
-            // Producer lane: the driver's run loop pushes frames honoring backpressure (D6).
-            d->producer = std::thread(
-                [drv = d->driver.get(), sink = std::move(sink), flag = &d->stop_flag,
-                 done = &d->producer_done]() mutable {
-                    drv->run(std::move(sink), aero::StopToken{flag});
-                    done->store(true, std::memory_order_release);
-                });
+            if (d->driver->descriptor().poll_driven) {
+                // --- PULL driver lane (006 §6.1, M9.2): a "Command/Timer -> driver.poll(sink)" loop ---
+                // that spec 006 documented but no code ever implemented — poll() was previously only
+                // ever called from each driver's own test harness (ModbusTcpDriver/OpcUaDriver/
+                // ModbusRtuDriver, all of spec 018, could NOT actually be deployed via a real
+                // Application before this). `poll(StreamSink<Frame>)`'s by-value contract consumes its
+                // sink after ONE call (a StreamActivation's single-producer bind is a lifetime
+                // commitment — no way to hand the token back for reuse), so unlike the push lane below
+                // there is no persistent d->stream/producer/bridge pair: EVERY tick stands up a small
+                // throwaway StreamActivation (mirrors the exact pattern this driver family's own tests
+                // already use), calls poll() once, and drains whatever frame(s) that single call
+                // produced straight into the actor — synchronously, on this one poller thread. No
+                // separate bridge thread is needed because one poll() is a bounded step, not an
+                // independent streaming producer.
+                //
+                // CADENCE: for a PULL driver, `rate_hz` stops being merely advisory (as it is for push
+                // drivers, which ignore it) and becomes the actual timer period — 0 falls back to
+                // kDefaultPollIntervalMs (1 Hz), never "poll as fast as possible" against a real device.
+                constexpr std::uint32_t kDefaultPollIntervalMs = 1000;
+                const std::uint32_t rate_hz = dcfg.rate_hz;
+                const auto interval = std::chrono::milliseconds(
+                    rate_hz > 0 ? (1000 / rate_hz) : kDefaultPollIntervalMs);
 
-            // Bridge lane: drain the stream and `tell` each frame into the actor (single-executor, I2).
-            Deployment* dp = d.get();
-            d->bridge = std::thread([dp]() {
-                auto& ch = dp->stream->channel();
-                auto ref = dp->router->get<FlowActor>(dp->key);
-                for (;;) {
-                    const bool producer_done = dp->producer_done.load(std::memory_order_acquire);
-                    while (ch.occupancy() > 0) {
-                        quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 64);
-                        while (const aero::Frame* f = batch.next()) {
-                            // copy raw + byte payload out of the pinned slot (006 §4)
-                            ref.tell(ReceiveFrame{f->raw, f->payload_len, f->payload});
-                            batch.retire();                  // return credit after the tell is enqueued
+                Deployment* dp = d.get();
+                d->poller = std::thread([dp, interval]() {
+                    auto ref = dp->router->get<FlowActor>(dp->key);
+                    while (!dp->stop_flag.load(std::memory_order_acquire)) {
+                        quark::StreamActivation<aero::Frame>::Config scfg;
+                        scfg.capacity = 4;  // one poll() call yields at most a handful of frames
+                        std::pmr::monotonic_buffer_resource mr;
+                        quark::StreamActivation<aero::Frame> act(scfg, &mr);
+                        auto tok = quark::open_stream(act);
+                        if (tok) {
+                            aero::StreamSink<aero::Frame> sink(std::move(tok.value()));
+                            if (dp->driver->poll(std::move(sink)) == aero::DriverStatus::Ok) {
+                                auto& ch = act.channel();
+                                while (ch.occupancy() > 0) {
+                                    quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 4);
+                                    while (const aero::Frame* f = batch.next()) {
+                                        ref.tell(ReceiveFrame{f->raw, f->payload_len, f->payload});
+                                        batch.retire();
+                                    }
+                                }
+                            }
+                            // A non-Ok poll() (device unreachable, mid-backoff, ...) is not fatal —
+                            // the driver's own bounded-backoff reconnect (006 §8) handles it; this loop
+                            // just tries again next tick.
+                        }
+
+                        // Sleep in short slices so stop_flag is observed promptly (006 §8 graceful
+                        // stop), not one long sleep_for(interval).
+                        const auto deadline = std::chrono::steady_clock::now() + interval;
+                        while (std::chrono::steady_clock::now() < deadline) {
+                            if (dp->stop_flag.load(std::memory_order_acquire)) break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
                         }
                     }
-                    if (dp->stop_flag.load(std::memory_order_acquire)) break;
-                    if (producer_done && ch.occupancy() == 0) break;  // bounded driver finished + drained
-                    std::this_thread::yield();  // no sleep; progress bounded by frame_count / stop
+                });
+            } else {
+                // --- PUSH driver lane (006 §6.2), unchanged: a persistent stream + producer + bridge. --
+                quark::StreamActivation<aero::Frame>::Config scfg;
+                scfg.capacity = 256;  // ring == max credit == max in-flight frames (006 §3)
+                d->mr = std::make_unique<std::pmr::monotonic_buffer_resource>();
+                d->stream = std::make_unique<quark::StreamActivation<aero::Frame>>(scfg, d->mr.get());
+                auto tok = quark::open_stream(*d->stream);  // single-writer token (024, D1)
+                if (!tok) {
+                    d->engine->stop();
+                    return std::unexpected("open_stream failed");
                 }
-            });
+                aero::StreamSink<aero::Frame> sink(std::move(tok.value()));
+
+                // Producer lane: the driver's run loop pushes frames honoring backpressure (D6).
+                d->producer = std::thread(
+                    [drv = d->driver.get(), sink = std::move(sink), flag = &d->stop_flag,
+                     done = &d->producer_done]() mutable {
+                        drv->run(std::move(sink), aero::StopToken{flag});
+                        done->store(true, std::memory_order_release);
+                    });
+
+                // Bridge lane: drain the stream and `tell` each frame into the actor (single-executor, I2).
+                Deployment* dp = d.get();
+                d->bridge = std::thread([dp]() {
+                    auto& ch = dp->stream->channel();
+                    auto ref = dp->router->get<FlowActor>(dp->key);
+                    for (;;) {
+                        const bool producer_done = dp->producer_done.load(std::memory_order_acquire);
+                        while (ch.occupancy() > 0) {
+                            quark::StreamBatch<aero::Frame> batch(ch, /*budget*/ 64);
+                            while (const aero::Frame* f = batch.next()) {
+                                // copy raw + byte payload out of the pinned slot (006 §4)
+                                ref.tell(ReceiveFrame{f->raw, f->payload_len, f->payload});
+                                batch.retire();  // return credit after the tell is enqueued
+                            }
+                        }
+                        if (dp->stop_flag.load(std::memory_order_acquire)) break;
+                        if (producer_done && ch.occupancy() == 0) break;  // bounded driver finished+drained
+                        std::this_thread::yield();  // no sleep; progress bounded by frame_count / stop
+                    }
+                });
+            }
         }
 
         dep_ = std::move(d);
@@ -416,6 +649,12 @@ public:
         return arr;
     }
 
+    // The node/driver catalog (015 U1, 016 §2-style additive route): every registered type_id's config
+    // schema, straight from the registries `register_builtins()` populated — never a hand-maintained
+    // Studio-side list. No lock needed: nodes_/drivers_ are populated once in the ctor and never mutated
+    // after (deploy only reads them via create()).
+    nlohmann::json catalog() { return build_catalog(nodes_, drivers_); }
+
     // Undeploy (by name; empty name == the current deployment). Stops the driver + engine and joins all
     // threads before destroying anything (ordered teardown).
     std::expected<void, std::string> undeploy(const std::string& name = "") {
@@ -509,18 +748,121 @@ public:
         return j;
     }
 
+    // ---- HTTP egress (019 slice) --------------------------------------------------------------------
+    // Same daemon-lifetime, opt-in shape as the MES gateway above — a HttpEgressActor is best-effort
+    // (no durable outbox, see egress/http_egress_actor.hpp's banner), so unlike MES there is nothing to
+    // recover on restart; it still lives at daemon scope (not deployment scope) so it survives a flow
+    // redeploy, matching how an Output node's egress target should outlive the flow that staged into it.
+    using HttpEgress = aero::egress::HttpEgressActor;
+
+    std::expected<void, std::string> configure_http_egress() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (http_egress_engine_) {
+            return std::unexpected("HTTP egress already configured");
+        }
+        http_egress_actor_ = std::make_unique<HttpEgress>();
+        http_egress_pool_ = std::make_unique<quark::detail::MessagePool>(1024);
+        http_egress_activation_ = std::make_unique<quark::Activation>(
+            http_egress_actor_.get(), HttpEgress::dispatch_table(), http_egress_pool_->sink());
+        http_egress_engine_ = std::make_unique<quark::Engine<>>(quark::EngineConfig{/*workers*/ 1,
+                                                                                     /*shards*/ 1,
+                                                                                     /*budget*/ 64, 64});
+        quark::register_actor<HttpEgress>(*http_egress_engine_, /*key*/ 1, *http_egress_activation_);
+        http_egress_router_ =
+            std::make_unique<quark::LocalRouter>(http_egress_engine_->post_courier(), *http_egress_pool_);
+        http_egress_engine_->start();
+        return {};
+    }
+
+    // Forward one staged request through the egress actor (mirrors mes_stage()'s hand-off point). Public
+    // so a flow-actor integration or a test can drive it without reaching into the actor internals —
+    // same honest scope as mes_stage() (no automatic live-flow-actor forwarding is wired yet either).
+    std::expected<void, std::string> http_send(const aero::egress::SendHttpRequest& r) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!http_egress_engine_) return std::unexpected("HTTP egress not configured");
+        http_egress_router_->get<HttpEgress>(1).tell(r);
+        return {};
+    }
+
+    // Egress observability: {"configured": false} when configure_http_egress() was never called.
+    nlohmann::json http_egress_stats() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json j;
+        if (!http_egress_engine_) {
+            j["configured"] = false;
+            return j;
+        }
+        auto ref = http_egress_router_->get<HttpEgress>(1);
+        auto r = quark::block_on(
+            ref.template ask<aero::egress::HttpEgressStats>(aero::egress::GetHttpEgressStats{}));
+        const aero::egress::HttpEgressStats s = r.value_or(aero::egress::HttpEgressStats{});
+        j["configured"] = true;
+        j["sent"] = s.sent;
+        j["failed"] = s.failed;
+        return j;
+    }
+
     // ---- Cluster + Fleet(OTA) observability (010/011, 016 §2.1/§2.2) --------------------------------
     // The device registry source (016 §6 open question) is resolved here as the minimal honest answer:
     // a config-driven list, one call at daemon start (mirrors configure_mes()). Builds a ClusterView
     // scoped to what ONE daemon can honestly see (016 §2.1 — real multi-node membership stays gated on
     // Quark 019/021) and a FleetActor over per-device MockOtaDriver instances (016 §2.2 — real
-    // orchestration policy, but no real firmware-push driver/crypto exists yet, R5).
+    // orchestration policy + real ECDSA-P256 image signing (011 §6, aero/pal/crypto.hpp), but no real
+    // firmware-push DEVICE driver exists yet, R5 — MockOtaDriver's A/B-slot protocol stands in for one).
     struct FleetDeviceConfig {
         std::string id;
         std::string initial_version;
         std::vector<std::string> required_flags;
         std::vector<std::string> preferred_flags;
     };
+    // A known OTHER cluster member this node joins the real SWIM membership through (010 §5 follow-up).
+    // `flags` is that peer's OWN advertised capability set — config-declared, same posture as this
+    // node's own `FleetConfig::node_flags` (capabilities are NOT gossiped; only ALIVENESS is real —
+    // see cluster.hpp's own banner for why that split is the honest v1 scope).
+    struct ClusterMember {
+        quark::NodeId id{};
+        std::string host;
+        std::uint16_t port = 0;
+        std::vector<std::string> flags;
+    };
+
+    // Opt-in real multi-node membership (010 §5 follow-up, Phase-8): swaps `fleet_status()`'s single-
+    // hardcoded-node `ClusterView` for one backed by a real `quark::SwimMembership` (021) — a genuine
+    // SWIM failure detector over a real `TcpTransport`, so "which nodes are alive" becomes an honest,
+    // live answer instead of a config-time fiction. `listen_port == 0` (the default) means disabled:
+    // `configure_fleet()` keeps its exact pre-existing single-node behavior, unchanged.
+    //
+    // WHAT THIS DOES NOT DO (honest scope, matching cluster.hpp's own banner): no capability gossip
+    // (peer flags are config-declared here, not discovered), and — the actually hard part — no cross-
+    // node actor state hand-off. Real fenced migration (010 §3) needs the OLD and NEW node's durable
+    // stores to be the SAME store; neither Quark nor AeroEdge ships a networked/shared store today, so
+    // an actor's placement can be recomputed live but nothing here ever MOVES a running actor or its
+    // state across nodes. This is real-time membership OBSERVABILITY, not migration.
+    struct ClusterMembershipConfig {
+        quark::NodeId self{};
+        std::uint16_t listen_port = 0;  // this node's own SWIM listener (0 == disabled)
+        std::uint64_t cluster_id = 0;
+        std::vector<ClusterMember> seeds;  // other known members to join through
+        std::uint32_t tick_interval_ms = 200;  // real wall-clock cadence for SwimMembership::tick()
+    };
+
+    // TEST-ONLY EC P-256 keypair (011 §3/§6, aero/pal/crypto.hpp) — a default so every existing
+    // configure_fleet() caller keeps compiling/working unchanged; NEVER used in production (same
+    // convention as every other checked-in *_TEST_CERTS_DIR material in this tree — generated with
+    // `openssl ecparam -name prime256v1 -genkey -noout` / `openssl ec -pubout`). A real deployment
+    // overrides FleetConfig::ota_signing_key_pem/ota_trust_root_public_key_pem with its own keypair.
+    static constexpr const char* kDefaultOtaSigningKeyPem =
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "MHcCAQEEIOI8Hgmq+AGZP7mjSfqsxVBRsXuC/ffSUOzWnaSYOj9coAoGCCqGSM49\n"
+        "AwEHoUQDQgAEQVB6J9oo1Z+/PPaYwJuwXSUmrZv5+U21d34+EsXvO9IyOx0sTSqv\n"
+        "XyET1vSUqgc71FfeYkXkVbum6q9pUDzoMg==\n"
+        "-----END EC PRIVATE KEY-----\n";
+    static constexpr const char* kDefaultOtaTrustRootPublicKeyPem =
+        "-----BEGIN PUBLIC KEY-----\n"
+        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQVB6J9oo1Z+/PPaYwJuwXSUmrZv5\n"
+        "+U21d34+EsXvO9IyOx0sTSqvXyET1vSUqgc71FfeYkXkVbum6q9pUDzoMg==\n"
+        "-----END PUBLIC KEY-----\n";
+
     struct FleetConfig {
         std::vector<std::string> node_flags;
         std::vector<FleetDeviceConfig> devices;
@@ -528,9 +870,15 @@ public:
         std::size_t ota_canary = 1;
         std::size_t ota_staged = 1;
         std::size_t ota_rate_limit = 1;
-        // A keyed-hash trust root (011 §3, GATED stand-in for real asymmetric signing — see ota.hpp
-        // sign_image()'s own comment). Never a real secret; a production adapter uses Quark 020.
-        std::uint64_t ota_trust_key = 0xA1B2C3D4ULL;
+        // Real ECDSA-P256/SHA-256 trust root (011 §3/§6, aero/pal/crypto.hpp): start_rollout() signs
+        // with ota_signing_key_pem (the trust root's PRIVATE key — an operator/CI posture collapsed
+        // into the daemon for this scope, never sent over the wire) and FleetActor/run_ota verify with
+        // ota_trust_root_public_key_pem (the PUBLIC key, O1). Defaults below are TEST-ONLY material
+        // (generated for this repo, never used in production — same convention as every other
+        // *_TEST_CERTS_DIR in this tree) — a real deployment supplies its own keypair via Quark 020.
+        std::string ota_signing_key_pem = kDefaultOtaSigningKeyPem;
+        std::string ota_trust_root_public_key_pem = kDefaultOtaTrustRootPublicKeyPem;
+        ClusterMembershipConfig membership;  // listen_port==0 (default) == single-node mode, unchanged
     };
 
     std::expected<void, std::string> configure_fleet(const FleetConfig& cfg) {
@@ -542,10 +890,40 @@ public:
         node_flags_ = cfg.node_flags;
         quark::NodeCapabilities node_caps;
         for (const auto& f : cfg.node_flags) node_caps.add(quark::Flag{f});
-        cluster_ = std::make_unique<aero::cluster::ClusterView>(
-            std::vector<aero::cluster::NodeSpec>{aero::cluster::NodeSpec{quark::NodeId{1}, node_caps}});
 
-        ota_trust_key_ = cfg.ota_trust_key;
+        if (cfg.membership.listen_port != 0) {
+            // Real multi-node membership (010 §5 follow-up) — see ClusterMembershipConfig's own banner
+            // for exactly what this does and does not provide.
+            self_node_id_ = cfg.membership.self;
+            cluster_transport_ = std::make_unique<aero::transport::TcpTransport>(
+                aero::transport::TcpTransport::Config{self_node_id_, "0.0.0.0", cfg.membership.listen_port, {}});
+            auto tr = cluster_transport_->start();
+            if (!tr) {
+                return std::unexpected("configure_fleet: cluster membership transport failed to start: " +
+                                       tr.error());
+            }
+
+            quark::SwimMembership::Config swim_cfg;
+            swim_cfg.cluster_id = quark::ClusterId{cfg.membership.cluster_id};
+            swim_ = std::make_unique<quark::SwimMembership>(self_node_id_, *cluster_transport_, swim_cfg);
+
+            std::vector<aero::cluster::NodeSpec> nodes;
+            nodes.push_back(aero::cluster::NodeSpec{self_node_id_, node_caps});
+            for (const auto& seed : cfg.membership.seeds) {
+                cluster_transport_->add_peer(seed.id, seed.host, seed.port);
+                quark::NodeCapabilities seed_caps;
+                for (const auto& f : seed.flags) seed_caps.add(quark::Flag{f});
+                nodes.push_back(aero::cluster::NodeSpec{seed.id, seed_caps});
+                swim_->request_join(seed.id);
+            }
+            cluster_ = std::make_unique<aero::cluster::ClusterView>(std::move(nodes), *swim_);
+        } else {
+            cluster_ = std::make_unique<aero::cluster::ClusterView>(
+                std::vector<aero::cluster::NodeSpec>{aero::cluster::NodeSpec{self_node_id_, node_caps}});
+        }
+
+        ota_signing_key_pem_ = cfg.ota_signing_key_pem;
+        ota_trust_root_public_key_pem_ = cfg.ota_trust_root_public_key_pem;
         ota_ = std::make_unique<aero::ota::FleetActor>(cfg.ota_threshold, cfg.ota_canary, cfg.ota_staged,
                                                        cfg.ota_rate_limit);
 
@@ -569,6 +947,37 @@ public:
         }
         placement_ = aero::cluster::place_actors(devs, *cluster_);
         device_actors_ = std::move(devs);
+
+        if (swim_) {
+            // Deferred to here (not started above, before device_actors_/placement_ existed) so the
+            // FIRST tick has real data to recompute placement over — see the loop body's own comment.
+            // SwimMembership::tick() itself does no sleeping ("NO sleeping, NO wall-clock wait" — its
+            // own doc comment); driving the real SWIM protocol period at a real cadence is this
+            // caller's job. 20ms wake-up slices (mirrors Deployment::poller's own pattern, M9.2) so
+            // stop() is observed promptly rather than blocking on the full tick_interval_ms.
+            swim_tick_running_.store(true, std::memory_order_release);
+            swim_tick_thread_ = std::thread([this, interval_ms = cfg.membership.tick_interval_ms] {
+                while (swim_tick_running_.load(std::memory_order_acquire)) {
+                    {
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        swim_->tick();
+                        if (cluster_) {
+                            cluster_->refresh();
+                            // Placement is a pure function of the current view (cluster.hpp) — cheap to
+                            // recompute every tick so a node joining/leaving is reflected in
+                            // fleet_status()'s device assignments, not just its node list.
+                            placement_ = aero::cluster::place_actors(device_actors_, *cluster_);
+                        }
+                    }
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(interval_ms);
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        if (!swim_tick_running_.load(std::memory_order_acquire)) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                }
+            });
+        }
         return {};
     }
 
@@ -581,10 +990,21 @@ public:
             return j;
         }
         j["configured"] = true;
-        nlohmann::json node;
-        node["id"] = 1;
-        node["flags"] = node_flags_;
-        j["nodes"] = nlohmann::json::array({std::move(node)});
+        // `real_membership`: honest flag for WHICH kind of node list follows — a live quark::SwimMembership
+        // view (010 §5 follow-up: genuinely alive/reachable right now) vs. the single-node stand-in
+        // (always just self, unconditionally "alive" by definition).
+        j["real_membership"] = swim_ != nullptr;
+        nlohmann::json nodes = nlohmann::json::array();
+        const quark::MembershipView view = cluster_->membership();
+        for (const quark::NodeId n : view.nodes()) {
+            nlohmann::json nj;
+            nj["id"] = n.value;
+            nj["alive"] = true;  // MembershipView only ever lists currently-alive members (021)
+            if (n.value == self_node_id_.value) nj["flags"] = node_flags_;
+            nodes.push_back(std::move(nj));
+        }
+        j["nodes"] = std::move(nodes);
+        j["epoch"] = view.epoch();
 
         nlohmann::json devices = nlohmann::json::array();
         for (const auto& d : device_actors_) {
@@ -639,8 +1059,8 @@ public:
             return std::unexpected("fleet not configured");
         }
         aero::ota::OtaImage image{image_version, image_bytes, ""};
-        image.signature = aero::ota::sign_image(image, ota_trust_key_);
-        last_waves_ = ota_->run(image, ota_trust_key_);
+        image.signature = aero::ota::sign_image(image, ota_signing_key_pem_);
+        last_waves_ = ota_->run(image, ota_trust_root_public_key_pem_);
         return {};
     }
 
@@ -732,6 +1152,7 @@ private:
 
         std::thread producer;  // declared last → joined in teardown, dtor sees non-joinable
         std::thread bridge;
+        std::thread poller;    // PULL drivers only (§6.1) — see deploy()'s driver-ingestion branch
     };
 
     // Classify a reload as Live or BuildOnly (009 §4 table, P3). Returns nullopt for a Live change
@@ -767,6 +1188,7 @@ private:
         d.stop_flag.store(true, std::memory_order_release);  // graceful stop (006 §8): finish in-flight
         if (d.producer.joinable()) d.producer.join();
         if (d.bridge.joinable()) d.bridge.join();
+        if (d.poller.joinable()) d.poller.join();
         if (d.engine) d.engine->stop();
         if (d.driver) d.driver->close();
     }
@@ -786,15 +1208,31 @@ private:
     std::unique_ptr<quark::Engine<>> mes_engine_;
     std::unique_ptr<quark::LocalRouter> mes_router_;
 
+    // HTTP egress lifetime (daemon-scoped — see configure_http_egress() above).
+    std::unique_ptr<HttpEgress> http_egress_actor_;
+    std::unique_ptr<quark::detail::MessagePool> http_egress_pool_;
+    std::unique_ptr<quark::Activation> http_egress_activation_;
+    std::unique_ptr<quark::Engine<>> http_egress_engine_;
+    std::unique_ptr<quark::LocalRouter> http_egress_router_;
+
     // Fleet/OTA/placement lifetime (daemon-scoped, set by configure_fleet() above).
     std::vector<std::string> node_flags_;
+    quark::NodeId self_node_id_{1};  // NodeId{1}: matches the pre-M5.1-follow-up single-node default
     std::unique_ptr<aero::cluster::ClusterView> cluster_;
     std::vector<aero::cluster::DeviceActor> device_actors_;
     aero::cluster::PlacementPlan placement_;
     std::vector<std::unique_ptr<aero::ota::MockOtaDriver>> ota_drivers_;
     std::unique_ptr<aero::ota::FleetActor> ota_;
-    std::uint64_t ota_trust_key_ = 0;
+    std::string ota_signing_key_pem_;
+    std::string ota_trust_root_public_key_pem_;
     std::vector<aero::ota::WaveResult> last_waves_;
+
+    // Real multi-node membership (010 §5 follow-up, opt-in via FleetConfig::membership) — all null/
+    // idle unless configure_fleet() was given a non-zero listen_port. See ~Runtime() for stop ordering.
+    std::unique_ptr<aero::transport::TcpTransport> cluster_transport_;
+    std::unique_ptr<quark::SwimMembership> swim_;
+    std::thread swim_tick_thread_;
+    std::atomic<bool> swim_tick_running_{false};
 
     // Native MQTT broker lifetime (daemon-scoped, set by configure_broker() above).
     std::unique_ptr<aero::broker::NativeBroker> broker_;

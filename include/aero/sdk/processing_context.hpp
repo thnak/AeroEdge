@@ -61,6 +61,19 @@ struct StagedMesReport {
     double value = 0.0;      // produced count / measurement / severity
 };
 
+// A request an Output node stages for the HTTP egress actor (019 slice: aero.output.http). Same
+// SDK-layer reasoning as StagedMesReport: POD, no upward include of the egress module (R1). `url` and
+// `method` are views into the node's own config storage (stable, 0-alloc to stage — N1); `body` is
+// built fresh per Command from the working-set tags, so it is owned, not a view (the same documented
+// exception JsonParseNode already takes for allocation on the steady path, 005 §7).
+struct StagedHttpRequest {
+    std::string_view url;
+    std::string_view method;         // "GET"|"POST"|"PUT"|"PATCH"|"DELETE"
+    std::string_view headers_json;   // a flat {"Key":"Value",...} object, or "{}" — node config storage
+    std::int32_t timeout_ms = 2000;
+    std::string body;                // owned — built fresh per Command from the working-set tags
+};
+
 using TagCollection = std::vector<Tag>;
 using EventBuffer = std::vector<Event>;
 
@@ -80,6 +93,14 @@ struct ProcessingContext {
     EventBuffer events;       // Events to publish after commit (002)
     std::vector<StagedMesReport> mes_reports;  // MES reports staged by Output nodes (012 §4), drained
                                                // by the actor into the MesGateway outbox at commit
+    std::vector<StagedHttpRequest> http_requests;  // HTTP requests staged by aero.output.http, drained
+                                                    // into the HttpEgressActor (019 slice)
+
+    // The branch a Rule/switch node (aero.flow.switch) chose this Command (019 §3/§4) — a view into
+    // static storage (the node's own literal "true"/"false"), so setting it is 0-alloc (N1). Read by
+    // CompiledFlow::execute() to skip steps whose required_label doesn't match. Not a stack (v1 supports
+    // exactly one active switch point per flow, per 004's existing "linear + single switch" precedent).
+    std::string_view active_branch;
 
     // --- flow status ---
     bool failed = false;
@@ -97,6 +118,8 @@ struct ProcessingContext {
         output.clear();
         events.clear();
         mes_reports.clear();
+        http_requests.clear();
+        active_branch = {};
         failed = false;
         failed_step = 0;
     }

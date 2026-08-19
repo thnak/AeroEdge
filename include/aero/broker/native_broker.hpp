@@ -265,9 +265,20 @@ public:
     // exactly the loop-prevention invariant). Unset (the default) ⇒ no-op ⇒ single-node behavior is
     // unchanged. `BrokerCluster` (broker_cluster.hpp) is the intended caller: it wires this to broadcast
     // the PUBLISH to every peer node via `DistributedRouter`/`BrokerRelayActor`. Same signature as
-    // `on_publish()` (topic/payload/qos) — no retain flag, mirroring `deliver_remote_publish()` below.
+    // `on_publish()` (topic/payload/qos/props) plus one more parameter — no retain flag, mirroring
+    // `deliver_remote_publish()` below.
+    // 017 M7.2 PR E: gained `message_expiry_remaining` — a RELATIVE duration (seconds remaining as of
+    // THIS call), not the private `PublishExtras::expiry_deadline` absolute time_point (which this public
+    // signature can't even name — `PublishExtras` is a private nested type — and which would be
+    // meaningless on a peer node's own `steady_clock` epoch anyway). `props` (Response Topic/Correlation
+    // Data/User Properties) rides the same public `PublishProperties` shape `on_publish()` already uses.
+    // Before this PR, `deliver_publish()` called the (3-arg) forwarder with none of this — a relayed
+    // PUBLISH silently lost every one of these fields cross-node (see this function's OLD banner, and
+    // `deliver_remote_publish()`'s OLD one below, both now stale/superseded).
     void set_peer_forwarder(std::function<void(std::string_view topic, std::span<const std::byte> payload,
-                                               std::uint8_t qos)> cb) {
+                                               std::uint8_t qos,
+                                               std::optional<std::chrono::seconds> message_expiry_remaining,
+                                               const PublishProperties& props)> cb) {
         peer_forwarder_ = std::move(cb);
     }
 
@@ -281,19 +292,38 @@ public:
     // PUBLISH's retain semantics stay a property of the node the publisher actually dialed — see
     // broker_cluster.hpp's banner for why), or call peer_forwarder_ (the loop-prevention boundary — a
     // relay-delivered PUBLISH is never re-broadcast onward).
-    void deliver_remote_publish(std::string_view topic, std::span<const std::byte> payload,
-                                std::uint8_t qos) {
-        // 017 M7.2 PR B: relayed PUBLISHes never carry Response Topic/Correlation Data/User Properties
-        // yet — same documented v1 cross-node gap PR A already left for Message Expiry (see this
-        // function's own banner above); a future cross-node-relay PR would thread real extras through.
-        if (on_publish_) on_publish_(topic, payload, qos, PublishProperties{});
-        route_publish(std::string(topic), std::vector<std::byte>(payload.begin(), payload.end()), qos);
+    // 017 M7.2 PR E: `message_expiry_remaining`/`props` are the SAME extras `set_peer_forwarder()`'s
+    // callback now hands the sender's own `BrokerCluster::broadcast()` — this is the receiving end.
+    // `message_expiry_remaining` (relative, as forwarded) is turned into a FRESH absolute deadline on
+    // THIS node's own `steady_clock`, exactly like `handle_publish()` does for an inbound MQTT Message
+    // Expiry Interval property — never copies a foreign node's absolute time_point (meaningless here).
+    // Defaulted so a caller that genuinely has nothing more than topic/payload/qos (there are none left
+    // in this tree, but the shape mirrors this file's other extras-optional call sites) still compiles.
+    void deliver_remote_publish(std::string_view topic, std::span<const std::byte> payload, std::uint8_t qos,
+                                std::optional<std::chrono::seconds> message_expiry_remaining = std::nullopt,
+                                const PublishProperties& props = {}) {
+        PublishExtras extras;
+        if (message_expiry_remaining) {
+            extras.expiry_deadline = std::chrono::steady_clock::now() + *message_expiry_remaining;
+        }
+        extras.response_topic = props.response_topic;
+        extras.correlation_data = props.correlation_data;
+        extras.user_properties = props.user_properties;
+        if (on_publish_) on_publish_(topic, payload, qos, props);
+        route_publish(std::string(topic), std::vector<std::byte>(payload.begin(), payload.end()), qos, extras);
     }
 
 private:
     struct Subscription {
         std::string filter;
         std::uint8_t qos = 0;  // granted QoS (v1: min(requested, 1))
+        // 017 M7.2 PR D: nullopt for a regular subscription. Set to the ShareName when this filter was a
+        // MQTT 5 §4.8.2 `$share/<group>/<filter>` SUBSCRIBE — `filter` above is already the REAL Topic
+        // Filter with that prefix stripped (topic_matches()/the topic index both operate on it exactly as
+        // if it were a plain subscription), so this field is consulted ONLY at route_publish()'s delivery-
+        // arbitration step (a shared subscription still matches, indexes, and gets an ACL check exactly
+        // like a regular one — the only difference is who among the group actually receives each message).
+        std::optional<std::string> share_group;
     };
 
     // 017 M7.2: carries the subset of MQTT 5 PUBLISH properties this broker acts on end-to-end, from
@@ -482,6 +512,22 @@ private:
         // in the class definition). Every call site in this file changed from `s->send_packet(...)` /
         // `s.send_packet(...)` to `send_packet(*s, ...)` / `send_packet(s, ...)` — a mechanical rename
         // only, no business logic touched.
+
+        // 017 M7.2 PR C: outbound Topic Alias (compression, broker→client direction, MQTT 5 §3.3.2.3.4).
+        // client_topic_alias_max is the client's own CONNECT Topic Alias Maximum (0x22) — nullopt/0 means
+        // the client never advertised one, so §3.1.2.11.2 forbids the broker from sending ANY Topic Alias
+        // to it (unchanged pre-M7.2-PR-C behavior: every PUBLISH carries its full topic name). Set ONCE in
+        // handle_connect, same discipline as max_packet_size above. outbound_topic_aliases is THIS
+        // session's own topic -> broker-assigned-alias table, mutated only from publish_to() — every
+        // publish_to() call for a given session runs on that session's own send path under io_mu (see
+        // send_packet), so no separate lock is needed here (mirrors topic_aliases' own no-lock rationale).
+        // Aliases 1..client_topic_alias_max are assigned on first use per topic and never reassigned or
+        // reclaimed for the life of the connection (MQTT 5 §3.3.2.3.4 — an alias, once mapped, stays
+        // mapped); a topic seen after every slot is taken just gets its full name again (a legal,
+        // uncompressed fallback), never treated as an error.
+        std::optional<std::uint16_t> client_topic_alias_max;
+        std::unordered_map<std::string, std::uint16_t> outbound_topic_aliases;
+
     };
 
     // A QoS ≥1 message that arrived for a client-id while it had no live connection (persistent session,
@@ -1071,11 +1117,13 @@ private:
         // other property in the table is recognized only so read_properties() can correctly skip past it.
         std::optional<std::uint32_t> connect_session_expiry;
         std::optional<std::uint32_t> connect_max_packet_size;
+        std::optional<std::uint16_t> connect_topic_alias_max;
         if (is_v5) {
             auto props = aero::transport::mqtt::read_properties(b, pos);
             if (!props) return false;  // malformed CONNECT properties
             connect_session_expiry = props->session_expiry_interval;
             connect_max_packet_size = props->maximum_packet_size;
+            connect_topic_alias_max = props->topic_alias_maximum;  // 017 M7.2 PR C — 0x22
         }
 
         if (pos + 2 > b.size()) return false;
@@ -1188,6 +1236,7 @@ private:
         s->clean_session = clean_session;
         s->session_expiry_interval = connect_session_expiry;  // M7.1: nullopt for v4 / v5-without-property
         s->max_packet_size = connect_max_packet_size;  // M7.2 PR A: nullopt for v4 / v5-without-property
+        s->client_topic_alias_max = connect_topic_alias_max;  // M7.2 PR C: nullopt => no outbound aliasing
         s->last_activity = std::chrono::steady_clock::now();
         if (will_flag) {
             s->has_will = true;
@@ -1314,14 +1363,34 @@ private:
             pos += 1;
             const std::uint8_t qos = requested_qos > 1 ? 1 : requested_qos;  // v1 ceiling: QoS 1
 
+            // 017 M7.2 PR D — Shared Subscriptions (MQTT 5 §4.8.2): v5-only, same posture as this file's
+            // other v5-only Properties (a v4 session's "$share/..." filter is just a literal, oddly-shaped
+            // Topic Filter — no real topic will ever start with '$', so it's effectively inert, not an
+            // error). A malformed share (`parse_shared_subscription` returns nullopt: no ShareName, no
+            // TopicFilter after it, or a ShareName containing '/'/'+'/'#') is a Protocol Error (§4.8.2) —
+            // the whole SUBSCRIBE is rejected via DISCONNECT 0x82, mirroring handle_publish()'s own
+            // Response-Topic-wildcard Protocol Error handling.
+            std::optional<std::string> share_group;
+            if (s->protocol_version == 5 && filter.starts_with("$share/")) {
+                auto shared = parse_shared_subscription(filter);
+                if (!shared) {
+                    send_disconnect(*s, 0x82);  // Protocol Error
+                    return false;
+                }
+                share_group = std::string(shared->group);
+                filter = std::string(shared->filter);
+            }
+
             // M5 ACL gate: unset Config::authorizer ⇒ unchanged Phase-1 behavior (everything granted). A
             // denied filter still gets a SUBACK byte (3.9.3 requires one per filter) but it's 0x80
             // (failure) and the filter is NOT added to `added` — so it never enters s.subs and can never
-            // match in route_publish()/the retained-replay loop below.
+            // match in route_publish()/the retained-replay loop below. The ACL check runs against the REAL
+            // (post-share-prefix-stripped) filter — a client's read authorization is a property of the
+            // topic it's asking to read, not of the group-membership syntax wrapping the request.
             const bool allowed =
                 !cfg_.authorizer || cfg_.authorizer->allow(s->principal, filter, AclAction::Subscribe);
             if (allowed) {
-                added.push_back(Subscription{filter, qos});
+                added.push_back(Subscription{filter, qos, share_group});
                 granted.push_back(static_cast<std::byte>(qos));
             } else {
                 // 3.9.3 (v4): 0x80 SUBACK failure. MQTT 5 §3.9.3: 0x87 Not Authorized is the v5-specific
@@ -1355,8 +1424,17 @@ private:
         // immediately, at the subscription's granted QoS. M7.2 PR A: msg.extras carries the retained
         // message's own Message Expiry through — publish_to()'s choke point re-checks it at replay time,
         // so a long-stale retained message is silently dropped instead of replayed as if fresh.
+        //
+        // 017 M7.2 PR D: a Shared Subscription is skipped here — §4.8.2's own non-normative note is that
+        // retained delivery to a shared group has "no guarantee that all members ... will eventually
+        // receive a copy", i.e. it's expected to ride the SAME one-member-of-the-group arbitration as any
+        // other PUBLISH, not an unconditional per-subscriber replay. Replaying it to every member here
+        // (this loop runs once per member's own SUBSCRIBE) would defeat that — the new member instead
+        // picks it up via the ordinary route_publish() arbitration the next time this topic is published
+        // (or a future PR could fold retained backfill into that same arbitration; not needed yet).
         std::lock_guard<std::mutex> rg(retained_mu_);
         for (const Subscription& sub : added) {
+            if (sub.share_group) continue;
             for (const auto& [topic, msg] : retained_) {
                 if (topic_matches(sub.filter, topic)) {
                     if (!publish_to(*s, topic, msg.payload, sub.qos, /*retain=*/true, msg.extras)) return false;
@@ -1527,7 +1605,19 @@ private:
         route_publish(topic, payload, qos, extras);
         // M6 (017 §4): AFTER local delivery, so a peer's relayed copy can never arrive before this node's
         // own subscribers see it. No-op single-node default (peer_forwarder_ unset) — see set_peer_forwarder().
-        if (peer_forwarder_) peer_forwarder_(topic, payload, qos);
+        // 017 M7.2 PR E: `extras` (Message Expiry, Response Topic, Correlation Data, User Properties) now
+        // rides along too — computed into a RELATIVE remaining duration here (never the absolute
+        // `expiry_deadline` itself, meaningless off this node's own steady_clock) exactly like
+        // publish_to()'s own outbound-wire choke point already does for the MQTT PUBLISH path.
+        if (peer_forwarder_) {
+            std::optional<std::chrono::seconds> remaining;
+            if (extras.expiry_deadline) {
+                const auto delta = std::chrono::duration_cast<std::chrono::seconds>(
+                    *extras.expiry_deadline - std::chrono::steady_clock::now());
+                remaining = delta.count() > 0 ? delta : std::chrono::seconds{0};
+            }
+            peer_forwarder_(topic, payload, qos, remaining, to_publish_properties(extras));
+        }
     }
 
     // Fan out to every connected session with a matching subscription, at min(publish qos, granted
@@ -1578,16 +1668,53 @@ private:
     // before, so delivery semantics are unchanged) and then handed to route_publish_reactor_batch() below
     // for the bounded/chained dispatch (7b). A non-reactor-thread caller's own inline loop is left
     // completely unbounded/unchained, exactly as in 7a — it only ever blocks its own dedicated thread.
+    //
+    // 017 M7.2 PR D — Shared Subscriptions (§4.8.2): a matching Subscription with a `share_group` set does
+    // NOT fan out like a regular one in either branch below — it's bucketed by (group, filter) identity
+    // (see §4.8.2's own note that the pair, not the ShareName alone, identifies a shared subscription: two
+    // different groups can independently share a ShareName as long as their filters differ) into
+    // `shared_groups`, and after every live candidate has been scanned, exactly ONE member of each bucket
+    // is chosen — round-robin via shared_group_cursor_, a small piece of state that outlives any single
+    // route_publish() call so successive PUBLISHes to the same shared subscription actually rotate across
+    // members instead of always picking whichever session happened to sort first. The chosen winner is
+    // then dispatched through the SAME thread-aware path as any other candidate (added to `deliveries` for
+    // the reactor-thread branch, or enqueued/published inline for the other) — a shared-subscription
+    // winner gets no exemption from Critical fix #1's "never block the reactor thread" rule.
     void route_publish(const std::string& topic, const std::vector<std::byte>& payload, std::uint8_t qos,
                        const PublishExtras& extras = {}) {
+        struct ShareCandidate {
+            std::shared_ptr<Session> session;
+            Subscription sub;
+        };
+        std::unordered_map<std::string, std::vector<ShareCandidate>> shared_groups;
+
         const bool caller_on_reactor_thread = is_on_reactor_thread();
         if (caller_on_reactor_thread) {
             std::vector<std::pair<std::shared_ptr<Session>, std::uint8_t>> deliveries;
             for (const auto& session : topic_index_candidates(topic)) {
-                std::lock_guard<std::mutex> g(session->subs_mu);
-                for (const Subscription& sub : session->subs)
-                    if (topic_matches(sub.filter, topic))
-                        deliveries.emplace_back(session, qos < sub.qos ? qos : sub.qos);
+                std::vector<Subscription> matches;
+                {
+                    std::lock_guard<std::mutex> g(session->subs_mu);
+                    for (const Subscription& sub : session->subs)
+                        if (topic_matches(sub.filter, topic)) matches.push_back(sub);
+                }
+                for (const Subscription& sub : matches) {
+                    if (sub.share_group) {
+                        shared_groups[*sub.share_group + '\x1f' + sub.filter].push_back(
+                            ShareCandidate{session, sub});
+                        continue;
+                    }
+                    deliveries.emplace_back(session, qos < sub.qos ? qos : sub.qos);
+                }
+            }
+            for (auto& [key, candidates] : shared_groups) {
+                std::size_t idx;
+                {
+                    std::lock_guard<std::mutex> g(shared_group_cursor_mu_);
+                    idx = shared_group_cursor_[key]++ % candidates.size();
+                }
+                const ShareCandidate& chosen = candidates[idx];
+                deliveries.emplace_back(chosen.session, qos < chosen.sub.qos ? qos : chosen.sub.qos);
             }
             route_publish_reactor_batch(topic, payload, extras, std::move(deliveries), /*offset=*/0);
         } else {
@@ -1599,6 +1726,11 @@ private:
                         if (topic_matches(sub.filter, topic)) matches.push_back(sub);
                 }
                 for (const Subscription& sub : matches) {
+                    if (sub.share_group) {
+                        shared_groups[*sub.share_group + '\x1f' + sub.filter].push_back(
+                            ShareCandidate{session, sub});
+                        continue;
+                    }
                     const std::uint8_t deliver_qos = qos < sub.qos ? qos : sub.qos;
                     if (session->is_reactor_session) {
                         enqueue_reactor_publish(session, topic, payload, deliver_qos, /*retain=*/false,
@@ -1608,9 +1740,30 @@ private:
                     }
                 }
             }
+            for (auto& [key, candidates] : shared_groups) {
+                std::size_t idx;
+                {
+                    std::lock_guard<std::mutex> g(shared_group_cursor_mu_);
+                    idx = shared_group_cursor_[key]++ % candidates.size();
+                }
+                const ShareCandidate& chosen = candidates[idx];
+                const std::uint8_t deliver_qos = qos < chosen.sub.qos ? qos : chosen.sub.qos;
+                if (chosen.session->is_reactor_session) {
+                    enqueue_reactor_publish(chosen.session, topic, payload, deliver_qos, /*retain=*/false,
+                                            extras);
+                } else {
+                    (void)publish_to(*chosen.session, topic, payload, deliver_qos, /*retain=*/false, extras);
+                }
+            }
         }
 
         if (qos == 0) return;
+        // 017 M7.2 PR D scope note: shared-subscription arbitration above applies to the LIVE fan-out only
+        // — an offline (clean_session=0) stored session with a shared-subscription filter is queued into
+        // exactly like a regular one here, independently of whatever other members of its group are doing.
+        // Round-robin fairness across a mix of online and offline group members would need unifying this
+        // loop with the live one above; deferred until a real deployment actually mixes shared subscribers
+        // with persistent offline sessions (not exercised by anything today).
         std::lock_guard<std::mutex> g(stored_sessions_mu_);
         for (auto& [client_id, stored] : stored_sessions_) {
             for (const Subscription& sub : stored.subs) {
@@ -1719,11 +1872,35 @@ private:
         }
 
         out.clear();
-        aero::transport::mqtt::put_str(out, topic);
+
+        // 017 M7.2 PR C — outbound Topic Alias (compression): only for v5 sessions that advertised a
+        // nonzero Topic Alias Maximum in CONNECT (§3.1.2.11.2 — absent/0 means "never send me one").
+        // `alias_to_send`: set when this delivery carries a Topic Alias property (either establishing a
+        // NEW mapping, alongside the full topic name, or reusing an established one). `send_full_topic`:
+        // false only on reuse — an empty Topic Name field is how the client is told "resolve via alias"
+        // (§3.3.2.3.4). Session::outbound_topic_aliases's own comment covers the assignment policy.
+        std::optional<std::uint16_t> alias_to_send;
+        bool send_full_topic = true;
+        if (s.protocol_version == 5 && s.client_topic_alias_max && *s.client_topic_alias_max > 0) {
+            if (auto it = s.outbound_topic_aliases.find(topic); it != s.outbound_topic_aliases.end()) {
+                alias_to_send = it->second;
+                send_full_topic = false;  // already established — Topic Alias alone resolves it
+            } else if (s.outbound_topic_aliases.size() < *s.client_topic_alias_max) {
+                const auto new_alias =
+                    static_cast<std::uint16_t>(s.outbound_topic_aliases.size() + 1);
+                s.outbound_topic_aliases.emplace(topic, new_alias);
+                alias_to_send = new_alias;  // establishing — full topic name still goes out this once
+            }
+            // else: every alias slot is already taken by other topics — fall through with no alias, full
+            // topic name, exactly pre-PR-C behavior for this one delivery (a legal, uncompressed fallback).
+        }
+
+        aero::transport::mqtt::put_str(out, send_full_topic ? std::string_view{topic} : std::string_view{});
         if (qos > 0) aero::transport::mqtt::put_u16_be(out, next_packet_id());
 
         if (s.protocol_version == 5) {
             aero::transport::mqtt::PropertyWriter pw;
+            if (alias_to_send) pw.put_u16(0x23, *alias_to_send);
             if (extras.expiry_deadline) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
                     *extras.expiry_deadline - std::chrono::steady_clock::now())
@@ -1812,6 +1989,15 @@ private:
         }
         if (had_wildcard) std::erase(wildcard_subscribers_, s);
     }
+
+    // 017 M7.2 PR D: round-robin cursor for Shared Subscription delivery arbitration (route_publish()'s
+    // own banner covers the key shape — (ShareName, TopicFilter), NOT ShareName alone). Deliberately never
+    // pruned when a group's last member disconnects — a stale entry just means the NEXT client to (re)join
+    // that exact (group, filter) pair resumes the rotation instead of restarting at 0, which is harmless
+    // (the modulo in route_publish() re-scales it to however many candidates exist at delivery time) and
+    // avoids adding a second removal path to keep in sync with remove_session()'s existing bookkeeping.
+    std::mutex shared_group_cursor_mu_;
+    std::unordered_map<std::string, std::size_t> shared_group_cursor_;
 
     // Topic index (post-benchmark addition — see route_publish()'s own banner for why this exists).
     //
@@ -1995,7 +2181,10 @@ private:
 
     // M6 (017 §4): unset by default (single-node — 100% of Phase 1 through M3 behavior unchanged). Set by
     // BrokerCluster via set_peer_forwarder() to broadcast every locally-originated PUBLISH to peer nodes.
-    std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t)> peer_forwarder_;
+    // 017 M7.2 PR E: signature gained message_expiry_remaining/props — see set_peer_forwarder()'s comment.
+    std::function<void(std::string_view, std::span<const std::byte>, std::uint8_t,
+                       std::optional<std::chrono::seconds>, const PublishProperties&)>
+        peer_forwarder_;
 };
 
 }  // namespace aero::broker

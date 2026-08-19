@@ -59,6 +59,17 @@ target_link_libraries(runtime_deploy PRIVATE aero::runtime)
 add_test(NAME runtime_deploy COMMAND runtime_deploy)
 set_tests_properties(runtime_deploy PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# M9.2 LOAD-BEARING gate (006 §6.1, 018): proves Runtime::deploy() actually drives a PULL (poll()-only)
+# driver end to end now, not just push — before this, ModbusTcpDriver/ModbusRtuDriver/OpcUaDriver were
+# registered in the driver factory but could NOT be deployed via a real Application (the deploy path
+# only ever spawned a run() producer thread, and all three have run() as a hard Unsupported). Deploys
+# "aero.driver.modbus_tcp" against a hand-rolled fake Modbus-TCP server and asserts frames_processed
+# climbs over real wall-clock time at the configured rate_hz, plus clean teardown (poller thread joins).
+add_executable(runtime_poll_driver_wiring runtime/runtime_poll_driver_wiring.cpp)
+target_link_libraries(runtime_poll_driver_wiring PRIVATE aero::runtime quark::quark Threads::Threads)
+add_test(NAME runtime_poll_driver_wiring COMMAND runtime_poll_driver_wiring)
+set_tests_properties(runtime_poll_driver_wiring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-4 API gate (013 §5/§9): start the REST server on an ephemeral port, POST an Application + GET
 # /status over a real socket, assert it is reported, then shut down cleanly. Wait-for-ready by polling.
 add_executable(api_integration api/api_integration.cpp)
@@ -73,6 +84,15 @@ add_executable(flow_validation core/flow_validation.cpp)
 target_link_libraries(flow_validation PRIVATE aero::runtime)
 add_test(NAME flow_validation COMMAND flow_validation)
 set_tests_properties(flow_validation PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# 019 sec2/3 gate: the flow GRAPH model (edges[], topo-sort/cycle-detect, branch routing via
+# aero.flow.switch). Cycle/duplicate-id/unknown-endpoint/conflicting-branch-label graphs are rejected
+# at deploy (P1); a valid fan-out graph runs every branch (merge is free); a switch graph runs ONLY
+# the matching branch.
+add_executable(flow_graph core/flow_graph.cpp)
+target_link_libraries(flow_graph PRIVATE aero::runtime)
+add_test(NAME flow_graph COMMAND flow_graph)
+set_tests_properties(flow_graph PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
 # Phase-5 LOAD-BEARING gate (009 §4 P2): hot-reload a live actor's flow while Commands flow — 0
 # dropped, 0 duplicated (exactly-once), the pre-reload frames run the old flow and post-reload the
@@ -245,6 +265,20 @@ target_link_libraries(broker_cluster PRIVATE aero::broker)
 add_test(NAME broker_cluster COMMAND broker_cluster)
 set_tests_properties(broker_cluster PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# 017 M5.1 gate (§10): broker_cluster_security.hpp — BrokerCluster's optional mTLS cluster-link over
+# QuarkCpp's ADR-040 SecureTransport/MbedtlsHandshakeEngine/MbedtlsAeadGcm, proven over the SAME real
+# loopback TCP two-node shape as broker_cluster above: a cross-node PUBLISH still crosses AND the link
+# genuinely sealed/opened real frames (not just "still worked over the plain path"); a cluster_id
+# mismatch between two validly-certificated peers fails the handshake, so a PUBLISH never crosses.
+# Uses pre-generated, checked-in TEST-ONLY EC certs under broker/certs_cluster/ (never used in
+# production) — mirrors tls_channel/opcua_driver_security's own *_TEST_CERTS_DIR convention.
+add_executable(broker_cluster_security broker/broker_cluster_security.cpp)
+target_link_libraries(broker_cluster_security PRIVATE aero::broker)
+target_compile_definitions(broker_cluster_security PRIVATE
+  AERO_CLUSTER_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/broker/certs_cluster")
+add_test(NAME broker_cluster_security COMMAND broker_cluster_security)
+set_tests_properties(broker_cluster_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # M5 TLS+ACL milestone gate: acl.hpp — the broker-local per-topic Authorizer seam (Allow/Deny-all
 # triviality, TopicAclAuthorizer's Closed/Open default posture, exact + wildcard principal/topic
 # matching, first-match-wins ordering, Publish/Subscribe action independence). Pure logic, no sockets.
@@ -282,6 +316,17 @@ target_compile_definitions(mqtt_transport PRIVATE
   AERO_MQTT_BROKER_PY="${CMAKE_CURRENT_SOURCE_DIR}/py/mqtt_broker.py")
 add_test(NAME mqtt_transport COMMAND mqtt_transport)
 set_tests_properties(mqtt_transport PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL" TIMEOUT 120)
+
+# 014 §5: MqttClientTransport's QoS-1 sender-side retransmit-on-missing-PUBACK (closes that file's former
+# TODO) — a hand-rolled fake broker (real loopback TCP, no uv/amqtt dependency, always runs) withholds/
+# never-sends PUBACK on demand to prove: a withheld first ack triggers a DUP-flagged retransmit that then
+# succeeds, and a never-acked PUBLISH is retried exactly Config::max_publish_retries times before being
+# abandoned. Deterministic; Config's retry timings are tuned down for fast CI runtime (real defaults would
+# make the give-up case take ~15s).
+add_executable(mqtt_transport_retry transport/mqtt_transport_retry.cpp)
+target_link_libraries(mqtt_transport_retry PRIVATE aero::transport)
+add_test(NAME mqtt_transport_retry COMMAND mqtt_transport_retry)
+set_tests_properties(mqtt_transport_retry PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
 # Phase-7 REAL-gRPC gate (014 §6, X2): the hand-written GrpcClientTransport (its OWN HTTP/2 + gRPC framing,
 # no gRPC library linked) exchanges genuine MessageFrames with a REAL grpcio bidi server (spawned via uv)
@@ -332,6 +377,22 @@ target_link_libraries(mes_outbox PRIVATE aero::mes aero::runtime)
 add_test(NAME mes_outbox COMMAND mes_outbox)
 set_tests_properties(mes_outbox PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
+# ---- 019 slice: GET /catalog config schema + aero.output.http ---------------------------------------
+# Regression gate (015 U1): Runtime::catalog() must list every registered node/driver type_id with its
+# real field schema — this is what would have caught modbus_tcp/modbus_rtu/opcua/opcua_subscribe being
+# invisible to the Studio (see 019-Flow-Graph-Model-and-Studio-Canvas-API.md's ground-truth table).
+add_executable(catalog runtime/catalog.cpp)
+target_link_libraries(catalog PRIVATE aero::runtime)
+add_test(NAME catalog COMMAND catalog)
+set_tests_properties(catalog PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# aero.output.http end to end (best-effort HTTP egress, NOT aero-mes's durable outbox shape — see
+# egress/http_egress_actor.hpp's banner). Ephemeral-port local httplib sink, bounded polling.
+add_executable(http_egress egress/http_egress.cpp)
+target_link_libraries(http_egress PRIVATE aero::runtime aero::egress aero::nodes)
+add_test(NAME http_egress COMMAND http_egress)
+set_tests_properties(http_egress PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
 # Phase-11.1 gate (016 §2.3): the MES gateway wired into Runtime + reachable over the real REST API —
 # GET /mes/outbox is {"configured": false} until configure_mes(), then reflects a staged/retained
 # report (MES down) and a drained/delivered one (MES up, via POST /mes/outbox/drain).
@@ -356,6 +417,17 @@ add_executable(runtime_fleet_wiring runtime/runtime_fleet_wiring.cpp)
 target_link_libraries(runtime_fleet_wiring PRIVATE aero::api)
 add_test(NAME runtime_fleet_wiring COMMAND runtime_fleet_wiring)
 set_tests_properties(runtime_fleet_wiring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# Phase-8 follow-up gate (010 §10): Runtime::configure_fleet()'s optional REAL multi-node membership
+# (FleetConfig::membership) over a genuine quark::SwimMembership (021) + real loopback TCP — two real
+# Runtime instances converge to seeing each other alive, live device placement follows the real node
+# set, and killing one is detected by the survivor's real SWIM failure detector (not a crash/hang, not
+# a false "still alive" forever). Real (not virtual) SWIM clock, so this test genuinely waits on real
+# ack/suspicion timeouts — not instant, but bounded.
+add_executable(runtime_cluster_membership runtime/runtime_cluster_membership.cpp)
+target_link_libraries(runtime_cluster_membership PRIVATE aero::api)
+add_test(NAME runtime_cluster_membership COMMAND runtime_cluster_membership)
+set_tests_properties(runtime_cluster_membership PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
 # Phase-10 breadth gate (005 §2): the new compute nodes each transform correctly and malformed input is
 # handled without a crash (odd Modbus frame → Error; bad JSON → Error; CRC/mean/minmax/sum values).
@@ -449,3 +521,46 @@ target_link_libraries(opcua_driver PRIVATE aero::drivers aero::nodes aero::sdk a
   quark::quark Threads::Threads)
 add_test(NAME opcua_driver COMMAND opcua_driver)
 set_tests_properties(opcua_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M9.3: OPC-UA Subscriptions/MonitoredItems (018 §8) ------------------------------------------------
+# OpcUaSubscriptionDriver (drivers/opcua_subscription_driver.hpp): the PUSH counterpart to OpcUaDriver, a
+# real open62541 UA_Server (own fixed port 48712, distinct from opcua_driver's 48711) with a background
+# "updater" thread bumping a Counter variable proves: (1) run() connects, subscribes, and delivers
+# multiple DISTINCT DataChange notifications, decoded correctly by the same JsonParseNode poll mode uses;
+# (2) a malformed NodeId is rejected at open() with no network I/O (this driver never dials in open());
+# (3) connection loss mid-subscription is survived and reconnected (bounded backoff, 006 §8).
+add_executable(opcua_subscription_driver drivers/opcua_subscription_driver.cpp)
+target_link_libraries(opcua_subscription_driver PRIVATE aero::drivers aero::nodes aero::sdk
+  aero-thirdparty-opcua quark::quark Threads::Threads)
+add_test(NAME opcua_subscription_driver COMMAND opcua_subscription_driver)
+set_tests_properties(opcua_subscription_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M9.4/M9.5: OPC-UA security policies (018 §8) -------------------------------------------------------
+# Sign/SignAndEncrypt over a client certificate + cert-based client auth (opcua_security.hpp), proven
+# against a REAL open62541 UA_Server configured via UA_ServerConfig_setDefaultWithSecurityPolicies (own
+# fixed port 48715, distinct from every other OPC-UA test's port). M9.5 adds a session-level X.509
+# UserIdentityToken (a SEPARATE mechanism from M9.4's channel cert auth) over the same fixture. Uses
+# pre-generated, checked-in TEST-ONLY self-signed certs under drivers/certs/ (never used in production) —
+# mirrors tls_channel/native_broker_security's own AERO_TLS_TEST_CERTS_DIR convention.
+add_executable(opcua_driver_security drivers/opcua_driver_security.cpp)
+target_link_libraries(opcua_driver_security PRIVATE aero::drivers aero::nodes aero::sdk aero-thirdparty-opcua
+  aero-thirdparty-tls quark::quark Threads::Threads)
+target_compile_definitions(opcua_driver_security PRIVATE
+  AERO_OPCUA_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/drivers/certs")
+add_test(NAME opcua_driver_security COMMAND opcua_driver_security)
+set_tests_properties(opcua_driver_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ---- M9.1 PR H: Modbus RTU / serial southbound (018 §8) -----------------------------------------------
+# ModbusRtuDriver (drivers/modbus_rtu_driver.hpp): the serial counterpart to ModbusTcpDriver, over a new
+# aero::pal::serial PAL (this tree's first serial I/O of any kind). No portable hardware-free way to fake
+# a COM port exists (unlike a TCP loopback server), so the driver talks to an ISerialTransport seam
+# instead of the PAL directly; this test injects an in-memory fake transport that echoes canned RTU
+# frames (built independently in the test file, mirroring FakeModbusServer's own arm's-length approach)
+# to prove: (1) happy path read (FC03) decodes correctly and the driver's own request bytes/CRC are
+# correct; (2) a write (FC06) round-trip; (3) a Modbus exception response is a clean Error with the
+# transport left open; (4) a CRC-corrupted response is a clean Error with the transport closed
+# (reconnect-eligible); (5) modbus_crc16 itself matches the Modbus spec's own worked example.
+add_executable(modbus_rtu_driver drivers/modbus_rtu_driver.cpp)
+target_link_libraries(modbus_rtu_driver PRIVATE aero::drivers aero::nodes aero::sdk quark::quark Threads::Threads)
+add_test(NAME modbus_rtu_driver COMMAND modbus_rtu_driver)
+set_tests_properties(modbus_rtu_driver PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

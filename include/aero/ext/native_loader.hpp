@@ -227,7 +227,14 @@ register_native_extension(NodeRegistry& registry, const std::string& path) {
     const AeroExtManifest& m = (*ext)->manifest();
     for (std::size_t i = 0; i < m.node_count; ++i) {
         const std::string type_id = m.nodes[i].type_id;
-        registry.register_type(type_id, [ext = *ext, type_id](const nlohmann::json& config)
+        // Catalog descriptor (015 U1) built from the manifest's advisory category — the C ABI doesn't
+        // carry a config schema, so config_fields stays empty for native extensions (a real gap, not
+        // an oversight: schema-in-manifest is future ABI work). type_id view points at the manifest's
+        // OWN char* (library-owned, kept alive by the shared_ptr chain below), not the local `type_id`
+        // string, which would dangle past this loop iteration.
+        const NodeDescriptor desc{category_from_c(m.nodes[i].category),
+                                  std::string_view{m.nodes[i].type_id}};
+        registry.register_type(type_id, desc, [ext = *ext, type_id](const nlohmann::json& config)
                                             -> std::unique_ptr<INode> {
             auto node = ext->create_node(type_id, config);
             // NodeFactory has no error channel; deploy-time validation (flow_compiler) checks the

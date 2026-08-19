@@ -15,6 +15,8 @@
 //   GET    /ota/rollouts     → Runtime.ota_status() (016 §2.2 — real orchestration, mock drivers)
 //   POST   /ota/rollouts     → body = {"version","bytes"} → Runtime.start_rollout()
 //   GET    /broker/status    → Runtime.broker_status() (017 §1/§5 — native MQTT broker, Phase 1)
+//   GET    /catalog          → Runtime.catalog() (015 U1, 019 slice — node/driver config schema, the
+//                              single source of truth generated from the registries themselves)
 //
 // httplib (cpp-httplib) is confined to aero-api/aero-cli (R1): it never enters aero-core/aero-sdk.
 #pragma once
@@ -168,6 +170,13 @@ public:
         // NativeBroker itself doesn't expose that beyond listen_port() (see runtime.hpp broker_status()).
         svr.Get("/broker/status", [this](const httplib::Request&, httplib::Response& res) {
             res.set_content(rt_.broker_status().dump(), "application/json");
+        });
+
+        // Node/driver config schema (015 U1, 019 slice): generated straight from the registries'
+        // descriptors — see runtime.hpp's build_catalog()/Runtime::catalog(). Kills the Studio's
+        // hardcoded catalog.ts, which had drifted from what the runtime actually accepts.
+        svr.Get("/catalog", [this](const httplib::Request&, httplib::Response& res) {
+            res.set_content(rt_.catalog().dump(), "application/json");
         });
     }
 

@@ -151,7 +151,19 @@ Each phase: **Goal · Deliverables · Specs realized · Exit criteria · Quark d
 - **Exit:** a device actor migrates across nodes **fenced** (never dual-driven), recovers state,
   re-opens its driver, resumes flows — verified on a loopback cluster, then on real sockets when
   Quark lands them.
-- **Quark dep:** placement/membership/fenced-hand-off (010/021/025), **socket transport (gate)**.
+- **Status (010 §5)**: real multi-node MEMBERSHIP shipped — `Runtime::configure_fleet()`'s
+  `FleetConfig::membership` swaps `ClusterView`'s in-process test double for a real
+  `quark::SwimMembership` over real sockets (proven in `tests/runtime/runtime_cluster_membership.cpp`,
+  two real nodes converging + real failure detection). The **socket transport gate below is
+  resolved** — but this only makes placement's live INPUT (who is alive) real, not migration
+  itself. FENCED HAND-OFF ACROSS REAL NODES REMAINS UNSHIPPED: it needs the old and new node's
+  durable stores to be the SAME store, and no networked/shared store or state-transfer-over-
+  transport protocol exists in QuarkCpp or AeroEdge today — see 010 §5's own writeup for the
+  full explanation. This is the real remaining blocker for this phase's exit criteria, not
+  socket transport.
+- **Quark dep:** placement/membership/fenced-hand-off (010/021/025), socket transport (~~gate~~ —
+  resolved for membership; migration itself is blocked on a still-missing networked durable
+  store, see Status above).
 
 ### Phase 9 — Studio (web) + plugin UI + runtime-assisted discovery  *(parallel from Phase 4)*
 - **Goal:** design, configure, deploy, and monitor from the browser.
@@ -174,7 +186,12 @@ Each phase: **Goal · Deliverables · Specs realized · Exit criteria · Quark d
 - **Exit:** a `ProductionFinished` round-trips to a mock MES through the durable outbox (survives an
   MES outage); an OTA rollout canaries → commits with a forced-failure rollback; MQTT/Modbus/OPC UA
   each configurable end-to-end in the Studio and ingesting into a flow.
-- **Quark dep:** delivery/outbox (017), security/secrets (020), governance (022).
+- **Status (011 §7)**: OTA image signing is now REAL asymmetric crypto (ECDSA P-256/SHA-256 over
+  mbedTLS's `pk` layer, `aero/pal/crypto.hpp`) — no longer the keyed-FNV placeholder. The device-side
+  transfer/activate protocol remains `MockOtaDriver` (no specific device family targeted yet); trust-root
+  key custody/rotation is still open (Quark 020).
+- **Quark dep:** delivery/outbox (017), security/secrets (020 — key custody/rotation only; the signing
+  primitive itself is now real, built directly against vendored mbedTLS per 011 §7), governance (022).
 
 ## 5. Cross-cutting workstreams (run continuously, not a phase)
 

@@ -124,6 +124,10 @@ export class AeroApi {
   // Native MQTT broker observability (017 §1/§2/M2/M4).
   brokerStatus(): Promise<ApiResult> { return this.req("GET", "/broker/status"); }
 
+  // Node/driver config schema (015 U1, 019 slice) — the single source of truth catalog.ts's
+  // setCatalog() populates from. Body is a RawCatalog on success; caller checks `.ok` first.
+  fetchCatalog(): Promise<ApiResult> { return this.req("GET", "/catalog"); }
+
   // Runtime-assisted discovery (015 §5): browsing an OPC UA address space / testing an MQTT
   // connection needs the runtime + a live device — which only the edge node can reach. The browser
   // NEVER dials a device. Offline there is no connected runtime+device, so this is an honest gate,

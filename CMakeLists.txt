@@ -150,12 +150,41 @@ if(AERO_ENABLE_OPCUA)
     GIT_REPOSITORY https://github.com/open62541/open62541.git
     GIT_TAG        v1.4.11  # a real tagged v1.4.x LTS release — confirmed present via `git ls-remote
                              # --tags` against the upstream repo at the time this was pinned
+    # See cmake/patch_open62541.cmake's banner: with UA_ENABLE_ENCRYPTION=MBEDTLS (below), open62541's
+    # own unconditional install(EXPORT)/export(TARGETS) rules for the open62541 target fail CMake's
+    # generate-time export-set validation once it links this project's own vendored mbedTLS targets.
+    PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_open62541.cmake"
   )
   # Keep open62541's own build lean/quiet, mirroring the mbedTLS ENABLE_TESTING/QUARK_BUILD_TESTS
   # pattern above — force the cache vars ITS CMakeLists.txt reads BEFORE FetchContent_MakeAvailable:
-  #   UA_ENABLE_ENCRYPTION "OFF" — a STRING cache var upstream (not BOOL: "OFF" or a plugin name like
-  #     "MBEDTLS"/"OPENSSL"), already OFF by default but forced explicitly here to document the v1 scope
-  #     decision: NO security policies, no TLS/crypto coupling for this dependency.
+  #   UA_ENABLE_ENCRYPTION "MBEDTLS" — a STRING cache var upstream ("OFF" or a plugin name like
+  #     "MBEDTLS"/"OPENSSL"). M9.4 (018 §Security policies) turns this on to get Sign/SignAndEncrypt
+  #     support. open62541's own CMakeLists.txt responds by calling `find_package(MbedTLS REQUIRED)`
+  #     (see its tools/cmake/FindMbedTLS.cmake) — a MODULE-mode find script that does `find_library(...
+  #     mbedtls/mbedx509/mbedcrypto)` against the filesystem. Left alone, that would either fail (the
+  #     TLS section above's FetchContent'd mbedTLS is a build target, not yet a file on disk at configure
+  #     time) or, on a machine with a second system mbedTLS installed, silently link a SECOND, unrelated
+  #     copy — real risk: two independently-built static libs exporting the same C symbols
+  #     (mbedtls_x509_crt_parse et al) into one binary. Requires AERO_ENABLE_TLS (below) so there is
+  #     exactly one mbedTLS in this build for OPC-UA to share.
+  if(NOT AERO_ENABLE_TLS)
+    message(FATAL_ERROR "AERO_ENABLE_OPCUA's security policies (UA_ENABLE_ENCRYPTION=MBEDTLS) require "
+                         "AERO_ENABLE_TLS=ON — open62541 shares this project's single vendored mbedTLS "
+                         "build rather than fetching/linking a second, independent copy.")
+  endif()
+  # Pre-seed the exact CACHE variables tools/cmake/FindMbedTLS.cmake computes via find_path/find_library,
+  # pointing at the TLS section's already-declared mbedTLS FetchContent target names (not file paths) —
+  # CMake's target_link_libraries happily resolves a bare target name and carries its real include dirs/
+  # usage requirements along with it. Because these are pre-set as CACHE entries before
+  # FetchContent_MakeAvailable(open62541) runs, find_path/find_library each see an already-valid cached
+  # value and skip searching the filesystem entirely (standard CMake find_* behavior) — so this is the
+  # SAME mbedTLS build as aero-thirdparty-tls links above, not a duplicate. Confirmed empirically against
+  # v1.4.11 + mbedTLS v3.6.7: configures and links clean, no duplicate-symbol errors.
+  set(MBEDTLS_INCLUDE_DIRS "${mbedtls_SOURCE_DIR}/include" CACHE STRING "" FORCE)
+  set(MBEDTLS_LIBRARY mbedtls CACHE STRING "" FORCE)
+  set(MBEDX509_LIBRARY mbedx509 CACHE STRING "" FORCE)
+  set(MBEDCRYPTO_LIBRARY mbedcrypto CACHE STRING "" FORCE)
+  set(MBEDTLS_LIBRARIES mbedtls mbedx509 mbedcrypto CACHE STRING "" FORCE)
   #   UA_BUILD_EXAMPLES / UA_BUILD_TOOLS / UA_BUILD_UNIT_TESTS OFF — only the client library, never
   #     open62541's own example servers/clients, shell tools, or unit test suite as build targets (NOTE:
   #     the real upstream option is UA_BUILD_UNIT_TESTS, not "UA_BUILD_TESTING" — verified against
@@ -177,7 +206,7 @@ if(AERO_ENABLE_OPCUA)
   #     AEROEDGE_SANITIZER option is this project's single source of truth for which sanitizer a CI leg
   #     builds under; a vendored dependency silently opting itself into a DIFFERENT one is never correct
   #     here, so this is forced off unconditionally, not just for the thread leg.
-  set(UA_ENABLE_ENCRYPTION "OFF" CACHE STRING "" FORCE)
+  set(UA_ENABLE_ENCRYPTION "MBEDTLS" CACHE STRING "" FORCE)
   set(UA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(UA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   set(UA_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
@@ -275,6 +304,27 @@ endif()
 set(QUARK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(QUARK_BUILD_BENCH OFF CACHE BOOL "" FORCE)
 set(QUARK_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+# M5.1 (017 §10, cluster-link TLS): QuarkCpp's own cmake/QuarkSecurityAdapters.cmake gates its real
+# mTLS handshake (MbedtlsHandshakeEngine) + AES-128-GCM AEAD (MbedtlsAeadGcm) — ADR-040's production
+# transport-security backend — behind QUARK_WITH_MBEDTLS, off by default. Turning it on (only when
+# AERO_ENABLE_TLS is also on — cluster-link TLS is an OPTIONAL BrokerCluster feature, unlike OPC-UA's
+# hard AERO_ENABLE_TLS requirement above, so this stays a silent no-op rather than a FATAL_ERROR for a
+# build that legitimately doesn't want TLS at all) mirrors the M9.4 open62541 fix exactly: QuarkCpp's
+# own `find_package(MbedTLS CONFIG QUIET)` targets an INSTALLED package config this project's
+# FetchContent'd (never installed) mbedTLS doesn't produce, so its fallback find_path/find_library
+# calls are pre-seeded with the SAME already-declared mbedtls/mbedx509/mbedcrypto FetchContent target
+# names used above (aero-thirdparty-tls) — one shared mbedTLS build, not a second independent copy
+# (the exact duplicate-symbol hazard cmake/patch_open62541.cmake's banner documents). AeroEdge's
+# BrokerCluster (broker_cluster.hpp) is the consumer; with AERO_ENABLE_TLS off, its mTLS surface
+# compiles to the same "not compiled in" stub pattern every other optional AeroEdge security feature
+# uses (see broker_cluster_security.hpp's own AERO_TLS_ENABLED guard).
+if(AERO_ENABLE_TLS)
+  set(QUARK_WITH_MBEDTLS ON CACHE BOOL "" FORCE)
+  set(MBEDTLS_INCLUDE_DIR "${mbedtls_SOURCE_DIR}/include" CACHE PATH "" FORCE)
+  set(MBEDTLS_LIBRARY mbedtls CACHE STRING "" FORCE)
+  set(MBEDX509_LIBRARY mbedx509 CACHE STRING "" FORCE)
+  set(MBEDCRYPTO_LIBRARY mbedcrypto CACHE STRING "" FORCE)
+endif()
 add_subdirectory("${QUARK_DIR}" "${CMAKE_BINARY_DIR}/quark")
 
 # ---- AeroEdge libraries (header-first, mirroring Quark's posture) ----------
@@ -314,12 +364,24 @@ target_include_directories(aero-mes INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_link_libraries(aero-mes INTERFACE aero-core aero-sdk aero-thirdparty-httplib aero-thirdparty-json quark::quark)
 add_library(aero::mes ALIAS aero-mes)
 
+# aero-egress — generic HTTP egress (019 slice): the HttpEgressActor delivery lane for
+# `aero.output.http` (nodes/http_output_node.hpp stays in aero-nodes, HTTP-free — R1). Deliberately NOT
+# aero-mes's durable-outbox shape (see egress/http_egress_actor.hpp's banner) — best-effort, no Quark 012
+# store dependency, just httplib + the actor.
+add_library(aero-egress INTERFACE)
+target_include_directories(aero-egress INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(aero-egress INTERFACE aero-core aero-sdk aero-thirdparty-httplib aero-thirdparty-json quark::quark)
+add_library(aero::egress ALIAS aero-egress)
+
 # aero-ota — Firmware OTA (011): the per-device state machine + mock OTA driver (ota.hpp) and the
 # FleetActor staged-rollout policy (fleet.hpp). Durable OTA progress reuses aero-core's DurableState over
 # the Quark 012 seam; the device write goes through the fenced IDriver::write (aero-sdk). No httplib.
+# aero-thirdparty-tls: ota.hpp's real image-signature verify/sign (O1) is aero/pal/crypto.hpp's ECDSA-
+# P256/SHA-256 over mbedTLS's `pk` layer — the SAME vendored mbedTLS aero-drivers/aero-broker already
+# link (one build, not a duplicate); AERO_TLS_ENABLED off compiles crypto.hpp's honest stub instead.
 add_library(aero-ota INTERFACE)
 target_include_directories(aero-ota INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-ota INTERFACE aero-core aero-sdk quark::quark)
+target_link_libraries(aero-ota INTERFACE aero-core aero-sdk quark::quark aero-thirdparty-tls)
 add_library(aero::ota ALIAS aero-ota)
 
 # aero-ext — the HOST side of the extension model (008): the Native `.so` loader (dlopen + INode
@@ -333,10 +395,15 @@ add_library(aero::ext ALIAS aero-ext)
 # M9b adds aero-thirdparty-opcua: OpcUaDriver (drivers/opcua_driver.hpp) needs the real open62541-backed
 # implementation (AERO_OPCUA_ENABLED + the open62541 lib) transitively wherever this library is linked
 # into a real binary (aero-runtime -> aero-runtime-daemon, and this library's own tests) — same reasoning
-# as aero-broker linking aero-thirdparty-tls for native_broker.hpp's TLS listener (M5).
+# as aero-broker linking aero-thirdparty-tls for native_broker.hpp's TLS listener (M5). M9.4 adds
+# aero-thirdparty-tls itself: opcua_security.hpp's apply_security_config() calls
+# aero::pal::tls::detail::ensure_threading_registered() (see its own banner) before any mbedTLS-touching
+# open62541 call — the SAME mbedTLS threading registration native_broker.hpp's TLS listener needs, not a
+# second one; this project's OPC-UA security build requires AERO_ENABLE_TLS=ON already (root
+# CMakeLists.txt's UA_ENABLE_ENCRYPTION=MBEDTLS block), so this link is never a no-op surprise.
 add_library(aero-drivers INTERFACE)
 target_include_directories(aero-drivers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(aero-drivers INTERFACE aero-sdk aero-thirdparty-opcua)
+target_link_libraries(aero-drivers INTERFACE aero-sdk aero-thirdparty-opcua aero-thirdparty-tls)
 add_library(aero::drivers ALIAS aero-drivers)
 
 # aero-transport — inter-actor transport ADAPTERS behind Quark's `Transport` seam (014, X1). The FIFO/
@@ -366,11 +433,17 @@ add_library(aero::transport ALIAS aero-transport)
 # rabbitmq-c-backed implementation (AERO_RABBITMQ_ENABLED + the rabbitmq-c static lib), not the "not
 # compiled in" stub, whenever this library is actually linked into a binary — same reasoning as the
 # TLS listener above.
+# M5.1 adds quark::security_mbedtls: BrokerCluster's optional mTLS cluster-link (broker_cluster.hpp,
+# 017 M5.1) needs QuarkCpp's real MbedtlsHandshakeEngine/MbedtlsAeadGcm adapter, enabled above via
+# QUARK_WITH_MBEDTLS — a target that only exists when AERO_ENABLE_TLS turned it on, hence the guard.
 add_library(aero-broker INTERFACE)
 target_include_directories(aero-broker INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-broker INTERFACE
   aero-transport aero-nodes aero-thirdparty-httplib aero-thirdparty-json aero-thirdparty-tls
   aero-thirdparty-rabbitmq quark::quark Threads::Threads)
+if(TARGET quark::security_mbedtls)
+  target_link_libraries(aero-broker INTERFACE quark::security_mbedtls)
+endif()
 add_library(aero::broker ALIAS aero-broker)
 
 # aero-cluster — the device-affinity placement POLICY + multi-node deployment view + fenced-migration
@@ -392,7 +465,7 @@ add_library(aero::schema ALIAS aero-schema)
 add_library(aero-runtime INTERFACE)
 target_include_directories(aero-runtime INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(aero-runtime INTERFACE
-  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-ota aero-cluster aero-schema aero-broker
+  aero-core aero-nodes aero-drivers aero-ext aero-mes aero-egress aero-ota aero-cluster aero-schema aero-broker
   quark::quark aero-thirdparty-json Threads::Threads)
 add_library(aero::runtime ALIAS aero-runtime)
 

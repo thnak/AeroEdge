@@ -1,9 +1,16 @@
-// The node/driver catalog — the Studio-side reflection of each plugin's config schema (015 U1). In
-// the full design the runtime serves this (a future GET /catalog so the Studio can't drift from what
-// the runtime accepts); Phase-9 hardcodes the built-in set registered in
-// include/aero/runtime/runtime.hpp. Each entry drives the Tier-1 schema-driven config form (015 §3).
+// The node/driver catalog — the Studio-side reflection of each plugin's config schema (015 U1). Was
+// hardcoded here and had drifted from what the runtime actually accepts (4 of 5 real drivers were
+// invisible; several nodes were missing fields — see 019-Flow-Graph-Model-and-Studio-Canvas-API.md's
+// ground-truth table). Now sourced from `GET /catalog` (api.ts's fetchCatalog) via setCatalog() —
+// call it once at app start (App.tsx) before anything reads catalogEntry/sourceIds/outputIds.
+//
+// The server schema doesn't carry a human display label per node/driver type (only per config field —
+// that IS on the wire, see FieldSpec below) — labels shown in the palette/dropdowns are derived
+// client-side from the type_id (humanize()). Every other call site (ConfigForm.tsx, FlowCanvasNode.tsx,
+// FlowDesigner.tsx, FlowsPage.tsx, application.ts's tests) keeps calling catalogEntry/sourceIds/
+// outputIds/validateConfig exactly as before — only the data backing them changed.
 
-export type FieldType = "number" | "int" | "string" | "boolean";
+export type FieldType = "number" | "int" | "string" | "boolean" | "enum" | "string_array" | "object";
 
 export interface FieldSpec {
   key: string;
@@ -13,8 +20,10 @@ export interface FieldSpec {
   default?: number | string | boolean;
   min?: number;
   help?: string;
-  // A field whose editor is a Tier-2 custom micro-frontend rather than a plain input (015 §3).
-  tier2?: "modbus-register-map";
+  // A field whose editor is a Tier-2 custom micro-frontend rather than a plain input (015 §3) — e.g.
+  // "modbus-register-map", "opcua-security", "http-headers". Free-form string from the server.
+  tier2?: string;
+  options?: string[];  // Enum only
 }
 
 export type Category = "Source" | "Transform" | "Rule" | "Output";
@@ -24,49 +33,70 @@ export interface CatalogEntry {
   label: string;
   category: Category;
   fields: FieldSpec[];
+  // 020 §4.3: true for a node type that must be the flow's LAST step (a Cap shape — nothing may follow
+  // it — vs. the default Stack shape). Optional/undefined for driver entries, which don't carry it.
+  terminal?: boolean;
 }
 
-export const NODE_CATALOG: CatalogEntry[] = [
-  { type_id: "aero.source.decode", label: "Decode (scalar)", category: "Source", fields: [] },
-  { type_id: "aero.source.json", label: "JSON Parse", category: "Source", fields: [] },
-  { type_id: "aero.source.modbus", label: "Modbus Decode", category: "Source",
-    fields: [{ key: "map", label: "Register map", type: "string", tier2: "modbus-register-map",
-               help: "Rich editor: address / type / endianness / scale per register." }] },
-  { type_id: "aero.transform.scale", label: "Scale", category: "Transform",
-    fields: [{ key: "factor", label: "Factor", type: "number", required: true, default: 1,
-               help: "Multiply every tag by this factor." }] },
-  { type_id: "aero.transform.moving_average", label: "Moving Average", category: "Transform",
-    fields: [{ key: "window", label: "Window (samples)", type: "int", required: true, default: 8, min: 1 }] },
-  { type_id: "aero.transform.mean", label: "Mean", category: "Transform", fields: [] },
-  { type_id: "aero.transform.minmax", label: "Min/Max", category: "Transform", fields: [] },
-  { type_id: "aero.transform.sum", label: "Sum (tags)", category: "Transform", fields: [] },
-  { type_id: "aero.transform.crc", label: "CRC-16", category: "Transform", fields: [] },
-  { type_id: "aero.rule.expr", label: "Expression Rule", category: "Rule",
-    fields: [{ key: "expr", label: "Expression", type: "string", required: true, default: "raw > 100",
-               help: "Non-Turing DSL: compare / boolean / arithmetic over tags. On match: alarm + stop." }] },
-  { type_id: "aero.output.sum", label: "Sum Output", category: "Output", fields: [] },
-  { type_id: "aero.output.mes", label: "MES Report", category: "Output",
-    fields: [{ key: "line", label: "Line/device id", type: "string", required: true, default: "line-1" }] },
-];
+export interface DriverCatalogEntry extends CatalogEntry {
+  writable: boolean;
+  pollDriven: boolean;
+}
 
-export const DRIVER_CATALOG: CatalogEntry[] = [
-  { type_id: "aero.driver.generator", label: "Generator (synthetic)", category: "Source",
-    fields: [{ key: "frame_count", label: "Frame count", type: "int", default: 100, min: 0,
-               help: "0 = run until stopped." }] },
-];
+export interface Catalog {
+  nodes: CatalogEntry[];
+  drivers: DriverCatalogEntry[];
+}
 
-const byId = new Map<string, CatalogEntry>();
-for (const e of [...NODE_CATALOG, ...DRIVER_CATALOG]) byId.set(e.type_id, e);
+// The raw `GET /catalog` response shape (runtime.hpp's build_catalog()).
+export interface RawCatalog {
+  nodes: { type_id: string; category: Category; terminal?: boolean; fields: FieldSpec[] }[];
+  drivers: { type_id: string; writable: boolean; poll_driven: boolean; fields: FieldSpec[] }[];
+}
+
+function humanize(type_id: string): string {
+  const last = type_id.split(".").pop() ?? type_id;
+  return last.split("_").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
+}
+
+let current: Catalog = { nodes: [], drivers: [] };
+
+// Populate the catalog from a `GET /catalog` response (App.tsx calls this once at startup, and tests
+// call it with a fixture). Replaces whatever was there before — the server is always the whole truth.
+// Defensive against a malformed/unexpected body (e.g. a test's stubbed fetch returning an unrelated
+// JSON shape for every URL, including /catalog): ignored, leaving whatever catalog was already loaded
+// in place, rather than wiping it — a malformed response is not evidence the real catalog is empty.
+export function setCatalog(raw: RawCatalog): void {
+  if (!Array.isArray(raw?.nodes) || !Array.isArray(raw?.drivers)) {
+    return;
+  }
+  current = {
+    nodes: raw.nodes.map((n) => ({ ...n, label: humanize(n.type_id) })),
+    drivers: raw.drivers.map((d) => ({
+      type_id: d.type_id,
+      label: humanize(d.type_id),
+      category: "Source",  // drivers aren't node-categorized server-side; palette groups them separately
+      fields: d.fields,
+      writable: d.writable,
+      pollDriven: d.poll_driven,
+    })),
+  };
+}
+
+export function getCatalog(): Catalog {
+  return current;
+}
 
 export function catalogEntry(type_id: string): CatalogEntry | undefined {
-  return byId.get(type_id);
+  return current.nodes.find((e) => e.type_id === type_id) ??
+         current.drivers.find((e) => e.type_id === type_id);
 }
 
 export function sourceIds(): Set<string> {
-  return new Set(NODE_CATALOG.filter((e) => e.category === "Source").map((e) => e.type_id));
+  return new Set(current.nodes.filter((e) => e.category === "Source").map((e) => e.type_id));
 }
 export function outputIds(): Set<string> {
-  return new Set(NODE_CATALOG.filter((e) => e.category === "Output").map((e) => e.type_id));
+  return new Set(current.nodes.filter((e) => e.category === "Output").map((e) => e.type_id));
 }
 
 // Validate a config object against a catalog entry's field specs — the Tier-1 client-side check

@@ -1,6 +1,9 @@
 :root {
   --bg:#0f1419; --panel:#1a212b; --line:#2b3542; --fg:#e6edf3; --muted:#8b98a5; --accent:#4c9aff;
   --danger:#e5534b; --success:#3fb950; --warning:#d29922;
+  /* Node-category accent colors (019 §4 jigsaw slice) — reused for the SVG card stroke, the badge
+     tint, and the generic connect handle, so the shape/color identity is the same signal everywhere. */
+  --cat-source:#4c9aff; --cat-transform:#b388ff; --cat-rule:#d29922; --cat-output:#3fb950;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; }
@@ -59,19 +62,87 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #04101f; font-weight: 600; }
 .btn-danger { background: transparent; border-color: var(--danger); color: var(--danger); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
-/* ---- Flow node-graph canvas (Phase 11.8, 016 §5.2): @xyflow/react over the same linear array ---- */
-.flow-canvas { height: 360px; border: 1px solid var(--line); border-radius: 6px; background: #0d141b; }
+/* ---- Flow node-graph canvas (Phase 11.8, 016 §5.2; real editing 019 §4): @xyflow/react, drag +
+   connect enabled — the canvas IS the editor now, not just a presentation of the linear array. */
+.flow-canvas { height: 480px; border: 1px solid var(--line); border-radius: 6px; background: #0d141b; }
 .flow-canvas .react-flow__edge-path { stroke: var(--accent); stroke-width: 2; opacity: .6; }
-/* Handles are non-functional here (nodesConnectable=false, 016 S2 — order in the array IS the DAG,
-   not a user-drawn connection) — visible only as two dots nearly touching at this card spacing,
-   easily misread as a stray glyph. Hide them; the edge line alone is the connector. */
-.flow-canvas .react-flow__handle { opacity: 0; pointer-events: none; }
-.flow-node-card {
-  width: 190px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
-  background: var(--panel); cursor: pointer;
+.flow-canvas .react-flow__edge-text { fill: var(--muted); font-size: 10px; }
+.flow-canvas .react-flow__edge-textbg { fill: #0d141b; }
+/* Handles are real connectors now (nodesConnectable=true, 019 §4) — styled as small visible dots,
+   tinted per node category (matching the jigsaw card's own stroke color below). */
+.flow-canvas .react-flow__handle { width: 8px; height: 8px; background: var(--accent); border: 1px solid #0d141b; opacity: 1; }
+.flow-canvas .cat-source .react-flow__handle { background: var(--cat-source); }
+.flow-canvas .cat-transform .react-flow__handle { background: var(--cat-transform); }
+.flow-canvas .cat-rule .react-flow__handle { background: var(--cat-rule); }
+.flow-canvas .cat-output .react-flow__handle { background: var(--cat-output); }
+.flow-canvas .react-flow__handle.branch-handle.branch-true { background: #4caf50; }
+.flow-canvas .react-flow__handle.branch-handle.branch-false { background: var(--danger); }
+.flow-canvas .branch-label {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  font-size: 10px; color: var(--muted); white-space: nowrap; pointer-events: none;
 }
-.flow-node-card.sel { border-color: var(--accent); background: #12233b; }
+/* A "stub"/rejoin edge (020 §4.2's ANSI off-page-connector case: a branch's last cavity member
+   reaching a node shared with something else) is dashed, visually distinct from a normal connection —
+   the physical-snap cavities already removed the line for the common (no-rejoin) case. */
+.flow-canvas .react-flow__edge.edge-stub .react-flow__edge-path { stroke-dasharray: 4 4; opacity: .8; }
+
+/* ---- Switch C-block (020 §4.2): aero.flow.switch renders as one big card with two nested "true"/
+   "false" cavities drawn INSIDE it, once a flow is in graph mode (SwitchBlockNode.tsx) — branch members
+   are ordinary jigsaw cards FlowDesigner.tsx positions to visually sit inside those boxes (no react-flow
+   parentId/extent nesting; see switchCavityLayout.ts's own note on why). ---- */
+.switch-block { position: relative; cursor: pointer; }
+/* A THICKER stroke than the plain jigsaw cards (1.5px) — at the switch-block's much larger size, the
+   same stroke width read as "a generic bordered rectangle" instead of a deliberate puzzle-piece block;
+   this (plus the header title-bar band below) is what keeps its jigsaw identity legible at this scale. */
+.switch-block .jigsaw-shape path { fill: var(--panel); stroke: var(--cat-rule); stroke-width: 2.5; }
+.switch-block.sel .jigsaw-shape path { fill: #12233b; stroke: var(--accent); stroke-width: 3; }
+.switch-block-header {
+  position: relative; z-index: 1; padding: 10px 14px;
+  background: rgba(210, 153, 34, .12); border-bottom: 1px solid rgba(210, 153, 34, .35);
+}
+.switch-block-header .badge { color: var(--cat-rule); }
+.switch-block-header .node-label { font-size: 15px; }
+.switch-expr {
+  font-family: monospace; font-size: 11px; color: var(--fg); background: #0d141b;
+  border-radius: 4px; padding: 2px 6px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Each cavity gets a solid colored LABEL BANNER across its own top edge (not just a small corner
+   caption) so "this box is the true/false branch" reads at a glance — the visual equivalent of the
+   design doc's "├─── true ─────" ASCII divider line. */
+.cavity {
+  position: absolute; z-index: 0; border: 1.5px dashed var(--line); border-radius: 6px;
+  background: rgba(0, 0, 0, .2); pointer-events: none; /* the cards inside remain interactive, not this box */
+}
+.cavity-true { border-color: rgba(76, 175, 80, .5); }
+.cavity-false { border-color: rgba(229, 83, 75, .5); }
+.cavity-label {
+  position: absolute; top: 0; left: 0; right: 0; padding: 3px 8px; font-size: 10px;
+  text-transform: uppercase; letter-spacing: .06em; font-weight: 600; border-radius: 5px 5px 0 0;
+}
+.cavity-true .cavity-label { background: rgba(76, 175, 80, .2); color: #4caf50; }
+.cavity-false .cavity-label { background: rgba(229, 83, 75, .2); color: var(--danger); }
+
+/* ---- Jigsaw/puzzle-piece node shape (019 §4 follow-up, jigsawPath.ts): the card boundary is an SVG
+   path (fill/stroke) instead of a div border, sized to a fixed box so the notch/tab geometry (which
+   assumes known width/height) stays correct. Content overlays the SVG as a transparent layer. ---- */
+/* height = FlowCanvasNode.tsx's CARD_VISUAL_HEIGHT (CARD_HEIGHT + DEFAULT_LOBE_DEPTH) — the box must
+   be tall enough to hold the bottom tab, which protrudes past the "logical" 140px card, or SVG's
+   default overflow:hidden clips it (found via the live smoke test). */
+.flow-node-card { position: relative; width: 190px; height: 149px; padding: 14px 12px 10px; cursor: pointer; }
+.jigsaw-shape { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.jigsaw-shape path { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
+.flow-node-card.cat-source .jigsaw-shape path { stroke: var(--cat-source); }
+.flow-node-card.cat-transform .jigsaw-shape path { stroke: var(--cat-transform); }
+.flow-node-card.cat-rule .jigsaw-shape path { stroke: var(--cat-rule); }
+.flow-node-card.cat-output .jigsaw-shape path { stroke: var(--cat-output); }
+.flow-node-card.sel .jigsaw-shape path { fill: #12233b; stroke: var(--accent); stroke-width: 2; }
+.node-content { position: relative; z-index: 1; }
 .badge { font-size: 11px; background: #26303c; padding: 1px 6px; border-radius: 4px; color: var(--muted); }
+.flow-node-card.cat-source .badge { color: var(--cat-source); }
+.flow-node-card.cat-transform .badge { color: var(--cat-transform); }
+.flow-node-card.cat-rule .badge { color: var(--cat-rule); }
+.flow-node-card.cat-output .badge { color: var(--cat-output); }
 .node-id { font-size: 11px; color: var(--muted); font-family: monospace; }
 .row-actions { display: flex; gap: 4px; margin-top: 6px; }
 .row-actions .btn { margin-left: 0; }

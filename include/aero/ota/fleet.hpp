@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "aero/ota/ota.hpp"
@@ -54,7 +55,7 @@ public:
     // Run the rollout wave-by-wave (011 §4). Stops + PAUSES at the first wave that misses the threshold
     // (O5) — later waves are NOT started, so their devices keep their current firmware. A fully-passing
     // rollout ends Completed. Returns the per-wave results for observability (011 §4).
-    std::vector<WaveResult> run(const OtaImage& image, std::uint64_t trust_key) {
+    std::vector<WaveResult> run(const OtaImage& image, std::string_view trust_root_public_key_pem) {
         state_ = RolloutState::Running;
         updated_ = 0;
         rolled_back_ = 0;
@@ -71,7 +72,7 @@ public:
             if (offset >= n) break;
             const std::size_t count = std::min(w.count, n - offset);
             if (count == 0) continue;
-            WaveResult wr = run_wave(w.name, offset, count, image, trust_key);
+            WaveResult wr = run_wave(w.name, offset, count, image, trust_root_public_key_pem);
             results.push_back(wr);
             offset += count;
             if (!wr.passed) {
@@ -90,7 +91,7 @@ public:
 
 private:
     WaveResult run_wave(const char* name, std::size_t offset, std::size_t count, const OtaImage& image,
-                        std::uint64_t trust_key) {
+                        std::string_view trust_root_public_key_pem) {
         WaveResult wr;
         wr.name = name;
         wr.attempted = count;
@@ -101,7 +102,7 @@ private:
                 FleetDevice& d = devices_[offset + done + k];
                 // Each device gets its own durable OTA progress keyed by index (fenced, single-driver).
                 const quark::ActorId id{quark::TypeKey{0x0DA0}, static_cast<std::uint32_t>(offset + done + k)};
-                const OtaOutcome oc = run_ota(*d.driver, image, trust_key, store_, id);
+                const OtaOutcome oc = run_ota(*d.driver, image, trust_root_public_key_pem, store_, id);
                 if (oc.result == OtaResult::Committed) { ++wr.succeeded; ++updated_; }
                 else if (oc.result == OtaResult::RolledBack) { ++rolled_back_; }
             }

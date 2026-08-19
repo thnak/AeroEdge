@@ -27,11 +27,25 @@ using quark::ActorId;
 using quark::InMemoryStore;
 using quark::TypeKey;
 
-static constexpr std::uint64_t kTrustKey = 0xA1B2C3D4ULL;
+// TEST-ONLY EC P-256 keypair (never used in production — same convention as every other checked-in
+// *_TEST_CERTS_DIR material in this tree). Generated with:
+//   openssl ecparam -name prime256v1 -genkey -noout -out signing_key.pem
+//   openssl ec -in signing_key.pem -pubout -out public_key.pem
+static const std::string kSigningKeyPem =
+    "-----BEGIN EC PRIVATE KEY-----\n"
+    "MHcCAQEEIOI8Hgmq+AGZP7mjSfqsxVBRsXuC/ffSUOzWnaSYOj9coAoGCCqGSM49\n"
+    "AwEHoUQDQgAEQVB6J9oo1Z+/PPaYwJuwXSUmrZv5+U21d34+EsXvO9IyOx0sTSqv\n"
+    "XyET1vSUqgc71FfeYkXkVbum6q9pUDzoMg==\n"
+    "-----END EC PRIVATE KEY-----\n";
+static const std::string kTrustRootPem =
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQVB6J9oo1Z+/PPaYwJuwXSUmrZv5\n"
+    "+U21d34+EsXvO9IyOx0sTSqvXyET1vSUqgc71FfeYkXkVbum6q9pUDzoMg==\n"
+    "-----END PUBLIC KEY-----\n";
 
 static OtaImage good_image() {
     OtaImage img{"2.0", "firmware-payload-v2", ""};
-    img.signature = sign_image(img, kTrustKey);  // signed against the trust root
+    img.signature = sign_image(img, kSigningKeyPem);  // real ECDSA-P256/SHA-256 signature
     return img;
 }
 
@@ -42,7 +56,7 @@ int main() {
     {
         InMemoryStore store;
         MockOtaDriver dev("1.0");
-        const auto oc = run_ota(dev, good_image(), kTrustKey, store, ActorId{TypeKey{0x07A1}, 1});
+        const auto oc = run_ota(dev, good_image(), kTrustRootPem, store, ActorId{TypeKey{0x07A1}, 1});
         const bool pass = oc.result == OtaResult::Committed && oc.final_version == "2.0" &&
                           dev.current_version() == "2.0" && oc.reached == OtaPhase::Committed;
         ok &= pass;
@@ -55,7 +69,7 @@ int main() {
         InMemoryStore store;
         MockOtaDriver dev("1.0");
         dev.set_force_health_fail(true);  // activation "succeeds" but the device fails its health probe
-        const auto oc = run_ota(dev, good_image(), kTrustKey, store, ActorId{TypeKey{0x07A2}, 1});
+        const auto oc = run_ota(dev, good_image(), kTrustRootPem, store, ActorId{TypeKey{0x07A2}, 1});
         const bool pass = oc.result == OtaResult::RolledBack && dev.current_version() == "1.0" &&
                           oc.rollback_target == "1.0" && oc.reached == OtaPhase::RolledBack;
         ok &= pass;
@@ -68,7 +82,7 @@ int main() {
         InMemoryStore store;
         MockOtaDriver dev("1.0");
         OtaImage unsigned_img{"2.0", "firmware-payload-v2", ""};  // no signature
-        const auto oc = run_ota(dev, unsigned_img, kTrustKey, store, ActorId{TypeKey{0x07A3}, 1});
+        const auto oc = run_ota(dev, unsigned_img, kTrustRootPem, store, ActorId{TypeKey{0x07A3}, 1});
         const bool pass = oc.result == OtaResult::Rejected && dev.current_version() == "1.0" &&
                           dev.device_staged_hash() == 0 && oc.reached == OtaPhase::Rejected;
         ok &= pass;
@@ -80,7 +94,7 @@ int main() {
         MockOtaDriver dev("1.0");
         OtaImage img = good_image();
         img.bytes = "TAMPERED-payload";  // content changed but signature kept → verify must fail
-        const auto oc = run_ota(dev, img, kTrustKey, store, ActorId{TypeKey{0x07A4}, 1});
+        const auto oc = run_ota(dev, img, kTrustRootPem, store, ActorId{TypeKey{0x07A4}, 1});
         const bool pass = oc.result == OtaResult::Rejected && dev.current_version() == "1.0" &&
                           dev.device_staged_hash() == 0;
         ok &= pass;
@@ -105,7 +119,7 @@ int main() {
         }
         dev.ota_finish_transfer("2.0");
         dev.ota_activate();  // device is now on 2.0, mid-update, awaiting the health gate
-        const auto oc = resume_ota(dev, kTrustKey, store, id);
+        const auto oc = resume_ota(dev, kTrustRootPem, store, id);
         const bool pass = oc.result == OtaResult::Committed && dev.current_version() == "2.0";
         ok &= pass;
         std::printf("[act4] resume Activated->Committed, version=%s %s\n", dev.current_version().c_str(),
@@ -119,7 +133,7 @@ int main() {
         FleetActor fleet(/*threshold*/ 1.0, /*canary*/ 1, /*staged*/ 2, /*rate_limit*/ 2);
         fleet.add_device("d0", d0); fleet.add_device("d1", d1); fleet.add_device("d2", d2);
         fleet.add_device("d3", d3); fleet.add_device("d4", d4);
-        const auto waves = fleet.run(good_image(), kTrustKey);
+        const auto waves = fleet.run(good_image(), kTrustRootPem);
         const bool pass = fleet.state() == RolloutState::Completed && fleet.devices_updated() == 5 &&
                           d0.current_version() == "2.0" && d4.current_version() == "2.0" &&
                           waves.size() == 3;
@@ -135,7 +149,7 @@ int main() {
         FleetActor fleet(/*threshold*/ 1.0, /*canary*/ 1, /*staged*/ 2, /*rate_limit*/ 2);
         fleet.add_device("d0", d0); fleet.add_device("d1", d1); fleet.add_device("d2", d2);
         fleet.add_device("d3", d3); fleet.add_device("d4", d4);
-        const auto waves = fleet.run(good_image(), kTrustKey);
+        const auto waves = fleet.run(good_image(), kTrustRootPem);
         const bool pass = fleet.state() == RolloutState::Paused && fleet.devices_updated() == 0 &&
                           fleet.devices_rolled_back() == 1 && waves.size() == 1 && !waves[0].passed &&
                           d0.current_version() == "1.0" && d1.current_version() == "1.0" &&

@@ -1,13 +1,18 @@
 // AeroEdge cluster — the minimal multi-node DEPLOYMENT VIEW (spec 010 §2). THIN over Quark (R0): the
-// live node set is Quark's `InProcessMembership` (Phase-7, the 021 SWIM seam's test double), capability
-// annotation is Quark's `CapabilityView` (025). AeroEdge adds ONLY the deployment-shaped wrapper +
-// `place_actors`, which spreads a set of device actors across eligible nodes via the affinity policy
-// (placement.hpp). NO membership protocol, NO gossip, NO hash ring live here (010 §4).
+// live node set is Quark's `InProcessMembership` (Phase-7, the 021 SWIM seam's test double) BY DEFAULT,
+// capability annotation is Quark's `CapabilityView` (025). AeroEdge adds ONLY the deployment-shaped
+// wrapper + `place_actors`, which spreads a set of device actors across eligible nodes via the affinity
+// policy (placement.hpp). NO membership protocol, NO gossip, NO hash ring live here (010 §4).
 //
-// GATE (honest, R5). This is IN-PROCESS / loopback only: `InProcessMembership` is a deterministic test
-// double, not a failure detector, and capabilities are supplied directly rather than gossiped in a
-// SWIM join payload. Real multi-process membership + capability wire-gossip is Quark 021/010 (see the
-// seam notes in membership.hpp / capabilities.hpp). AeroEdge does not fake that boundary.
+// Phase-8 follow-up (010 §5): `ClusterView` can now ALSO be backed by a real `quark::SwimMembership`
+// (021, a genuine SWIM failure detector over a real Transport, shipped upstream since this banner was
+// first written) — pass a live `quark::Membership&` to the second constructor below instead of letting
+// ClusterView build its own in-process one. This makes the ALIVE/DEAD node set real; it does NOT make
+// capability annotation real (that stays config-declared here, same as the single-node case — see
+// runtime.hpp's `configure_fleet()`), and it does NOT provide cross-node actor state hand-off/migration
+// (fenced migration, 010 §3, still needs a shared/networked durable store neither Quark nor AeroEdge
+// ships today — see 010 §5's own writeup). This is OBSERVABILITY: an honest live view of who is
+// actually reachable, nothing more.
 #pragma once
 
 #include <cstdint>
@@ -21,7 +26,7 @@
 
 #include "quark/core/capabilities.hpp"   // NodeCapabilities, CapabilityView, make_capability_view (025)
 #include "quark/core/ids.hpp"            // ActorId, NodeId
-#include "quark/core/membership.hpp"     // InProcessMembership, MembershipView (021 seam / Phase-7)
+#include "quark/core/membership.hpp"     // Membership, InProcessMembership, MembershipView (021 seam)
 
 namespace aero::cluster {
 
@@ -54,14 +59,29 @@ struct PlacementPlan {
 };
 
 // A minimal multi-node deployment view (010 §2). Owns the node specs and publishes a Quark
-// `CapabilityView` (the annotated membership placement reads). The membership seam here is Quark's
-// `InProcessMembership`; a real deployment swaps it for `SwimMembership` (021) behind the same seam.
+// `CapabilityView` (the annotated membership placement reads).
+//
+// TWO membership modes, chosen by which constructor is used:
+//   - Default (single-arg): builds its own `quark::InProcessMembership` — a deterministic test double,
+//     not a failure detector (Phase-7's original shape, still the right choice for offline
+//     policy tests like tests/cluster/placement_affinity.cpp/cluster_place.cpp).
+//   - Live (two-arg): wraps a CALLER-OWNED, already-constructed `quark::Membership&` — in production
+//     this is a real `quark::SwimMembership` (021) ticking on its own thread elsewhere (see
+//     runtime.hpp's `configure_fleet()`). ClusterView does not own or tick it; call `refresh()`
+//     periodically to pull whatever `live_membership.view()` currently reports. `live_membership` must
+//     outlive this ClusterView.
 class ClusterView {
 public:
     explicit ClusterView(std::vector<NodeSpec> nodes)
         : nodes_(std::move(nodes)),
-          membership_(self_id(nodes_), node_ids(nodes_)) {
-        rebuild_view();
+          owned_membership_(std::make_unique<quark::InProcessMembership>(self_id(nodes_), node_ids(nodes_))),
+          membership_(owned_membership_.get()) {
+        refresh();
+    }
+
+    ClusterView(std::vector<NodeSpec> nodes, quark::Membership& live_membership)
+        : nodes_(std::move(nodes)), membership_(&live_membership) {
+        refresh();
     }
 
     [[nodiscard]] const quark::CapabilityView& capabilities() const noexcept { return view_; }
@@ -71,6 +91,19 @@ public:
     // Place ONE device actor via the affinity policy (placement.hpp): filter to eligible, then Quark HRW.
     [[nodiscard]] PlacementResult place(quark::ActorId id, const PlacementRequirement& req) const {
         return aero::cluster::place(id, req, view_);
+    }
+
+    // Re-pulls the underlying membership's CURRENT snapshot into a fresh CapabilityView — a no-op for
+    // the offline/InProcessMembership mode (it never changes after construction here), the actual point
+    // for the live-SwimMembership mode: the caller's own tick loop calls this after each tick() (or on
+    // whatever cadence it prefers) so `membership()`/`place()` reflect real, current aliveness. NodeSpec
+    // capabilities themselves stay config-declared/static either way (see this file's own banner).
+    void refresh() {
+        // Annotate the membership's live snapshot with the per-node capability map (025). The map is
+        // keyed by NodeId::value, exactly as CapabilityView expects (capabilities.hpp).
+        auto caps = std::make_shared<quark::CapabilityView::CapMap>();
+        for (const auto& n : nodes_) caps->emplace(n.id.value, n.caps);
+        view_ = quark::CapabilityView{membership_->view(), std::move(caps)};
     }
 
 private:
@@ -83,16 +116,10 @@ private:
         for (const auto& n : ns) ids.push_back(n.id);
         return ids;
     }
-    void rebuild_view() {
-        // Annotate Quark's live membership snapshot with the per-node capability map (025). The map is
-        // keyed by NodeId::value, exactly as CapabilityView expects (capabilities.hpp).
-        auto caps = std::make_shared<quark::CapabilityView::CapMap>();
-        for (const auto& n : nodes_) caps->emplace(n.id.value, n.caps);
-        view_ = quark::CapabilityView{membership_.view(), std::move(caps)};
-    }
 
     std::vector<NodeSpec> nodes_;
-    quark::InProcessMembership membership_;  // Quark's 021 test double (Phase-7) — not a failure detector
+    std::unique_ptr<quark::InProcessMembership> owned_membership_;  // set only by the offline constructor
+    quark::Membership* membership_;  // either owned_membership_.get() or the caller's live_membership
     quark::CapabilityView view_;
 };
 

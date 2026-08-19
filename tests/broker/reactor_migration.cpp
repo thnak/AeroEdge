@@ -174,21 +174,37 @@ public:
     // as opposed to the fan-out path (already non-blocking even before that fix).
     [[nodiscard]] bool ping_no_wait() { return mqtt::write_packet(fd_, std::byte{0xC0}, {}); }
 
-    // Writes a DISCONNECT and closes the fd immediately after, with no pause in between — races the
+    // Writes a DISCONNECT and triggers the FIN immediately after, with no pause in between — races the
     // broker's own recv() dispatch of this connection's already-written burst against the peer's FIN,
-    // mirroring a real fire-and-forget device that disconnects right after publishing. Deliberately closes
-    // the fd BEFORE stopping/joining the reader thread (unlike close()) — joining first would add a
-    // poll-interval-sized delay between the last write() and the actual close_fd(), which is enough time
-    // for the broker to already drain the burst and never race the FIN against pending data at all.
+    // mirroring a real fire-and-forget device that disconnects right after publishing. Deliberately signals
+    // the disconnect BEFORE stopping/joining the reader thread (unlike close()) — joining first would add a
+    // poll-interval-sized delay between the last write() and the FIN, which is enough time for the broker
+    // to already drain the burst and never race the FIN against pending data at all.
+    //
+    // Uses shutdown(), not close_fd(), to trigger that FIN: this client's own reader thread may be mid-
+    // syscall (recv_some/wait_readable) on fd_ at this exact moment, and close()'ing a fd from one thread
+    // while another thread is blocked in a syscall on that same fd is a genuine data race (TSan-flagged) —
+    // the closing thread's fd-number reuse can even get raced onto a brand-new, unrelated connection.
+    // shutdown() carries no such hazard (it doesn't invalidate the fd number, so it's safe to call
+    // concurrently with another thread's in-flight syscall on it) and still delivers the FIN immediately,
+    // preserving the exact race this test needs. The actual close_fd()/fd_ reset happens only after
+    // reader_.join() below, once the reader thread is guaranteed to have stopped touching fd_.
     void send_disconnect_and_close() {
         std::vector<std::byte> disc;
         (void)mqtt::write_packet(fd_, std::byte{0xE0}, disc);
         if (fd_ != quark::pal::invalid_fd) {
-            quark::pal::close_fd(fd_);
-            fd_ = quark::pal::invalid_fd;
+#ifdef _WIN32
+            ::shutdown(fd_, SD_BOTH);
+#else
+            ::shutdown(fd_, SHUT_RDWR);
+#endif
         }
         running_.store(false, std::memory_order_release);
         if (reader_.joinable()) reader_.join();
+        if (fd_ != quark::pal::invalid_fd) {
+            quark::pal::close_fd(fd_);
+            fd_ = quark::pal::invalid_fd;
+        }
     }
 
     void close() {

@@ -21,6 +21,11 @@
 | M9.1 PR E | `OpcUaDriver::write()` — scalar write via `UA_Client_writeValueAttribute` | **Shipped** |
 | M9.1 PR F | `OpcUaDriver::write()` — single-argument method call via `UA_Client_call` (`"object\|method"` target form) | **Shipped** |
 | M9.1 PR G | `OpcUaDriver` — address-space browse mode (`UA_Client_Service_browse`, `browse_root` config) | **Shipped** |
+| M9.1 PR H | `ModbusRtuDriver` + `aero::pal::serial` — Modbus RTU/serial transport (FC01/02/03/04/06/16) | **Shipped** |
+| M9.2 | `Runtime` poll-timer wiring (006 §6.1) — makes `ModbusTcpDriver`/`ModbusRtuDriver`/`OpcUaDriver` actually deployable via a real Application, not just unit-testable | **Shipped** |
+| M9.3 | `OpcUaSubscriptionDriver` — OPC-UA Subscriptions/MonitoredItems, the PUSH counterpart to `OpcUaDriver` | **Shipped** |
+| M9.4 | OPC-UA security policies — Sign/SignAndEncrypt over a client certificate, cert-based client auth (`OpcUaSecurityConfig`, shared by `OpcUaDriver`/`OpcUaSubscriptionDriver`) | **Shipped** |
+| M9.5 | OPC-UA session-level X.509 `UserIdentityToken` (`OpcUaSecurityConfig::user_certificate_file`/`user_private_key_file`, over `UA_ClientConfig_setAuthenticationCert`) — closes 018 §8's last backlog item | **Shipped** |
 
 ## 1. Why
 
@@ -61,6 +66,21 @@ decoding of their own**:
 Both drivers exist specifically to fill the gap those two Source nodes were built ahead of:
 `compute_nodes.hpp`'s own file header says real socket transports were "GATED" pending exactly
 this kind of driver work. This spec is that transport layer landing.
+
+**M9.2 correction**: from M9a through M9.1 PR H, "triggered by a timer/Command" above was
+aspirational, not actual — `runtime.hpp`'s driver-ingestion path unconditionally spawned a
+producer thread calling `drv->run(...)`, and every driver in this spec has `run()` as a hard
+`Unsupported` (§6.1: they are `poll()`-only). `poll()` was reachable ONLY from each driver's own
+test harness (a throwaway `StreamActivation` per call), never from a real deployed Application.
+M9.2 closes this: `Deployment::poller` (`runtime.hpp`) is a thread that, on the configured
+`rate_hz` cadence, stands up a small per-tick `StreamActivation` (mirroring the exact pattern the
+test harnesses already used — `poll()`'s `StreamSink`-by-value contract has no way to hand a
+producer token back for reuse across calls), calls `driver.poll(sink)` once, and `tell()`s
+whatever frame(s) that call produced into the `FlowActor` — the real "timer/Command → poll(sink)
+→ frames → stream" path §6.1 describes, finally implemented. `DriverDescriptor` gained a
+`poll_driven` flag (`aero/sdk/driver.hpp`) so `Runtime::deploy()` can pick the poll lane vs the
+existing push lane (producer+bridge threads) per driver, without probing `run()`/`poll()` at
+runtime to find out which one a driver supports.
 
 ## 3. Architecture — the shared prerequisite
 
@@ -155,7 +175,29 @@ downstream, not `"aero.source.modbus"`). The open()-time payload-cap check and `
 byte-count math are both now function-of-`ReadFunction` (word: `count*2`; bit: `ceil(count/8)`)
 rather than hardcoded to the word case.
 
-**Explicitly deferred** (M9.1, §8): Modbus RTU/serial transport (TCP only).
+**M9.1 PR H** shipped `ModbusRtuDriver` (`include/aero/drivers/modbus_rtu_driver.hpp`, type_id
+`aero.driver.modbus_rtu`) — the serial counterpart, over a NEW `aero::pal::serial` PAL
+(`include/aero/pal/serial.hpp`, this tree's first serial I/O of any kind: `CreateFileA`/`DCB`/
+`SetCommState`/`SetCommTimeouts` on Windows, `termios`/`VMIN`+`VTIME` on POSIX). Same FC01/02/03/04
+read + FC06/FC16 write surface and `cmd.target` encoding as `ModbusTcpDriver`, but NOT a refactor of
+it — RTU framing (`[addr:1][PDU][CRC16-LE:2]`, no length field, no transaction id, the request/
+response pairing implicit in half-duplex serial ordering) is different enough from MBAP+TCP that
+`ModbusRtuDriver` duplicates the short FC-byte-encoding shapes with RTU framing instead, rather than
+touching the shipped, working TCP driver. Modbus's own CRC-16 (poly `0xA001` reflected, init
+`0xFFFF`) is a distinct algorithm from `CrcNode`'s CCITT-FALSE — implemented once in the driver,
+verified against the Modbus spec's own worked example in the test suite. Same bounded-backoff
+reconnect posture as every other driver here (opening a serial port can fail exactly like a TCP
+dial can). Config: `port`, `baud_rate`, `slave_address`, `start_address`, `register_count`,
+`register_type`, `parity` (`N`/`E`/`O`), `stop_bits` (1/2) — mirrors `aero.driver.modbus_tcp`'s
+selector fields with serial-specific fields swapped in for `host`/`port`/`unit_id`.
+
+**Testability**: unlike a TCP loopback server, there is no portable way to fake a COM port without
+real hardware or a third-party virtual-COM driver — so `ModbusRtuDriver` talks to a small
+`ISerialTransport` seam instead of `aero::pal::serial` directly. Production code gets
+`RealSerialTransport` (a thin PAL wrapper); the test suite injects an in-memory fake that echoes
+canned RTU frames built independently (its own CRC16, not the driver's). This is the only
+abstraction this PR adds beyond duplicating `ModbusTcpDriver`'s shape, and exists purely because
+hardware-free testing has no other option.
 
 ## 5. Scope — M9b: OPC-UA
 
@@ -165,10 +207,11 @@ Modbus-TCP, OPC-UA's binary secure-channel protocol is not realistically hand-ro
 via CMake `FetchContent`, the same shape as 017 M5's mbedTLS vendoring (`AERO_ENABLE_OPCUA`
 option, forced-off noisy cache vars, wrapped as an `aero-thirdparty-opcua` INTERFACE library).
 
-**v1 scope**: a `UA_Client` connecting with **no security policy** (`UA_ClientConfig_setDefault`,
-the simplest open62541 client path — the vendored build itself is compiled with
-`UA_ENABLE_ENCRYPTION=OFF`, deliberately not coupling this driver's crypto needs to 017 M5's
-existing mbedTLS vendoring). Config: `endpoint` (`opc.tcp://host:port`), `node_ids` (a short list
+**v1 scope**: a `UA_Client` connecting with **no security policy** by default
+(`UA_ClientConfig_setDefault`, the simplest open62541 client path) — M9.4 (below) later added an
+OPT-IN `OpcUaSecurityConfig` for Sign/SignAndEncrypt over a client certificate; the vendored build
+itself now compiles with `UA_ENABLE_ENCRYPTION=MBEDTLS`, sharing 017 M5's existing mbedTLS
+vendoring rather than a second copy. Config: `endpoint` (`opc.tcp://host:port`), `node_ids` (a short list
 of NodeId strings — bounded by the 128-byte payload cap, §3). `poll()` reads each configured
 NodeId's value via `UA_Client_readValueAttribute`, converts numeric variant types to `double`,
 serializes the NodeId→value map as flat JSON into the `Frame` payload for `JsonParseNode`.
@@ -207,11 +250,111 @@ decode node ships for this shape — v1 puts the raw JSON array straight into th
 a caller/flow to consume directly (`JsonParseNode`, the scalar path's own decoder, does not
 understand this shape).
 
-**Explicitly deferred** (M9.1, §8): security policies (Sign/SignAndEncrypt, certificate-based
-client auth), Subscriptions/MonitoredItems (OPC-UA's native push mechanism — v1 is pure poll,
-matching the pull-driver shape 006 §6 already defines and keeping parity with the Modbus driver),
-and — within browsing itself — continuation-point paging beyond the first `kMaxBrowseResults`
-children, and reading nested subtrees (v1 is exactly one browse level per `poll()` call).
+**M9.3** shipped `OpcUaSubscriptionDriver` (`opcua_subscription_driver.hpp`, type_id
+`aero.driver.opcua_subscribe`) — OPC-UA Subscriptions/MonitoredItems, closing the "Subscriptions"
+half of the deferral above. A SEPARATE class/type_id from `OpcUaDriver`, not a mode flag on it:
+push vs pull is a different `IDriver` invocation contract (`run()` vs `poll()`,
+`DriverDescriptor::poll_driven`, M9.2), and `DriverDescriptor` is `static constexpr` per-CLASS, not
+per-instance — every driver in this tree already commits to exactly one invocation model
+(`GeneratorDriver` push-only, `ModbusTcpDriver`/`ModbusRtuDriver`/`OpcUaDriver` pull-only), and this
+follows that precedent. `run()` connects, creates ONE Subscription (open62541 defaults — 500ms
+publishing interval) with one MonitoredItem (data-change, `UA_ATTRIBUTEID_VALUE`) per configured
+NodeId, then pumps `UA_Client_run_iterate()` until stopped; open62541's client has no internal
+thread, so the data-change callback fires synchronously on `run()`'s own thread — safe to push into
+the bound sink directly, no cross-thread handoff. Each Frame carries exactly ONE
+`{"nodeId": value}` entry (one per notification), NOT a batched multi-NodeId object like poll
+mode's own payload — so subscription mode has no analogue to poll mode's "~3 NodeIds per poll"
+batching cap (§3); the only per-Frame constraint is that ONE NodeId-string+value pair fits under
+128 bytes, checked per-entry at `open()`. No write()/method-call surface in v1 (a deployment
+needing both notifications and writes to the same endpoint runs an `OpcUaDriver` instance
+alongside this one). Reconnect (006 §8) rebuilds the Subscription/MonitoredItems from scratch on
+any connection loss — open62541 does not resurrect a Subscription across a fresh session — and
+leans on open62541's own `connectivityCheckInterval` (set to 2s, shortened from its 5s-timeout
+defaults) for an active liveness check inside `run_iterate()`, rather than passively waiting on
+channel/session state alone (a peer that vanishes without a clean TCP FIN can leave that looking
+nominally healthy for a long time).
+
+**M9.4** shipped OPC-UA security policies — Sign/SignAndEncrypt over a client certificate, closing
+018 §8's last backlog item. `OpcUaSecurityConfig` (`opcua_security.hpp`, shared by both
+`OpcUaDriver` and `OpcUaSubscriptionDriver` via an additive, default-constructed-disabled
+constructor argument — every pre-M9.4 call site and deploy config keeps connecting at
+`MessageSecurityMode::None` unchanged) turns on Sign or SignAndEncrypt over DER certificate/key
+files loaded from disk (mirrors `aero/pal/tls.hpp`'s own `cert_file`/`key_file` PEM-file
+convention, not inline bytes/base64 in deploy JSON — private key material shouldn't live in a
+config file that might get logged or committed). v1 scope, deliberately narrow like every other
+slice in this file: ONE trusted peer certificate (`trusted_server_certificate_file`), not a CA
+chain/multi-entry trust store; Sign/SignAndEncrypt only, no plaintext-but-signed-elsewhere hybrid;
+`application_uri` must be set to match `certificate_file`'s own X.509 URI Subject Alternative Name
+byte-for-byte (open62541's mbedTLS plugin verifies a peer's claimed ApplicationUri against its
+cert via a raw substring search of the cert's v3 extension bytes — a mismatch is
+`BadCertificateUriInvalid`, discovered building this milestone's own test fixture). "Cert-based
+client auth" here means the SecureChannel itself is mutually authenticated by X.509 certs — the
+client's own cert IS its identity for the channel, verified against the server's trust list — not
+a session-level X.509 `UserIdentityToken` (that stays backlog, see below).
+
+Requires the vendored open62541 to be built with `UA_ENABLE_ENCRYPTION=MBEDTLS` (root
+`CMakeLists.txt`'s `AERO_ENABLE_OPCUA` block, now gated on `AERO_ENABLE_TLS=ON`) — sharing this
+project's own already-vendored mbedTLS (017 M5) rather than fetching/linking a second, independent
+copy: two separately-built static libs both exporting `mbedtls_x509_crt_parse` et al. into one
+binary is a real duplicate-symbol hazard, not just wasted size (see
+`cmake/patch_open62541.cmake`'s banner). Getting there needed two more fixes to open62541's own
+vendored CMakeLists.txt, both via the same content-matched `PATCH_COMMAND` mechanism 017 M5's
+`cmake/patch_mbedtls.cmake` already established: (1) open62541's `install(EXPORT)`/`export(TARGETS)`
+rules for its own target fail CMake's generate-time export-set validation once it links AeroEdge's
+mbedTLS targets (this project never installs/exports either, so these rules are dropped, not
+worked around); (2) `mbedtls_entropy_self_test()` (called once per SecurityPolicy setup) is
+undeclared once `MBEDTLS_SELF_TEST` is disabled project-wide (017 M5's own TSan-race fix) — each
+call site is patched to skip the self-test rather than reintroducing that race for a one-time RNG
+check.
+
+§8's real answer on the mbedTLS-sharing threading hazard: **yes, a genuine hazard exists**, found
+empirically standing up this milestone's own security-enabled test fixture — every open62541
+SecurityPolicy failed to initialize (`mbedtls_ctr_drbg_seed` returning
+`MBEDTLS_ERR_CTR_DRBG_ENTROPY_SOURCE_FAILED`, deterministically, every time) until
+`aero::pal::tls::detail::ensure_threading_registered()` (017 M5's `MBEDTLS_THREADING_ALT`
+registration) ran first. `MBEDTLS_THREADING_ALT` requires `mbedtls_threading_set_alt()` before
+**any** other mbedTLS call in the process, full stop — not specific to TLS. `apply_security_config()`
+now calls it before every mbedTLS-touching open62541 call (`std::call_once`-guarded, so it's a
+no-op if the native broker's own TLS listener already registered it, and vice versa) — one shared
+registration for the one shared mbedTLS build, exactly the fix 017 M5's own shim was designed to
+generalize to.
+
+**Still deferred** (v2 backlog): a CA-chain/multi-entry trust store (v1 is exactly one trusted
+peer cert, matching this driver's existing "one configured endpoint" posture); certificate
+rotation/expiry handling (v1 loads cert/key files once, at `open()`); and — within browsing itself
+— continuation-point paging beyond the first `kMaxBrowseResults` children, and reading nested
+subtrees (v1 is exactly one browse level per `poll()` call). Within Subscriptions (M9.3): Events
+(only DataChange notifications), server-requested-parameter renegotiation (accepts whatever the
+server revises), and resubscribing to an EXISTING subscription id after a reconnect (v1 always
+creates a fresh one).
+
+**M9.5** shipped the one item M9.4 explicitly left backlog: a session-level X.509
+`UserIdentityToken` (OPC-UA Part 4 §7.36.5) for USER (not channel) authentication — a genuinely
+separate mechanism from M9.4's SecureChannel cert auth, not a relabeling of it. `OpcUaSecurityConfig`
+gains `user_certificate_file`/`user_private_key_file` (DER, same on-disk convention as every other
+cert knob in this file); `apply_security_config()` forwards them to open62541's own
+`UA_ClientConfig_setAuthenticationCert` (`client_config_default.h`), which does the real work:
+constructs the `X509IdentityToken` and separately provisions `authSecurityPolicies` so
+`ActivateSession` can sign the server's nonce as proof the client holds the matching private key.
+Independent of `certificate_file`/`private_key_file` by construction — a deployment can set either,
+both, or neither; empty (the default) stays an implicit Anonymous session, unchanged pre-M9.5
+behavior. Same build gate as `UA_ClientConfig_setAuthenticationCert` itself
+(`UA_ENABLE_ENCRYPTION_MBEDTLS`), already satisfied by M9.4's own CMake requirement — no new
+CMake work needed.
+<br>**A real constraint found building this**: a X.509 UserIdentityToken over a channel with NO
+crypto SecurityPolicy loaded at all (`MessageSecurityMode::None`, no `certificate_file`) is not
+reachable through open62541's own client endpoint-selection — the server's default AccessControl
+plugin tags each endpoint's Certificate `UserTokenPolicy` with the SAME SecurityPolicy URI as that
+endpoint's own channel policy (`ua_accesscontrol_default.c`), and the client can only sign the
+ActivateSession proof-of-possession nonce using a SecurityPolicy it already has loaded — which
+`UA_ClientConfig_setDefault()` (the `certificate_file`-empty path) never loads. In practice this
+means session-level X.509 auth is layered on top of M9.4's own Sign/SignAndEncrypt (own trusted
+cert, own trust list — `opcua_driver_security.cpp`'s test (5) uses a DIFFERENT cert for the channel
+than for the session, proving the two checks are independently enforced), not a MessageSecurityMode
+::None-only feature.
+<br>**Still deferred** (v2 backlog, unchanged from M9.4's own list): a CA-chain/multi-entry trust
+store for the session identity too (v1 is exactly one trusted peer cert, same posture as
+`trusted_server_certificate_file`); certificate rotation/expiry handling.
 
 ## 6. Capability table
 
@@ -222,39 +365,67 @@ children, and reading nested subtrees (v1 is exactly one browse level per `poll(
 | Modbus-TCP: Read Input Registers (FC04) | **shipped** | M9.1 PR B, `ModbusTcpDriver::ReadFunction` |
 | Modbus-TCP: Write Multiple Registers (FC16) | **shipped** | M9.1 PR C, `ModbusTcpDriver::write()` |
 | Modbus-TCP: Read Coils / Discrete Inputs (FC01/FC02) | **shipped** | M9.1 PR D, `ModbusBitsDecodeNode` |
-| Modbus-TCP: RTU/serial transport | backlog | M9.1 |
+| Modbus RTU/serial transport (FC01/02/03/04/06/16) | **shipped** | M9.1 PR H, `ModbusRtuDriver` + `aero::pal::serial` |
 | OPC-UA: no-security client, poll configured NodeIds | **shipped** | M9b, `OpcUaDriver` |
 | OPC-UA: scalar write to a configured NodeId | **shipped** | M9.1 PR E, `OpcUaDriver::write()` |
 | OPC-UA: single-argument method call | **shipped** | M9.1 PR F, `OpcUaDriver::write()` |
 | OPC-UA: address-space browse (one root, one level, capped result count) | **shipped** | M9.1 PR G, `OpcUaDriver` browse mode |
-| OPC-UA: security policies, Subscriptions, browse paging/nested subtrees | backlog | M9.1 |
+| OPC-UA: Subscriptions/MonitoredItems (data-change push) | **shipped** | M9.3, `OpcUaSubscriptionDriver` |
+| OPC-UA: security policies — Sign/SignAndEncrypt, cert-based client auth | **shipped** | M9.4, `OpcUaSecurityConfig` |
+| OPC-UA: session-level X.509 `UserIdentityToken` (user, not channel, authentication) | **shipped** | M9.5, `OpcUaSecurityConfig::user_certificate_file`/`user_private_key_file` |
+| OPC-UA: CA-chain/multi-entry trust store, browse paging/nested subtrees, Subscription Events | backlog | M9.1/M9.3/M9.4/M9.5 |
 | Frame byte-payload plumbing (driver → `ctx.payload`) | **shipped** | M9a, shared prerequisite |
 | Multi-frame chunking beyond the 128B payload cap | backlog | M9.1 |
-| Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | both drivers |
+| Bounded-backoff reconnect on connection loss (006 §8) | **shipped** | all drivers |
+| `Runtime::deploy()` actually drives PULL drivers (006 §6.1 timer/poll wiring) | **shipped** | M9.2, `Deployment::poller` |
 
 ## 7. Security
 
 Both drivers dial *out* from AeroEdge to field equipment — the reverse exposure direction from
 017's MQTT broker (which accepts inbound device connections and therefore needed TLS/ACL, 017
-M5). Neither Modbus-TCP nor OPC-UA v1 here does connection authentication or encryption: Modbus-TCP
-has no such concept in the base protocol (this is normal for the protocol, not a gap this spec
-introduces); OPC-UA's security policies are explicitly deferred (§5, M9.1). This is an accepted v1
-posture matching how these protocols are actually deployed today (a trusted OT network segment),
-not a claim that either driver is safe to dial across an untrusted network — revisit if a
-deployment needs that.
+M5). Modbus-TCP does no connection authentication or encryption in either direction — the base
+protocol has no such concept (this is normal for the protocol, not a gap this spec introduces).
+OPC-UA now has a REAL security option (M9.4): a deployment can opt an `OpcUaDriver`/
+`OpcUaSubscriptionDriver` instance into Sign/SignAndEncrypt over a client certificate via
+`OpcUaSecurityConfig` (§5), authenticating the SecureChannel in both directions (the client's cert
+against the server's trust list, and — via `trusted_server_certificate_file` — the server's cert
+against the client's own single-entry trust). It stays OPT-IN, not the default: a config that
+doesn't set `certificate_file` connects at `MessageSecurityMode::None` exactly as before M9.4, and
+that remains an accepted posture for a trusted OT network segment where the operational cost of
+managing certs isn't justified. Neither driver claims to be safe dialing an untrusted network
+without security enabled — revisit which posture is the DEFAULT if a deployment target changes.
+M9.5 adds a SEPARATE, session-level identity on top: `user_certificate_file`/`user_private_key_file`
+authenticate the OPC-UA *session* (ActivateSession's X.509 UserIdentityToken) independently of
+whichever cert (if any) authenticated the SecureChannel itself — also opt-in, also defaulting to
+unchanged pre-M9.5 behavior (implicit Anonymous) when unset.
 
-## 8. Open questions (M9.1)
+## 8. Open questions (M9.1/M9.2/M9.3/M9.4/M9.5)
 
-- **OPC-UA security policies + cert-based auth.** Sign/SignAndEncrypt, client certificates —
-  deferred because it would couple this driver's crypto needs to (or duplicate) 017 M5's mbedTLS
-  vendoring, and no current deployment target needs it yet. Revisit alongside 017 §10's M5.1
-  (cluster-link TLS) if/when either becomes a real requirement.
-- **OPC-UA Subscriptions/MonitoredItems.** The OPC-UA-native push equivalent of MQTT's
-  subscribe-and-get-notified — would let `OpcUaDriver` become a push (`run()`) driver instead of
-  poll, lower latency and lower request volume than v1's poll loop. Revisit once poll-interval
-  latency is a measured problem, not preemptively.
-- **Modbus RTU / serial transport.** v1 is TCP-only; RTU needs a serial PAL this codebase doesn't
-  have yet.
+- **OPC-UA security policies v1 limits (M9.4/M9.5).** See §5's own writeup for the shipped scope
+  and the "still deferred" list (CA-chain/multi-entry trust store on both the channel and session
+  side, cert rotation). Revisit alongside 017 §10's M5.1 (cluster-link TLS) if a deployment needs
+  any of those.
+- **OPC-UA Subscriptions v1 limits (M9.3).** `OpcUaSubscriptionDriver` ships DataChange
+  notifications only (no Events), open62541's default subscription parameters (no per-deployment
+  tuning of publishing interval/queue size yet), and always creates a FRESH Subscription on
+  reconnect rather than resubscribing to an existing id (open62541 doesn't resurrect one across a
+  new session anyway, so there's nothing to resume). Also: this driver's own test found that
+  detecting a peer that vanishes WITHOUT a clean TCP FIN can be very slow via passive channel/
+  session-state checks alone (30+ seconds observed) — `connectivityCheckInterval` (2s) mitigates
+  this for real network failures, but a test harness that tears a UA_Server down via
+  `UA_Server_delete()` mid-session (not a real-world "cable unplugged" scenario) may not exercise
+  it reliably; revisit if a real deployment shows slow reconnect after a genuine network drop.
+- **M9.2 poll-timer v1 limits.** `Deployment::poller`'s cadence is a plain `sleep`-based loop
+  (20ms wake-up granularity to check `stop_flag`), not a real Quark timer/scheduler primitive
+  (006 §6.1's original diagram sketched "Quark timer (011)" — 011 doesn't exist as a reusable
+  primitive yet, so this is a Runtime-owned thread instead); a fresh `StreamActivation` per tick
+  has real per-tick overhead that would matter at a much higher `rate_hz` than any current PLC/
+  OPC-UA polling target uses. Revisit alongside 011 if/when a real Quark timer facility lands, or
+  if a deployment needs sub-20ms poll jitter.
+- **Modbus RTU serial-config breadth.** PR H ships the common case (8 data bits fixed per spec,
+  configurable baud/parity/stop-bits, no RS-485 driver-enable/DE-RTS toggling — assumes the
+  serial adapter or a transceiver handles half-duplex turnaround itself). Revisit if a real
+  deployment's RS-485 hardware needs the driver to control DE/RE lines directly.
 - **Multi-frame chunking** for register-maps/NodeId-lists wider than the 128-byte payload cap
   (§3) — would need either a bigger `kMaxFramePayload` (blocked on Quark's mailbox cell size,
   upstream QuarkCpp work) or splitting one wide poll into multiple `Frame`s per cycle. Revisit if

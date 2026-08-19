@@ -28,9 +28,11 @@ function Wrapper() {
 describe("FlowDesigner canvas", () => {
   it("renders a card per node with its catalog label and type_id", () => {
     render(<Wrapper />);
-    expect(screen.getByText("Decode (scalar)")).toBeTruthy();
+    // Labels are humanized client-side from the type_id (catalog.ts) now that the catalog comes from
+    // GET /catalog, which carries no per-node-type display label (015 U1) — see test-setup.ts's fixture.
+    expect(screen.getByText("Decode")).toBeTruthy();
     expect(screen.getByText("Scale")).toBeTruthy();
-    expect(screen.getByText("Sum Output")).toBeTruthy();
+    expect(screen.getByText("Sum")).toBeTruthy();
     expect(screen.getByText("aero.source.decode")).toBeTruthy();
   });
 
@@ -51,6 +53,18 @@ describe("FlowDesigner canvas", () => {
     expect(screen.getByText("aero.output.sum")).toBeTruthy();
   });
 
+  // 019 §4 jigsaw slice: a Source card renders no target handle at all — nothing can ever be wired
+  // into it, by shape, not just by a validation message (the literal "Sum before Decode" case).
+  it("a Source card has no target handle; other categories do", () => {
+    const { container } = render(<Wrapper />);
+    const cards = container.querySelectorAll(".flow-node-card");
+    expect(cards.length).toBe(3); // Decode (Source), Scale (Transform), Sum (Output)
+    expect(cards[0].classList.contains("cat-source")).toBe(true);
+    expect(cards[0].querySelector(".react-flow__handle.target")).toBeNull();
+    expect(cards[1].querySelector(".react-flow__handle.target")).not.toBeNull();
+    expect(cards[2].querySelector(".react-flow__handle.target")).not.toBeNull();
+  });
+
   it("moving a node reorders the emitted Application (order still IS the DAG)", () => {
     render(<Wrapper />);
     const json = () => JSON.parse(screen.getByText(/"flow"/).textContent!) as Application;
@@ -63,5 +77,54 @@ describe("FlowDesigner canvas", () => {
     expect(json().flow.map((n) => n.type_id)).toEqual([
       "aero.transform.scale", "aero.source.decode", "aero.output.sum",
     ]);
+  });
+});
+
+// 019 §4: the canvas is a real graph editor now — a switch node's card renders both branch handles,
+// and removing a node in graph mode prunes any edge that referenced it.
+const BRANCHING_APP: Application = {
+  name: "branching", version: "0.1.0",
+  actor: { kind: "edge", key: 1 },
+  flow: [
+    { id: "src", type_id: "aero.source.decode" },
+    { id: "sw", type_id: "aero.flow.switch", config: { expr: "raw > 100" } },
+    { id: "hi", type_id: "aero.transform.scale", config: { factor: 10 } },
+    { id: "lo", type_id: "aero.transform.scale", config: { factor: 1 } },
+    { id: "out", type_id: "aero.output.sum" },
+  ],
+  edges: [
+    { from: "src", to: "sw" },
+    { from: "sw", from_port: "true", to: "hi" },
+    { from: "sw", from_port: "false", to: "lo" },
+    { from: "hi", to: "out" },
+    { from: "lo", to: "out" },
+  ],
+};
+
+function BranchingWrapper() {
+  const [model, setModel] = useState<FlowModel>(() => fromApplication(BRANCHING_APP));
+  return <FlowDesigner model={model} onChange={setModel} />;
+}
+
+describe("FlowDesigner canvas — graph mode (019 §4)", () => {
+  it("renders true/false branch handle labels on a switch node's card", () => {
+    render(<BranchingWrapper />);
+    expect(screen.getByText("true")).toBeTruthy();
+    expect(screen.getByText("false")).toBeTruthy();
+  });
+
+  it("removing a node in graph mode drops edges that referenced it", () => {
+    render(<BranchingWrapper />);
+    const json = () => JSON.parse(screen.getByText(/"flow"/).textContent!) as Application;
+    expect(json().edges?.length).toBe(5);
+
+    const removeButtons = screen.getAllByText("✕");
+    // cards render in `model.nodes` order: src, sw, hi, lo, out — remove "hi".
+    fireEvent.click(removeButtons[2]);
+
+    const after = json();
+    expect(after.flow.some((n) => n.id === "hi")).toBe(false);
+    expect(after.edges?.some((e) => e.from === "hi" || e.to === "hi")).toBe(false);
+    expect(after.edges?.length).toBe(3); // sw->hi and hi->out both dropped
   });
 });

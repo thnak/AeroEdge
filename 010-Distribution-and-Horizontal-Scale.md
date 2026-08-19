@@ -76,7 +76,45 @@ If a requirement seems to need one of these, push it into Quark as a placement *
 adapters behind Quark's `Transport` seam, never a parallel interface, with brokers integrated as
 clients rather than reimplemented. See [014](014-Transport-Interface-and-Pluggable-Transports.md).
 
-## 5. Open questions
+## 5. Implementation status (updated as work ships)
+
+- **Real multi-node membership — shipped.** `Runtime::configure_fleet()`'s optional
+  `FleetConfig::membership` (`include/aero/runtime/runtime.hpp`) swaps the fleet/placement
+  observability hook's single-hardcoded-node `ClusterView` (016 §2.1's original "config-driven
+  list, one call at daemon start" stand-in) for one backed by a REAL `quark::SwimMembership`
+  (021) over a real `TcpTransport` — a genuine SWIM failure detector (direct/indirect ping,
+  suspicion, incarnation-numbered refutation, gossip), not the `InProcessMembership` test double.
+  `GET /fleet` now reports which configured nodes are ACTUALLY currently alive/reachable
+  (`"real_membership": true`, a live `nodes`/`epoch`), and device placement (§2.2) is recomputed
+  every SWIM tick against that live view — a device requiring a capability only a just-joined
+  peer advertises becomes eligible the moment that peer is actually visible, and a node that goes
+  dark drops back out within the real ack+suspicion timeout window. Proven over real loopback
+  sockets in `tests/runtime/runtime_cluster_membership.cpp`: two `Runtime` instances converge to
+  seeing each other alive, live placement follows the real node set, and killing one is detected
+  by the survivor's real SWIM failure detector. `ClusterView` itself (`aero/cluster/cluster.hpp`)
+  now accepts either its own offline test-double membership (unchanged, existing offline policy
+  tests are untouched) or an external, caller-owned `quark::Membership&` — the exact "swap it
+  behind the same seam" the file's own banner always said a real deployment would eventually do.
+  <br>**Still config-declared, not gossiped**: peer capability flags (`ClusterMembershipConfig::
+  ClusterMember::flags`) — matching this feature's own honest v1 scope, not a claim that
+  capabilities are discovered.
+- **Fenced actor migration (§3) — STILL NOT REAL, and this is the actual remaining blocker.**
+  §3 above describes Quark recomputing placement and device actors migrating with fenced hand-off
+  when membership changes. That does not happen today, and the gap is structural, not a missing
+  test: `aero::cluster::EdgeActivation` (`aero/cluster/migration.hpp`)'s fencing mechanism
+  requires the OLD and NEW node's activations to read/write the SAME durable `Store` instance
+  (`tests/cluster/fenced_migration.cpp` proves the fencing invariant correctly, but as an
+  IN-PROCESS simulation — one `quark::InMemoryStore` shared by two `EdgeActivation` objects in one
+  process). Across two real, separate node processes this is only true if both point at a
+  literal shared store — no networked/replicated store adapter exists in QuarkCpp or AeroEdge
+  today, and no state-transfer-over-transport protocol exists either. §3's "affected device
+  actors migrate" is real membership recomputing WHERE an actor *should* live (place_actors is a
+  pure function of the live view, and now genuinely live per the item above) — it does not, and
+  currently cannot, actually MOVE a running actor or its state there. Revisit if/when a real
+  shared/networked durable-store primitive lands (neither repo has one on a roadmap as of this
+  writing).
+
+## 6. Open questions
 
 - **Device→capability mapping source of truth** — where the `plant/segment/gateway` tags
   come from (device registry? config file? MES?). Ties to 011 (OTA/device management) and

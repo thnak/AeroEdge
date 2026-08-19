@@ -36,7 +36,7 @@ public:
         return NodeResult::Continue;
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
-    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.mean"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.mean"};  // no config
 };
 
 // Transform: min and max over the working-set tags, staged as two outputs [min, max] (005 §2). A
@@ -56,7 +56,7 @@ public:
         return NodeResult::Continue;
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
-    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.minmax"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.minmax"};  // no config
 };
 
 // Transform: the running sum of the working-set tags, staged as one output (005 §2). A totalizer
@@ -71,7 +71,7 @@ public:
         return NodeResult::Continue;
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
-    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.sum"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.sum"};  // no config
 };
 
 // Transform: CRC-16/CCITT-FALSE over the raw frame bytes (ctx.payload), staged as a tag + output
@@ -93,7 +93,7 @@ public:
         return NodeResult::Continue;
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
-    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.crc"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Transform, "aero.transform.crc"};  // no config
 };
 
 // Source: decode a Modbus holding-register payload (big-endian 16-bit registers) in ctx.payload into
@@ -120,7 +120,7 @@ public:
         return NodeResult::Continue;
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
-    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.modbus"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.modbus"};  // no config
 
 private:
     // Stable backing storage for the tag-name string_views (Tag::name is a view). Amortized: grown once
@@ -162,7 +162,7 @@ public:
         return NodeResult::Continue;
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
-    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.modbus_bits"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.modbus_bits"};  // no config
 
 private:
     std::vector<std::string> bit_names_;
@@ -188,7 +188,7 @@ public:
         return NodeResult::Continue;
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
-    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.json"};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.json"};  // no config
 
 private:
     std::vector<std::string> key_store_;  // stable backing for parsed key names (Tag::name views it)

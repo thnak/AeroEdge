@@ -38,4 +38,44 @@ describe("Application schema alignment", () => {
     const empty: Application = { ...hello, flow: [] };
     expect(validateApplication(empty, sourceIds(), outputIds())).toContain("flow must have at least one node");
   });
+
+  // 019 §4: a graph Application (explicit node ids + edges[], including a branch label) round-trips
+  // just as losslessly as the legacy shape above — proves the new opt-in path is alignment-safe too.
+  it("round-trips a graph Application (edges[] + branch labels)", () => {
+    const graph: Application = {
+      name: "branching", version: "0.1.0",
+      actor: { kind: "edge", key: 1 },
+      flow: [
+        { id: "src", type_id: "aero.source.decode" },
+        { id: "sw", type_id: "aero.flow.switch", config: { expr: "raw > 100" } },
+        { id: "hi", type_id: "aero.transform.scale", config: { factor: 10 } },
+        { id: "lo", type_id: "aero.transform.scale", config: { factor: 1 } },
+        { id: "out", type_id: "aero.output.sum" },
+      ],
+      edges: [
+        { from: "src", to: "sw" },
+        { from: "sw", from_port: "true", to: "hi" },
+        { from: "sw", from_port: "false", to: "lo" },
+        { from: "hi", to: "out" },
+        { from: "lo", to: "out" },
+      ],
+    };
+    const model = fromApplication(graph);
+    expect(toApplication(model)).toEqual(graph);
+  });
+
+  // 019 §4: also confirms a graph Application does NOT trip the legacy "flow[0] must be a Source"
+  // check just because its root isn't at array index 0.
+  it("validates a graph Application by root/reachability, not array position", () => {
+    const graph: Application = {
+      name: "branching", version: "0.1.0", actor: { kind: "edge", key: 1 },
+      flow: [
+        { id: "sw", type_id: "aero.flow.switch", config: { expr: "raw > 100" } },
+        { id: "src", type_id: "aero.source.decode" },
+        { id: "out", type_id: "aero.output.sum" },
+      ],
+      edges: [{ from: "src", to: "sw" }, { from: "sw", from_port: "true", to: "out" }],
+    };
+    expect(validateApplication(graph, sourceIds(), outputIds())).toEqual([]);
+  });
 });

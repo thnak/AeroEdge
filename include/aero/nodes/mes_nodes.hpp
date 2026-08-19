@@ -5,7 +5,9 @@
 // commit; the gateway maps StagedMesReport → canonical MesReport and does the durable I/O (012 §3).
 #pragma once
 
+#include <array>
 #include <string>
+#include <string_view>
 
 #include "aero/sdk/node.hpp"
 
@@ -29,7 +31,15 @@ public:
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Output, "aero.output.mes"};
+    static constexpr std::array<std::string_view, 3> kKindOptions{"production", "alarm", "tag_sample"};
+    static constexpr std::array<FieldSpec, 3> kFields{{
+        {.key = "line", .label = "Line/device id", .type = FieldType::String, .required = true,
+         .default_string = "line-1"},
+        {.key = "label", .label = "Label", .type = FieldType::String, .default_string = "produced"},
+        {.key = "kind", .label = "Report kind", .type = FieldType::Enum,
+         .default_string = "production", .enum_options = kKindOptions},
+    }};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Output, "aero.output.mes", kFields};
 
 private:
     std::string line_;   // stable backing for StagedMesReport::line (a string_view)
@@ -55,7 +65,10 @@ public:
     }
     const NodeDescriptor& descriptor() const noexcept override { return kDesc; }
 
-    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.mes_order"};
+    static constexpr std::array<FieldSpec, 1> kFields{{
+        {.key = "order_qty", .label = "Order quantity", .type = FieldType::Number},
+    }};
+    static constexpr NodeDescriptor kDesc{NodeCategory::Source, "aero.source.mes_order", kFields};
 
 private:
     double order_qty_ = 0.0;
