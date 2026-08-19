@@ -45,6 +45,14 @@ function Block({ shape, node, onChange }: {
     if (next) onChange(next.make());
   };
 
+  // Grouped by category (exprAst.ts's BlockCategory) — the palette more than doubled once the math
+  // functions joined the original operators, and a flat 30+ option list stopped being scannable.
+  const groups = new Map<string, typeof options>();
+  for (const k of options) {
+    if (!groups.has(k.category)) groups.set(k.category, []);
+    groups.get(k.category)!.push(k);
+  }
+
   return (
     <span className={`expr-block expr-block-${blockShape}`}>
       <select
@@ -53,8 +61,12 @@ function Block({ shape, node, onChange }: {
         onChange={(e) => changeKind(e.target.value)}
         aria-label="Block kind"
       >
-        {options.map((k) => (
-          <option key={k.id} value={k.id}>{k.label}</option>
+        {[...groups].map(([category, kinds]) => (
+          <optgroup key={category} label={category}>
+            {kinds.map((k) => (
+              <option key={k.id} value={k.id}>{k.label}</option>
+            ))}
+          </optgroup>
         ))}
       </select>
       {node.kind === "num" && (

@@ -36,6 +36,7 @@ function evaluate(node: ExprNode, tags: Record<string, number>): number {
         case "-": return l - r;
         case "*": return l * r;
         case "/": return r === 0 ? 0 : l / r;
+        case "%": return r === 0 ? 0 : l % r; // JS % on doubles matches std::fmod's guarded semantics
         case "<": return l < r ? 1 : 0;
         case ">": return l > r ? 1 : 0;
         case "<=": return l <= r ? 1 : 0;
@@ -44,6 +45,28 @@ function evaluate(node: ExprNode, tags: Record<string, number>): number {
         case "!=": return l !== r ? 1 : 0;
         case "&&": return l !== 0 && r !== 0 ? 1 : 0;
         case "||": return l !== 0 || r !== 0 ? 1 : 0;
+      }
+    }
+    case "call": {
+      const a = evaluate(node.args[0], tags);
+      switch (node.name) {
+        case "abs": return Math.abs(a);
+        case "floor": return Math.floor(a);
+        case "ceil": return Math.ceil(a);
+        case "round": return Math.round(a);
+        case "sqrt": return Math.sqrt(a);
+        case "sin": return Math.sin(a);
+        case "cos": return Math.cos(a);
+        case "tan": return Math.tan(a);
+        case "asin": return Math.asin(a);
+        case "acos": return Math.acos(a);
+        case "atan": return Math.atan(a);
+        case "ln": return Math.log(a);
+        case "log": return Math.log10(a);
+        case "exp": return Math.exp(a);
+        case "pow": return Math.pow(a, evaluate(node.args[1], tags));
+        case "min": return Math.min(a, evaluate(node.args[1], tags));
+        case "max": return Math.max(a, evaluate(node.args[1], tags));
       }
     }
   }
@@ -68,6 +91,24 @@ describe("parseExpr — valid strings from tests/nodes/expr_rule.cpp", () => {
     ['tag("temp") > 100', { temp: 120, raw: 0 }, 1],
     ["temp - raw > 5", { temp: 20, raw: 10 }, 1],
     ["ghost > 1", { raw: 99 }, 0],
+    // 020 §6.1/§6.2/§6.3 — mod + math functions, strings lifted from tests/nodes/expr_rule.cpp.
+    ["raw % 3 == 1", { raw: 7 }, 1],
+    ["raw % 3 == 0", { raw: 7 }, 0],
+    ["raw % 0 > 1", { raw: 100 }, 0], // guarded mod, like Div
+    ["abs(raw) > 5", { raw: -10 }, 1],
+    ["floor(raw) == 4", { raw: 4.9 }, 1],
+    ["ceil(raw) == 5", { raw: 4.1 }, 1],
+    ["round(raw) == 5", { raw: 4.6 }, 1],
+    ["sqrt(raw) == 3", { raw: 9 }, 1],
+    ["sin(0) == 0", { raw: 0 }, 1],
+    ["cos(0) == 1", { raw: 0 }, 1],
+    ["ln(raw) > 2", { raw: 20 }, 1],
+    ["log(100) == 2", { raw: 0 }, 1],
+    ["exp(0) == 1", { raw: 0 }, 1],
+    ["atan(tan(1)) > 0.9", { raw: 0 }, 1],
+    ["pow(2, raw) == 8", { raw: 3 }, 1],
+    ["min(3, raw) == 3", { raw: 9 }, 1],
+    ["max(3, raw) == 9", { raw: 9 }, 1],
   ];
 
   for (const [expr, tags, expected] of cases) {
@@ -87,7 +128,7 @@ describe("parseExpr — valid strings from tests/nodes/expr_rule.cpp", () => {
 });
 
 describe("parseExpr — malformed strings from tests/nodes/expr_rule.cpp", () => {
-  for (const bad of ["raw >", "(1 + 2", "raw & 3", "* 5", "tag(raw)", "1 2 3", ""]) {
+  for (const bad of ["raw >", "(1 + 2", "raw & 3", "* 5", "tag(raw)", "1 2 3", "", "sqtr(raw) > 1"]) {
     it(`rejects "${bad}"`, () => {
       const parsed = parseExpr(bad);
       expect(parsed.ok).toBe(false);
@@ -96,10 +137,27 @@ describe("parseExpr — malformed strings from tests/nodes/expr_rule.cpp", () =>
   }
 });
 
+describe("parseExpr — function-call arity (020 §6.2/§6.3)", () => {
+  it("rejects a binary function called with only one argument", () => {
+    expect(parseExpr("pow(2) > 1").ok).toBe(false);
+  });
+  it("rejects a unary function called with two arguments", () => {
+    expect(parseExpr("abs(1, 2) > 1").ok).toBe(false);
+  });
+  it("rejects an unknown function name distinctly from a bare tag reference", () => {
+    const asCall = parseExpr("sqtr(raw)");
+    const asTag = parseExpr("sqtr");
+    expect(asCall.ok).toBe(false);
+    expect(asTag.ok).toBe(true);
+    if (asTag.ok) expect(asTag.tree).toEqual({ kind: "tag", name: "sqtr" });
+  });
+});
+
 describe("serializeExpr — precedence/associativity", () => {
   it("round-trips every valid example string to a structurally-equivalent tree", () => {
     for (const expr of ["raw > 50", "raw >= 10 && raw < 20", "raw * 2 + 1 > 10", "(raw + 1) * 2 == 12",
-      "raw / 0 > 1", "!(raw == 0)", "raw < 0 || raw > 100", "-raw > -10"]) {
+      "raw / 0 > 1", "!(raw == 0)", "raw < 0 || raw > 100", "-raw > -10", "raw % 3 == 1",
+      "pow(2, raw) == 8", "min(3, raw) == 3", "atan(tan(1)) > 0.9", "sqrt(pow(raw, 2)) == raw"]) {
       const first = parseExpr(expr);
       expect(first.ok).toBe(true);
       if (!first.ok) continue;
@@ -145,6 +203,15 @@ describe("serializeExpr — precedence/associativity", () => {
   it("always serializes a tag node in canonical tag(\"name\") form", () => {
     expect(serializeExpr({ kind: "tag", name: "raw" })).toBe('tag("raw")');
   });
+
+  it("a function call is self-delimiting — no extra parens around its args, even nested", () => {
+    const tree: ExprNode = {
+      kind: "call", name: "pow",
+      args: [{ kind: "binary", op: "+", left: { kind: "num", value: 1 }, right: { kind: "num", value: 2 } },
+             { kind: "call", name: "sqrt", args: [{ kind: "num", value: 9 }] }],
+    };
+    expect(serializeExpr(tree)).toBe("pow(1 + 2, sqrt(9))");
+  });
 });
 
 describe("shapeOf", () => {
@@ -158,6 +225,12 @@ describe("shapeOf", () => {
     expect(shapeOf({ kind: "binary", op: ">", left: num(1), right: num(2) })).toBe("boolean");
     expect(shapeOf({ kind: "binary", op: "&&", left: num(1), right: num(2) })).toBe("boolean");
   });
+
+  it("classifies every function call as reporter (020 §6.2/§6.3: no function produces a boolean)", () => {
+    const num = (v: number): ExprNode => ({ kind: "num", value: v });
+    expect(shapeOf({ kind: "call", name: "abs", args: [num(1)] })).toBe("reporter");
+    expect(shapeOf({ kind: "call", name: "pow", args: [num(2), num(3)] })).toBe("reporter");
+  });
 });
 
 describe("collectTagRefs", () => {
@@ -165,6 +238,12 @@ describe("collectTagRefs", () => {
     const parsed = parseExpr("temp - raw > 5 && flag == 1");
     expect(parsed.ok).toBe(true);
     if (parsed.ok) expect(collectTagRefs(parsed.tree).sort()).toEqual(["flag", "raw", "temp"]);
+  });
+
+  it("reaches into function-call arguments, both unary and binary", () => {
+    const parsed = parseExpr("pow(base, tag(\"exp\")) > sqrt(raw)");
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(collectTagRefs(parsed.tree).sort()).toEqual(["base", "exp", "raw"]);
   });
 });
 
@@ -180,6 +259,22 @@ describe("tree editing helpers", () => {
 
     expect(getChildren({ kind: "num", value: 1 })).toEqual([]);
     expect(getChildren({ kind: "tag", name: "x" })).toEqual([]);
+  });
+
+  it("getChildren/withChild handle both unary- and binary-arity function calls", () => {
+    const unaryCall: ExprNode = { kind: "call", name: "sqrt", args: [{ kind: "num", value: 9 }] };
+    expect(getChildren(unaryCall)).toEqual([{ kind: "num", value: 9 }]);
+    expect(withChild(unaryCall, 0, { kind: "num", value: 16 })).toEqual({
+      kind: "call", name: "sqrt", args: [{ kind: "num", value: 16 }],
+    });
+
+    const binaryCall: ExprNode = {
+      kind: "call", name: "pow", args: [{ kind: "num", value: 2 }, { kind: "num", value: 3 }],
+    };
+    expect(getChildren(binaryCall)).toEqual([{ kind: "num", value: 2 }, { kind: "num", value: 3 }]);
+    expect(withChild(binaryCall, 1, { kind: "num", value: 5 })).toEqual({
+      kind: "call", name: "pow", args: [{ kind: "num", value: 2 }, { kind: "num", value: 5 }],
+    });
   });
 
   it("BLOCK_KINDS defaults are all internally valid and shape-consistent", () => {
