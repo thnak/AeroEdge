@@ -89,4 +89,41 @@ describe("ExprTreeEditor", () => {
     expect(list).toBeTruthy();
     expect(list!.querySelectorAll("option").length).toBe(3);
   });
+
+  // 020 §6.2/§6.3 follow-up: the math-function palette.
+  it("renders a function-call expr with a unary function's single argument as a nested block", () => {
+    render(<Wrapper initial="sqrt(raw) > 3" />);
+    // getByDisplayValue on a <select> matches its currently SELECTED option's text — unlike getByText,
+    // which would also match the same label appearing as an unselected <option> in every OTHER
+    // reporter-shaped socket's select in the tree (every socket offers the full matching palette).
+    expect(screen.getByDisplayValue("Square root")).toBeTruthy();
+    expect(screen.getByDisplayValue("raw")).toBeTruthy();
+  });
+
+  it("renders a binary function's two arguments as two nested blocks", () => {
+    render(<Wrapper initial="pow(2, raw) > 3" />);
+    expect(screen.getByDisplayValue("Power (base, exp)")).toBeTruthy();
+    const numInputs = screen.getAllByRole("spinbutton") as HTMLInputElement[];
+    expect(numInputs.map((i) => i.value)).toContain("2");
+  });
+
+  it("changing a reporter block's kind to a function replaces it with that function's default args", () => {
+    render(<Wrapper initial="raw > 50" />);
+    const [rootSelect, leftSelect] = screen.getAllByLabelText("Block kind") as HTMLSelectElement[];
+    void rootSelect;
+    fireEvent.change(leftSelect, { target: { value: "sqrt" } });
+    expect(currentValue()).toBe("sqrt(0) > 50");
+  });
+
+  it("groups the kind-select options into optgroups by category", () => {
+    render(<Wrapper initial="raw > 50" />);
+    // ">"'s own select is shape="any" (the tree's root socket) so it sees every category; its LEFT
+    // child socket is shape="reporter" (">"'s childShapes), which excludes Comparison/Logic entirely —
+    // that's the one that actually proves filtering-by-shape reaches the new Math function group too.
+    const [, leftSelect] = screen.getAllByLabelText("Block kind") as HTMLSelectElement[];
+    const groupLabels = Array.from(leftSelect.querySelectorAll("optgroup")).map((g) => g.getAttribute("label"));
+    expect(groupLabels).toContain("Math function");
+    expect(groupLabels).not.toContain("Comparison");
+    expect(groupLabels).not.toContain("Logic");
+  });
 });
