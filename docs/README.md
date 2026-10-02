@@ -48,5 +48,12 @@ Contributor rules stay at the repo root: [AGENTS.md](../AGENTS.md) and [CONVENTI
 | 019 | [019-Flow-Graph-Model-and-Studio-Canvas-API.md](specs/019-Flow-Graph-Model-and-Studio-Canvas-API.md) | Flow as a graph (branch/fan-out/merge); Studio canvas API | Draft |
 | 020 | [020-Block-Shape-Taxonomy-and-Loop-Constructs.md](specs/020-Block-Shape-Taxonomy-and-Loop-Constructs.md) | Blockly-grounded block shape taxonomy; loop constructs; expr-tree editor | Draft |
 | 021 | [021-Native-Broker-Performance-Redesign.md](specs/021-Native-Broker-Performance-Redesign.md) | Native broker I/O & fan-out performance redesign (research log) | WIP |
+| 022 | [022-Device-Registry-and-Lifecycle.md](specs/022-Device-Registry-and-Lifecycle.md) | Device models, devices, points, gateway/child devices, payload codecs; lifecycle, replacement; session-based health; versioned projections | Draft |
+| 023 | [023-Identity-Provisioning-and-Broker-Access.md](specs/023-Identity-Provisioning-and-Broker-Access.md) | Device/service/node identities; per-unit claim; client-id binding; templated ACL; revocation incl. node-local; required 017 changes | Draft |
+| 024 | [024-Machine-Binding-Signal-Roles-and-State.md](specs/024-Machine-Binding-Signal-Roles-and-State.md) | Point → machine bindings with roles/qualifiers; I/O layers; counting at the source; `MachineActor` windows, epochs, state (incl. `Unknown`), point quality; outputs by role | Draft |
+| 025 | [025-Upstream-Hook-and-Canonical-Events.md](specs/025-Upstream-Hook-and-Canonical-Events.md) | Generalizes 012: producer outboxes, critical/best-effort subscriptions, live/backfill lanes, event identity, clock policy, snapshot, consumer obligations | Draft |
+| 026 | [026-Edge-Data-Policy-and-Retention.md](specs/026-Edge-Data-Policy-and-Retention.md) | Data classes and retention, ingest-throttle chain, sizing, backup and epoch-bumping restore | Draft |
+| 027 | [027-Control-Plane-and-Edge-Node-Topology.md](specs/027-Control-Plane-and-Edge-Node-Topology.md) | `control` / `node` / `all` roles; `(control_epoch, version)` projections; node autonomy and local API; inbound routing; module changes | Draft |
+| 028 | [028-Device-Protocol-v4-and-Commands.md](specs/028-Device-Protocol-v4-and-Commands.md) | AeroEdge-native device protocol (re-flashed ESP32 fleet); acknowledged device commands; request/response bridge for terminals; signed OTA; firmware conformance | Draft |
 
 New specs take the next free number (`022-…`) and get a row here.

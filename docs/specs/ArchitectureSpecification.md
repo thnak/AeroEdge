@@ -22,7 +22,13 @@ An **Industrial Edge Platform** that:
 - **Edge firmware OTA** — signed, staged, rollback-safe firmware updates to managed
   devices, orchestrated as fleet rollouts. → [011](011-Firmware-OTA.md)
 - **MES integration hook** — a bidirectional seam (`IMesAdapter`) AeroEdge *defines*, so
-  any MES plugs in without changing flows. → [012](012-MES-Integration-Hook.md)
+  any MES plugs in without changing flows. → [012](012-MES-Integration-Hook.md), generalized
+  into the **upstream hook** with canonical machine events → [025](025-Upstream-Hook-and-Canonical-Events.md)
+- **Device management** — device registry and lifecycle, identity and broker access, machine
+  binding with state derivation, edge data policy, control plane vs edge nodes.
+  → [022](022-Device-Registry-and-Lifecycle.md)–[024](024-Machine-Binding-Signal-Roles-and-State.md),
+  [026](026-Edge-Data-Policy-and-Retention.md), [027](027-Control-Plane-and-Edge-Node-Topology.md),
+  device protocol v4 and commands → [028](028-Device-Protocol-v4-and-Commands.md)
 
 ## 2. What we build vs what we reuse
 
@@ -45,7 +51,8 @@ AeroEdge is deliberately **thin over Quark**. The line is bright:
 | Distribution / placement / membership | **Quark** (010, 025, 026, 021) |
 | **Device-affinity placement & rebalancing** | **AeroEdge** (policy over Quark, 010) |
 | **Firmware OTA (state machine + fleet rollout)** | **AeroEdge** (011) |
-| **MES integration hook (`IMesAdapter`)** | **AeroEdge** (012) |
+| **MES integration hook (`IMesAdapter`)** | **AeroEdge** (012), generalized as the upstream hook (025) |
+| **Device registry, identity, machine binding & state, device protocol** | **AeroEdge** (022–024, 028) |
 
 If a design pressure ever pushes AeroEdge to reimplement a "reuse" row, that is a
 signal to push the requirement *down into Quark*, not to fork it here.

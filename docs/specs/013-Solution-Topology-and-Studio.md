@@ -4,6 +4,11 @@
 > **Runtime** (the edge daemon + API), the **SDK / Extension** surface (what extension authors
 > build against), and the **Studio** (the tooling to configure, build, extend, deploy, and
 > monitor). This answers "how many projects do we need?" with a concrete, phaseable breakdown.
+>
+> **Amended by [027](027-Control-Plane-and-Edge-Node-Topology.md):** `aero-runtime` gains a role
+> flag (`control` / `node` / `all`). New modules `aero-registry` and `aero-machine`. `aero-mes`
+> becomes `aero-upstream`. `aero-drivers` gains the device protocol v4 codec (028). Layering in
+> 027 §5 supersedes T5's module list.
 
 ## 1. Three planes
 

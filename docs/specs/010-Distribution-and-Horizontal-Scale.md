@@ -116,7 +116,8 @@ clients rather than reimplemented. See [014](014-Transport-Interface-and-Pluggab
 
 ## 6. Open questions
 
-- **Device→capability mapping source of truth** — where the `plant/segment/gateway` tags
+- ~~**Device→capability mapping source of truth**~~ → **resolved by [022 §4](022-Device-Registry-and-Lifecycle.md)**
+  (the device registry on the control plane, [027](027-Control-Plane-and-Edge-Node-Topology.md)). Original: where the `plant/segment/gateway` tags
   come from (device registry? config file? MES?). Ties to 011 (OTA/device management) and
   012 (MES hook).
 - **Split-brain safety for actuators** — fenced hand-off (021) prevents dual activation, but
