@@ -175,7 +175,7 @@ target_link_libraries(resequencer PRIVATE aero::transport)
 add_test(NAME resequencer COMMAND resequencer)
 set_tests_properties(resequencer PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
-# 017 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): try_parse_packet() (mqtt_codec.hpp), the
+# 021 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): try_parse_packet() (mqtt_codec.hpp), the
 # buffered-read counterpart to read_packet()/read_n() NativeBroker's session_loop now drives directly.
 # Pure function, no sockets — proves the parser correct in isolation (empty/partial/malformed/burst
 # buffers) before it drives the broker's only ingestion path; closes Phase 1's test-coverage gap #4.
@@ -216,7 +216,7 @@ target_link_libraries(native_broker PRIVATE aero::broker)
 add_test(NAME native_broker COMMAND native_broker)
 set_tests_properties(native_broker PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
-# 017 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): NativeBroker::session_loop()'s buffered read
+# 021 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): NativeBroker::session_loop()'s buffered read
 # behaves correctly over a REAL socket — multiple complete packets delivered in one burst (forcing the
 # inner drain loop to carve more than one out of a single recv_some()), a packet split across two
 # separate writes (forcing a genuinely Incomplete parse across more than one read cycle), and session
@@ -465,7 +465,7 @@ target_compile_definitions(native_broker_security PRIVATE
 add_test(NAME native_broker_security COMMAND native_broker_security)
 set_tests_properties(native_broker_security PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
-# 017 Phase 7 gate: the IoContext reactor migration for plaintext connections — mixed-mode fan-out
+# 021 Phase 7 gate: the IoContext reactor migration for plaintext connections — mixed-mode fan-out
 # (one reactor/plaintext + one legacy/TLS recipient on the same topic) and the direct regression test for
 # Critical fix #1 (a stalled reactor client must not block other reactor sessions sharing the same reactor
 # thread). Needs aero-thirdparty-tls for the same reason native_broker_security does (a real mbedTLS
@@ -477,7 +477,7 @@ target_compile_definitions(reactor_migration PRIVATE
 add_test(NAME reactor_migration COMMAND reactor_migration)
 set_tests_properties(reactor_migration PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 
-# 017 Phase 2 Experiment C gate (redesign doc §1.5 gap #1 / §2.3 Experiment C): does a concurrent
+# 021 Phase 2 Experiment C gate (redesign doc §1.5 gap #1 / §2.3 Experiment C): does a concurrent
 # publish-vs-teardown race already exist in the CURRENT SHIPPED NativeBroker? Unlike every other
 # tests/broker/*.cpp test (which deliberately sleeps to AVOID this race), this one runs straight at it
 # for a sustained 12s window with no artificial sleeps: several publisher threads tight-loop QoS-1

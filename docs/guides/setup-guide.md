@@ -12,11 +12,11 @@ Once you're running, head to the **[User Guide](user-guide.md)** to deploy your 
 |---|---|---|
 | A C++23 compiler | GCC 13+ or Clang 17+ (verified: GCC 14.2 / Clang 20) | `std::expected`, deducing-this, etc. |
 | CMake | ≥ 3.24 | Build system |
-| [QuarkCpp](../../QuarkCpp) | matching checkout | The actor engine AeroEdge builds on — a **sibling** checkout, not vendored |
+| [QuarkCpp](../../../QuarkCpp) | matching checkout | The actor engine AeroEdge builds on — a **sibling** checkout, not vendored |
 | Node.js | 18+ / npm | Only if you want to run the **Studio** web UI |
 
 You do **not** need `uv`/Python or an MQTT broker/gRPC stack for basic setup — those are only used
-by the transport adapters' own test suite (see [CONVENTIONS.md](../CONVENTIONS.md) if you're
+by the transport adapters' own test suite (see [CONVENTIONS.md](../../CONVENTIONS.md) if you're
 contributing to `aero-transport`).
 
 ## 2. Get the code
@@ -106,12 +106,12 @@ Open `http://localhost:5173` — you should see the Flow Designer with the `hell
 pre-loaded, and (once you deploy it, either from here or via the CLI as in §5) live metrics
 streaming in under **Deploy & Monitor**:
 
-![AeroEdge Studio — Flow Designer + live Deploy & Monitor](../studio/docs/screenshot.png)
+![AeroEdge Studio — Flow Designer + live Deploy & Monitor](../../studio/docs/screenshot.png)
 
 *`deployed: true · frames: 100 · events: 100 · last output: 198` confirms the daemon, the Studio,
 and the proxy between them are all wired up correctly.*
 
-See [studio/README.md](../studio/README.md) for what each panel does.
+See [studio/README.md](../../studio/README.md) for what each panel does.
 
 ## Troubleshooting
 
@@ -130,8 +130,8 @@ match it with `--url`/`VITE_API_URL` on whatever client you're using).
 **A test other than `mqtt_transport`/`grpc_transport` fails or `ctest` reports less than 100%**
 That's a real regression — please open an issue with the `ctest --output-on-failure` output. (If you're
 building on anything other than Linux/x86-64, note that AeroEdge is only verified there today —
-see [CONVENTIONS.md](../CONVENTIONS.md).)
+see [CONVENTIONS.md](../../CONVENTIONS.md).)
 
 **Building for development (sanitizers, second compiler, contributing)**
-See [CONVENTIONS.md](../CONVENTIONS.md) and [AGENTS.md](../AGENTS.md) — the verification bar for
+See [CONVENTIONS.md](../../CONVENTIONS.md) and [AGENTS.md](../../AGENTS.md) — the verification bar for
 changes is stricter than "it builds" (two compilers, ASan+UBSan, TSan, all green).

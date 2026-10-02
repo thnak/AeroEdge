@@ -1,4 +1,4 @@
-// 017 Phase 1 gap #1 / Phase 2 Experiment C (redesign doc 017-Native-Broker-Performance-Redesign.md
+// 021 Phase 1 gap #1 / Phase 2 Experiment C (redesign doc 021-Native-Broker-Performance-Redesign.md
 // §1.5 gap #1, §2.3 Experiment C): does a concurrent-publish-vs-teardown race already exist in the
 // CURRENT SHIPPED `NativeBroker` (include/aero/broker/native_broker.hpp), independent of any redesign?
 //
@@ -271,7 +271,7 @@ int main() {
     }
 
     // --- teardown thread: connect a FRESH client, SUBSCRIBE, then abruptly close (no DISCONNECT) -------
-    // This is the exact scenario suspected (never proven — see 017-Native-Broker-Performance-Redesign.md
+    // This is the exact scenario suspected (never proven — see 021-Native-Broker-Performance-Redesign.md
     // §Background) to have caused the reverted fan-out-pool attempt's intermittent stall: a session
     // tearing down (teardown_session's non-clean-disconnect path) while PUBLISHes are concurrently
     // in-flight to the same topic from other threads.
