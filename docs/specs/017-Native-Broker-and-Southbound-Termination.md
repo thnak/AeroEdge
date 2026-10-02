@@ -8,6 +8,12 @@
 > is EMQX **capability** parity for the pieces that matter to AeroEdge's deployments — not a
 > line-for-line reimplementation of EMQX's own architecture, and explicitly not its licensed-away
 > multi-node clustering (§3/§4 cover how AeroEdge gets that property for free instead).
+>
+> **Amended by [023 §6](023-Identity-Provisioning-and-Broker-Access.md):** registry-backed identity
+> requires certificate-aware `Authenticator`, `{principal}`/`{site}` templated ACL rules,
+> client-id ↔ principal check, kick-by-principal, subscription re-check on rule change, hot swap
+> of auth data, and a bounded hash-verification pool with connect rate limiting. Topic delivery
+> of canonical events is an at-most-once live view (025 §4).
 
 ## Status (updated as milestones ship — keep this current, don't let it drift like v0.1's §6 did)
 

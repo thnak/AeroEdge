@@ -162,7 +162,8 @@ candidates.
 - **Store backend per deployment** — `FileStore` (std-only WAL) for a single edge node vs
   `SqliteStore`/`RocksStore` for richer query/retention; a deployment choice (Quark
   PersistenceAdapters.md), tie to 009.
-- **Retention & compaction policy** for EventSourced actors and the MES outbox (012) — bounded
+- ~~**Retention & compaction policy**~~ → **resolved by [026](026-Edge-Data-Policy-and-Retention.md).**
+  Original question: retention & compaction policy for EventSourced actors and the MES outbox (012) — bounded
   vs time-windowed; affects backfill/replay reach.
 - **Cache coherence across nodes** — when device config changes centrally, how co-located shard
   caches on multiple nodes are invalidated; likely a config-push Command (013) rather than shared

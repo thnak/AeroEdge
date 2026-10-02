@@ -9,6 +9,13 @@
 > defines the IA that closes that gap and the `aero-api` surface it needs, stating plainly which part
 > of each is real production wiring and which is an honest gate (mirroring the NullMqtt/NullGrpc
 > pattern from 014 Phase 7).
+>
+> **Amended by 022–028:** the Studio gains device, binding and identity management (022–024), a
+> **live I/O tap** (per-point values and per-client MQTT traffic, SSE/WebSocket), a **broker admin**
+> surface (clients, kick, retained, stats, topic tree), health-history views (026), and **local
+> alert routing** (offline > N min, outbox pressure, OTA failure, clock skew → email / Telegram /
+> Zalo / webhook, independent of upstream). `/mes` becomes `/upstream`: per-subscription cursors,
+> classes, leases and lanes (025). The same read-outs exist on each node's local API (027 §3.1).
 
 ## 1. Information architecture
 

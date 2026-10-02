@@ -3,6 +3,10 @@
 > Draft v0.1. AeroEdge's integration contract with an MES (Manufacturing Execution System).
 > AeroEdge **defines this hook** — it is not a fixed connector to one MES product but a
 > bidirectional seam any MES adapter implements. Keyword-mandated; AeroEdge-owned.
+>
+> **Amended by [025](025-Upstream-Hook-and-Canonical-Events.md):** this hook is generalized
+> into the *upstream hook* (one gateway, one outbox, per-subscription cursors, canonical events).
+> This spec remains as its **MES profile**. M1–M5 stay normative for every upstream adapter.
 
 ## 1. Why a hook, not a connector
 

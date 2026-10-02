@@ -4,6 +4,11 @@
 > AeroEdge-owned functionality (Quark provides the actor/transport substrate; the update
 > protocol and safety model are ours). Distinct from *flow* hot-reload (009) — this updates
 > the **device firmware**, not the AeroEdge software.
+>
+> **Amended by [028 §7](028-Device-Protocol-v4-and-Commands.md):** the first real device driver is
+> protocol v4 (signed image, on-device verification, A/B with rollback, range download from the
+> control-plane catalog, progress over `up/ota`). The firmware catalog lives in the registry (022 §2);
+> rollout targets are device groups.
 
 ## 1. Scope and the two update surfaces
 

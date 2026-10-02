@@ -22,7 +22,8 @@ QuarkCpp owns the runtime and AeroEdge stays a thin domain layer over it.
 ## Layering (dependencies flow one way — 013 T5)
 
 ```
-aero-sdk → aero-core → {aero-nodes, aero-drivers, aero-mes, aero-runtime} → aero-api → aero-cli
+aero-sdk → aero-core → {aero-nodes, aero-drivers, aero-registry, aero-upstream}
+                     → aero-machine → aero-runtime → aero-api → aero-cli
 ```
 - `aero-sdk` is the **stable extension contract** (INode/IDriver/context). It changes slowly and is
   versioned independently; `aero-core` may churn behind it.
