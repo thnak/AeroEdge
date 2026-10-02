@@ -1,5 +1,5 @@
-// 017 Phase 7 gate: `NativeBroker`'s IoContext reactor migration for plaintext connections
-// (017-Native-Broker-Performance-Redesign.md, Phase 7). Plaintext connections are now reactor-managed
+// 021 Phase 7 gate: `NativeBroker`'s IoContext reactor migration for plaintext connections
+// (021-Native-Broker-Performance-Redesign.md, Phase 7). Plaintext connections are now reactor-managed
 // (accept_loop() -> reactor_io_.post()); TLS connections stay on the pre-existing thread-per-connection
 // session_loop() path unchanged this round.
 //

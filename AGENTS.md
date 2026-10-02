@@ -2,8 +2,8 @@
 
 Every agent (orchestrator or subagent) working in this repo MUST follow these rules. They exist so
 parallel work cannot drift from the architecture. Read this and [CONVENTIONS.md](CONVENTIONS.md)
-before touching code. The specs (`001`–`015`, `ArchitectureSpecification.md`) and
-[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md) are the source of truth.
+before touching code. The specs in `docs/specs/` (`001`–`021`, `ArchitectureSpecification.md`) and
+[IMPLEMENTATION-PLAN.md](docs/IMPLEMENTATION-PLAN.md) are the source of truth.
 
 ## R0 — The prime directive: thin over Quark
 

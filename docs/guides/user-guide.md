@@ -36,7 +36,7 @@ new version in place (see [Hot-reload vs. redeploy](#hot-reload-vs-redeploy)).
 
 ## Your first flow
 
-The repo ships a minimal example at [`examples/hello_flow.json`](../examples/hello_flow.json):
+The repo ships a minimal example at [`examples/hello_flow.json`](../../examples/hello_flow.json):
 
 ```json
 {
@@ -118,7 +118,7 @@ at least one Source and one Output.
 | `type_id` | Config | What it does |
 |---|---|---|
 | `aero.transform.scale` | `factor` (number, **required**) | Multiplies every tag's value by `factor`. |
-| `aero.transform.moving_average` | `window` (integer ≥ 1, **required**) | A sliding-window average over the last `window` samples (stateful — resets on restart, see [007](../007-State-and-Persistence.md)). |
+| `aero.transform.moving_average` | `window` (integer ≥ 1, **required**) | A sliding-window average over the last `window` samples (stateful — resets on restart, see [007](../specs/007-State-and-Persistence.md)). |
 | `aero.transform.mean` | — | The arithmetic mean across the *current* frame's tags (not windowed). |
 | `aero.transform.minmax` | — | Stages `[min, max]` across the current frame's tags. |
 | `aero.transform.sum` | — | Stages the running sum of the current frame's tags (a totalizer). |
@@ -154,7 +154,7 @@ unknown node type_id: 'aero.transform.frobnicate'
 
 `aero.driver.generator` is the only built-in driver today — it's a deterministic stand-in used to
 exercise a flow with no external device. Real protocol drivers (TCP/Modbus-TCP/MQTT device ingestion)
-are on the roadmap; see [006-Drivers-and-Sources.md](../006-Drivers-and-Sources.md) for the design.
+are on the roadmap; see [006-Drivers-and-Sources.md](../specs/006-Drivers-and-Sources.md) for the design.
 
 ## The rule expression language
 
@@ -187,7 +187,7 @@ circuiting expensive downstream processing on bad data.
 
 ## MES integration nodes
 
-Two flow nodes bridge a flow to the MES integration hook ([spec 012](../012-MES-Integration-Hook.md))
+Two flow nodes bridge a flow to the MES integration hook ([spec 012](../specs/012-MES-Integration-Hook.md))
 without touching gateway internals:
 
 - **`aero.output.mes`** stages a report (production count, alarm, or tag sample — set via `kind`)
@@ -197,7 +197,7 @@ without touching gateway internals:
   tag each frame, so downstream nodes can react to it (progress-vs-target, a rule expression, etc).
 
 The outbox/gateway/exactly-once-delivery mechanics are a runtime-level concern, not something you
-configure per-flow — see [012-MES-Integration-Hook.md](../012-MES-Integration-Hook.md) if you're
+configure per-flow — see [012-MES-Integration-Hook.md](../specs/012-MES-Integration-Hook.md) if you're
 standing up the MES adapter side.
 
 ## Deploying & managing flows (CLI)
@@ -287,7 +287,7 @@ curl -N http://127.0.0.1:8080/metrics/stream
 
 ## Using the Studio
 
-If you'd rather not hand-write JSON and `curl`, the [Studio](../studio/README.md) is a web UI over
+If you'd rather not hand-write JSON and `curl`, the [Studio](../../studio/README.md) is a web UI over
 the same REST API:
 
 - **Flow Designer** — assemble a flow from the node catalog visually; it emits the same canonical
@@ -296,7 +296,7 @@ the same REST API:
   table above, rendered as UI).
 - **Deploy & Monitor** — deploy, watch live metrics over SSE, reload, rollback — all from the browser.
 
-![AeroEdge Studio — Flow Designer + live Deploy & Monitor](../studio/docs/screenshot.png)
+![AeroEdge Studio — Flow Designer + live Deploy & Monitor](../../studio/docs/screenshot.png)
 
 *The `hello_flow` pipeline from [Your first flow](#your-first-flow) (Decode → Scale → Sum) in the
 Flow Designer, its generated Application JSON alongside, and Deploy & Monitor streaming metrics
@@ -312,10 +312,10 @@ API** today. A few platform capabilities exist at a lower level and aren't yet e
 surface — if you need them, they're worth reading about but are currently a build/deploy-time or
 cluster-operator concern rather than something you set in flow JSON:
 
-- **Transport adapters** (TCP/MQTT/gRPC for cross-node actor messaging) — [014](../014-Transport-Interface-and-Pluggable-Transports.md).
-- **Multi-node distribution & placement** — [010](../010-Distribution-and-Horizontal-Scale.md).
-- **Firmware OTA rollout** — [011-Firmware-OTA.md](../011-Firmware-OTA.md).
-- **Writing custom nodes/drivers** (native `.so` or WASM extensions) — [008](../008-Extension-Model-Native-and-WASM.md).
+- **Transport adapters** (TCP/MQTT/gRPC for cross-node actor messaging) — [014](../specs/014-Transport-Interface-and-Pluggable-Transports.md).
+- **Multi-node distribution & placement** — [010](../specs/010-Distribution-and-Horizontal-Scale.md).
+- **Firmware OTA rollout** — [011-Firmware-OTA.md](../specs/011-Firmware-OTA.md).
+- **Writing custom nodes/drivers** (native `.so` or WASM extensions) — [008](../specs/008-Extension-Model-Native-and-WASM.md).
 
 ## Troubleshooting
 

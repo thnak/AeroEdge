@@ -1,4 +1,4 @@
-// AeroEdge 017 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): broker-level proof that
+// AeroEdge 021 Phase 3 gate (redesign doc §2.4 Experiment A / §3.1): broker-level proof that
 // NativeBroker::session_loop()'s buffered read (try_parse_packet(), mqtt_codec.hpp — unit-tested in
 // isolation by tests/transport/mqtt_codec.cpp) behaves correctly once it's actually driving a real
 // socket: multiple complete packets delivered in a single burst, and a single packet whose bytes are

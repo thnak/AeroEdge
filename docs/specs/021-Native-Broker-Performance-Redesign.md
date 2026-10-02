@@ -1,4 +1,6 @@
-# 017 Follow-on: Native Broker I/O & Fan-out Architecture Redesign (WIP)
+# 021 — Native Broker I/O & Fan-out Architecture Redesign (WIP)
+
+> Follow-on to [017](017-Native-Broker-and-Southbound-Termination.md) (formerly numbered "017 follow-on").
 
 Status: research/design phase — no implementation started. This document is the living
 record of that phase, per the working agreement: full feature inventory and validated

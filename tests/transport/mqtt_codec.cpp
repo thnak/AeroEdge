@@ -1,6 +1,6 @@
-// AeroEdge 017 Phase 3 gate: `try_parse_packet()` (aero/transport/mqtt_codec.hpp), the buffered-read
+// AeroEdge 021 Phase 3 gate: `try_parse_packet()` (aero/transport/mqtt_codec.hpp), the buffered-read
 // counterpart to read_packet()/read_n() that NativeBroker::session_loop() now drives directly instead of
-// doing one recv_some()-or-poll cycle per byte (017-Native-Broker-Performance-Redesign.md §2.4
+// doing one recv_some()-or-poll cycle per byte (021-Native-Broker-Performance-Redesign.md §2.4
 // Experiment A / §3.1). Pure function, no sockets — this is Phase 1's test-coverage gap #4
 // ("multi-packet-per-recv() burst framing — untested") closed at the unit level, proven in isolation
 // BEFORE it drives the broker's only ingestion path (see the redesign doc's §3.0 sequencing rationale:

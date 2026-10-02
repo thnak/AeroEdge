@@ -1,8 +1,8 @@
 # AeroEdge Studio
 
 React + Vite web app to **configure, build, deploy, and monitor** AeroEdge flows — the Studio
-plane of spec [013](../013-Solution-Topology-and-Studio.md) and the plugin-UI config model of
-[015](../015-Configuration-Model-and-Studio-Plugin-UI.md). It talks **only** to `aero-api` (013 T2);
+plane of spec [013](../docs/specs/013-Solution-Topology-and-Studio.md) and the plugin-UI config model of
+[015](../docs/specs/015-Configuration-Model-and-Studio-Plugin-UI.md). It talks **only** to `aero-api` (013 T2);
 it never touches a device directly.
 
 ![AeroEdge Studio — Flow Designer + live Deploy & Monitor](docs/screenshot.png)

@@ -16,7 +16,7 @@
 //     `sessions_` and scanned on every publish, but never fanned out to. This is the one knob that
 //     speaks directly to "would a topic trie/index help" — if p99 latency and throughput barely move as
 //     --idle-sessions grows, the linear scan (acl.hpp's documented tradeoff) isn't the bottleneck.
-//   - 017 Phase 7c: whether a slow-but-alive subscriber (--slow-subscribers / --slow-delay-us) delays
+//   - 021 Phase 7c: whether a slow-but-alive subscriber (--slow-subscribers / --slow-delay-us) delays
 //     delivery to healthy subscribers sharing the same topic — the benchmark-grade version of
 //     tests/broker/reactor_migration.cpp's pass/fail-only stalled-client test.
 //
@@ -539,7 +539,7 @@ int main(int argc, char** argv) {
         // the FASTEST deliveries, not a true tail. This silently makes incomplete runs look BETTER than
         // complete ones on tail latency, which is backwards. Found via workflow red-team review after it
         // produced a misleading "better tail latency" reading on a run that was actually the more backed-up
-        // one (017-Native-Broker-Performance-Redesign.md, Phase 4 investigation).
+        // one (021-Native-Broker-Performance-Redesign.md, Phase 4 investigation).
         std::fprintf(stderr,
                       "\nWARNING: only %llu/%llu (%.1f%%) expected messages arrived before --timeout-s — "
                       "the latency percentiles above are SURVIVORSHIP-BIASED (computed only over the "

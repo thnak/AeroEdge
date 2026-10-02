@@ -98,7 +98,7 @@ rebuild:
 
 - **Quark already has coordinator-free cluster membership and placement** — SWIM gossip + HRW
   rendezvous placement + DHT-relay for nodes that share no direct link (010 §3,
-  [ADR-006/026](../QuarkCpp/decisions/ADR-006-large-scale-cluster-topology.md) at the Quark
+  [ADR-006/026](../../../QuarkCpp/decisions/ADR-006-large-scale-cluster-topology.md) at the Quark
   layer). This is the same machinery every distributed AeroEdge actor already rides.
 - **A topic subscription is placement, not a new concept.** Each MQTT topic (or topic's owning
   actor — the natural unit is a `Tag`/`EdgeActor`, 001/005) is HRW-placed on exactly one node

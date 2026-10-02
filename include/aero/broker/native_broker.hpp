@@ -168,7 +168,7 @@ public:
 
         running_.store(true, std::memory_order_release);
 
-        // 017 Phase 7: start the reactor loop + its hand-off worker pool BEFORE accept_thread_ — plaintext
+        // 021 Phase 7: start the reactor loop + its hand-off worker pool BEFORE accept_thread_ — plaintext
         // connections are handed to the reactor the moment they're accepted (accept_loop()'s
         // reactor_io_.post()), so the reactor must already be running to receive them.
         reactor_thread_ = std::thread([this] { reactor_io_.run(); });
@@ -202,7 +202,7 @@ public:
             listen_fd_tls_ = quark::pal::invalid_fd;
         }
 
-        // 017 Phase 7: stop the reactor loop and join its thread BEFORE touching any reactor session's
+        // 021 Phase 7: stop the reactor loop and join its thread BEFORE touching any reactor session's
         // state directly — mirrors quark::net::TcpTransport::stop()'s own shape (stop the loop, join the
         // I/O thread; only THEN is it safe to touch remaining connection state with no concurrency risk,
         // since nothing can dispatch a readiness/timer/posted callback once run() has returned).
@@ -359,7 +359,7 @@ private:
                                 // not silently reset to "never expires" between PUBLISH and PUBREL.
     };
 
-    // 017 Phase 7: the per-Session outbound queue item shape for reactor-managed (plaintext) sessions.
+    // 021 Phase 7: the per-Session outbound queue item shape for reactor-managed (plaintext) sessions.
     // Exactly one of {raw item, logical item} ever exists per QueuedOutbound — kept as two separate
     // struct types (rather than one struct with an is-raw flag) so each shape only carries the fields it
     // actually needs. `Raw` covers Session::send_packet()'s direct replies (CONNACK/SUBACK/PINGRESP/
@@ -406,7 +406,7 @@ private:
     // (aero::pal::wait_readable(s->fd, 200)) and teardown's close_fd() both need the raw OS fd regardless
     // of channel kind — TLS still rides a real socket underneath.
     //
-    // 017 Phase 7: `is_reactor_session` is `const`, set ONLY via the constructor (never a post-
+    // 021 Phase 7: `is_reactor_session` is `const`, set ONLY via the constructor (never a post-
     // construction assignment) — a Plan-agent critique of this phase's draft flagged that a post-
     // construction write has no established happens-before relationship with the session becoming
     // visible to other threads (the reactor thread via reactor_io_.post(), or a fan-out thread reading it
@@ -414,7 +414,7 @@ private:
     // `const` turns "set before any other thread can see this object" into a property the compiler
     // enforces, not documentation-only discipline — exactly `protocol_version`'s "negotiated once,
     // read-only after" precedent, but load-bearing from construction rather than from handle_connect.
-    // The plaintext constructor (below) is reactor-managed; the TLS constructor never is (017 Phase 7's
+    // The plaintext constructor (below) is reactor-managed; the TLS constructor never is (021 Phase 7's
     // own scope decision — TLS reactor integration is explicitly deferred, see the design doc).
     // `enable_shared_from_this` lets any Session member function obtain a weak_ptr to itself to safely
     // capture in a lambda handed to `reactor_io_.post()` (mirrors voice_channel.hpp's State class, which
@@ -437,7 +437,7 @@ private:
         std::mutex subs_mu;
         std::vector<Subscription> subs;
 
-        // 017 Phase 7: reactor-session-only outbound state, all guarded by io_mu (reuses the existing
+        // 021 Phase 7: reactor-session-only outbound state, all guarded by io_mu (reuses the existing
         // mutex rather than adding a new one — this state only ever interacts with `channel`, which io_mu
         // already protects). Never touched for a legacy (TLS) session — is_reactor_session gates every
         // access. `out_queue` holds items not yet started; `out_current`/`out_sent` track the ONE packet
@@ -448,14 +448,14 @@ private:
         std::vector<std::byte> out_current;
         std::size_t out_sent = 0;
         bool write_interest_armed = false;
-        // 017 Phase 7: guards against a reactor session being torn down twice (e.g. a hard write error
+        // 021 Phase 7: guards against a reactor session being torn down twice (e.g. a hard write error
         // during try_drain_reactor_send and a concurrently-detected EOF both trying to schedule teardown)
         // — schedule_reactor_teardown() only actually posts the teardown task for whichever caller wins
         // the exchange. Legacy sessions never need this: session_loop's single owning thread only ever
         // calls teardown_session() once, at the very end of its own loop, by construction.
         std::atomic<bool> teardown_scheduled{false};
 
-        // 017 Phase 3: the buffered-read inbound byte buffer (redesign doc §2.4 Experiment A / §3.1) —
+        // 021 Phase 3: the buffered-read inbound byte buffer (redesign doc §2.4 Experiment A / §3.1) —
         // same single-thread-owned discipline as client_id/keep_alive_s/etc. below (only this session's
         // own reader thread, session_loop, ever touches these — no lock needed). read_pos marks how much
         // of read_buf's prefix has already been dispatched as complete packets; session_loop compacts it
@@ -505,7 +505,7 @@ private:
         // this session's own reader thread ever touches it, via handle_publish).
         std::unordered_map<std::uint16_t, std::string> topic_aliases;
 
-        // 017 Phase 7: the old Session::send_packet() member moved out to a NativeBroker method of the
+        // 021 Phase 7: the old Session::send_packet() member moved out to a NativeBroker method of the
         // same name (see its definition below, near build_publish_variable_header_and_payload()) — it
         // needs to reach reactor_io_/try_drain_reactor_send() for reactor sessions, which a nested
         // struct's inline member body cannot do (NativeBroker is still an incomplete type at this point
@@ -574,7 +574,7 @@ private:
     // "a device's PUBLISH topic set is small" allowance; revisit if a real deployment needs more.
     static constexpr std::uint16_t kTopicAliasMax = 16;
 
-    // 017 Phase 7: plaintext connections are reactor-managed (Session::is_reactor_session == true, set by
+    // 021 Phase 7: plaintext connections are reactor-managed (Session::is_reactor_session == true, set by
     // the constructor used here) — accept_loop() itself is UNCHANGED above the registration step; only
     // "spawn a session_threads_ entry" became "hand the session to the reactor via post()" (add_fd is
     // loop-thread-only per IoContext's documented contract, so registration must run ON reactor_thread_,
@@ -596,7 +596,7 @@ private:
     }
 
     // ============================================================================================
-    // 017 Phase 7: IoContext reactor machinery for plaintext sessions. Everything in this block only
+    // 021 Phase 7: IoContext reactor machinery for plaintext sessions. Everything in this block only
     // ever touches a reactor-managed Session (is_reactor_session == true) — legacy (TLS) sessions and
     // session_loop()/teardown_session() below are otherwise unaffected by this block's existence.
     // ============================================================================================
@@ -665,7 +665,7 @@ private:
         // peer writes a final burst and closes immediately after (the ordinary shape of a QoS-0
         // fire-and-forget publisher) — tearing down on that combination before reading discarded data
         // that was already fully received into the kernel socket buffer, a real message-loss bug found via
-        // broker_bench (017 Phase 7c), not a hypothetical: a 1-publisher/1-subscriber QoS-0 burst of just
+        // broker_bench (021 Phase 7c), not a hypothetical: a 1-publisher/1-subscriber QoS-0 burst of just
         // 10 messages lost ~20-70% of them, permanently, well within any timeout. recv_some()'s own return
         // value is the authoritative signal (0 = EOF, error = real fault, would-block = nothing left) —
         // EPOLLHUP/EPOLLERR alone must never skip a read that might still have data behind it.
@@ -795,7 +795,7 @@ private:
     // Precondition: caller holds s->io_mu. Serializes+sends as much of the outbound queue as possible
     // WITHOUT EVER BLOCKING the calling thread — on a genuine would-block it arms EPOLLOUT and returns;
     // the reactor's own later EPOLLOUT dispatch resumes this same function. This is the mechanism that
-    // makes 017 Phase 7 actually different from Phase 6: Phase 6's item-count cap bounded how many items
+    // makes 021 Phase 7 actually different from Phase 6: Phase 6's item-count cap bounded how many items
     // a flush drained, not how long any ONE blocking send could take. Here, no send ever blocks at all —
     // a would-block returns control to the reactor loop instead of waiting on it.
     void try_drain_reactor_send(const std::shared_ptr<Session>& s) {
@@ -897,7 +897,7 @@ private:
         return std::chrono::steady_clock::now() - s.last_activity > limit;
     }
 
-    // 017 Phase 3: buffered read (redesign doc §2.4 Experiment A / §3.1) — one recv_some() burst here can
+    // 021 Phase 3: buffered read (redesign doc §2.4 Experiment A / §3.1) — one recv_some() burst here can
     // hand over many packets' worth of bytes at once (or a partial one, split across TCP segments); the
     // inner drain loop below carves every complete packet currently in `s->read_buf` via
     // try_parse_packet() before this outer loop polls again, replacing the old one-outer-iteration-per-
@@ -1040,7 +1040,7 @@ private:
 
         remove_session(s);
 
-        // 017 Phase 7: close_fd() used to run with NO io_mu lock — a fan-out that already snapshotted
+        // 021 Phase 7: close_fd() used to run with NO io_mu lock — a fan-out that already snapshotted
         // this shared_ptr<Session> (topic_index_candidates() releases topic_index_mu_ before any write
         // happens) could race a concurrent teardown's close here, a classic fd-reuse hazard: the OS can
         // hand this exact fd number to a brand-new accept()'d connection before the racing writer's
@@ -1256,7 +1256,7 @@ private:
             // own poll loop and tears down on ITS OWN thread — this file never closes a socket from a
             // thread that doesn't own it (matches stop()'s and session_loop's existing discipline).
             //
-            // 017 Phase 7: a LEGACY session notices `kicked` within ~200ms via session_loop's own
+            // 021 Phase 7: a LEGACY session notices `kicked` within ~200ms via session_loop's own
             // unconditional poll, even while otherwise idle. A reactor session has no equivalent
             // always-running poll — its handler only runs on genuine fd readiness or an armed timer — so
             // an idle, kicked reactor session would otherwise sit connected indefinitely instead of being
@@ -1637,7 +1637,7 @@ private:
     // filter), so delivery semantics — including per-session duplicate delivery for overlapping
     // subscriptions — are byte-for-byte unchanged; only which sessions get scanned at all has changed.
     //
-    // 017 Phase 7b: bounds how many recipients a single reactor-thread call processes inline before
+    // 021 Phase 7b: bounds how many recipients a single reactor-thread call processes inline before
     // yielding the reactor loop to other ready fds via a chained reactor_io_.post() continuation — mirrors
     // quark::net::voice_channel.hpp's own cited rule ("bounded, chained IoContext::post() continuation —
     // never inline", proven there by ADR-030's negative control). A real measurement this round (a
@@ -1651,7 +1651,7 @@ private:
     // the reactor thread — a legacy thread's own inline loop only ever blocks its own thread, unaffected.
     static constexpr std::size_t kMaxFanoutInlinePerCall = 256;
 
-    // 017 Phase 7: the fan-out dispatch is a 3-way split by (recipient kind, calling thread) — the 4th
+    // 021 Phase 7: the fan-out dispatch is a 3-way split by (recipient kind, calling thread) — the 4th
     // cell of the design doc's dispatch table ("any non-reactor-loop thread" -> legacy recipient) IS this
     // function's original unchanged inline publish_to() call for that case. The 3 kinds:
     //   - reactor-managed recipient (any calling thread): enqueue_reactor_publish() — never blocks.
@@ -1776,7 +1776,7 @@ private:
         }
     }
 
-    // 017 Phase 7b: processes up to kMaxFanoutInlinePerCall deliveries starting at `offset`, then — if
+    // 021 Phase 7b: processes up to kMaxFanoutInlinePerCall deliveries starting at `offset`, then — if
     // more remain — chains via reactor_io_.post() rather than continuing the loop inline, so a large
     // fan-out interleaves with other reactor sessions' readiness events instead of hogging the loop for
     // its entire duration. Always runs on the reactor thread (the only caller, route_publish() above,
@@ -1817,7 +1817,7 @@ private:
         (void)send_packet(s, std::byte{0xE0}, body);
     }
 
-    // 017 Phase 7 (Critical fix #1): the single choke point EVERY outbound write on a Session goes
+    // 021 Phase 7 (Critical fix #1): the single choke point EVERY outbound write on a Session goes
     // through — CONNACK/SUBACK/PINGRESP/PUBACK/PUBREC/PUBCOMP/DISCONNECT directly (every call site above
     // and below this file mechanically renamed from `s->send_packet(...)`/`s.send_packet(...)` to
     // `send_packet(*s, ...)`/`send_packet(s, ...)` — no business logic touched), and PUBLISH indirectly
@@ -1848,7 +1848,7 @@ private:
         return true;
     }
 
-    // 017 Phase 5/Phase 7: builds [PUBLISH variable header + v5 Properties + payload] into `out` (does
+    // 021 Phase 5/Phase 7: builds [PUBLISH variable header + v5 Properties + payload] into `out` (does
     // NOT include the fixed header byte or remaining-length prefix — callers add framing separately via
     // aero::transport::mqtt::serialize_packet()/write_packet()/write_packet_bounded()). Extracted
     // (Phase 7) from publish_to() below so the reactor outbound-queue drain path (which must build this
@@ -1939,7 +1939,7 @@ private:
     // `protocol_version == 5` branch — wire shape is byte-for-byte unchanged for them, a hard invariant.
     bool publish_to(Session& s, const std::string& topic, const std::vector<std::byte>& payload,
                     std::uint8_t qos, bool retain, const PublishExtras& extras = {}) {
-        // 017 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector on every one of
+        // 021 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector on every one of
         // this function's 3 call sites (route_publish's fan-out loop, offline-queue flush, retained
         // replay) - safe because write_packet() (mqtt_codec.hpp) fully copies its `body` parameter (vh)
         // into its own owned buffer BEFORE the potentially-blocking send/retry loop starts, so a stalled
@@ -2042,7 +2042,7 @@ private:
     // pattern as the old sessions_mu_ snapshot this replaced): topic_index_mu_ is held only long enough to
     // copy shared_ptrs, never while route_publish()'s callers do the actual (possibly blocking) socket
     // writes.
-    // 017 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector every publish — safe
+    // 021 Phase 5 (redesign doc §4.1/plan): thread_local instead of a fresh vector every publish — safe
     // because NativeBroker is thread-per-connection (session reader threads) plus the cluster relay path
     // (BrokerRelayActor, a quark::Sequential actor - confirmed single-in-flight, never reentrant on its own
     // worker thread), so no thread can call back into this function while a previous call's `out` on that
@@ -2083,7 +2083,7 @@ private:
     std::vector<std::thread> session_threads_;  // legacy (TLS) sessions only — reactor sessions never
                                                  // get an entry here (see accept_loop()'s Phase 7 banner)
 
-    // 017 Phase 7: the shared reactor (single shard, per the design doc's §2.2 resolution — sharding
+    // 021 Phase 7: the shared reactor (single shard, per the design doc's §2.2 resolution — sharding
     // stays a future, separately-validated option) plaintext sessions register with. `reactor_thread_id_`
     // is read via std::thread::get_id() on the constructing thread immediately after reactor_thread_'s
     // construction (available without waiting for the thread body to start) — is_on_reactor_thread()
@@ -2093,7 +2093,7 @@ private:
     std::thread reactor_thread_;
     std::thread::id reactor_thread_id_;
 
-    // 017 Phase 7 (Critical fix #2): the bounded, persistent worker pool for "a reactor-originated
+    // 021 Phase 7 (Critical fix #2): the bounded, persistent worker pool for "a reactor-originated
     // PUBLISH fanning out to a legacy (TLS) recipient" — reuses BrokerCluster's own "dedicated persistent
     // worker, not ad-hoc pooled dispatch" precedent (broker_cluster.hpp's 1-worker Quark engine for
     // BrokerRelayActor), implemented here as a plain fixed-size std::thread pool rather than pulling in

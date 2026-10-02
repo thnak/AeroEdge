@@ -403,11 +403,11 @@ inline std::optional<Packet> read_packet(quark::pal::fd_t fd, const std::atomic<
     return read_packet(ch, running);
 }
 
-// 017 Phase 3 addition: the buffered-read counterpart to read_packet() above — ADDITIVE, does not
+// 021 Phase 3 addition: the buffered-read counterpart to read_packet() above — ADDITIVE, does not
 // replace it. read_packet()/read_n() do one recv_some()-or-poll cycle PER BYTE of the fixed header and
 // remaining-length varint, plus one more for the body — 3+ syscalls per packet, unconditionally
 // (measured as the dominant per-packet cost even with zero fan-out, see
-// 017-Native-Broker-Performance-Redesign.md §2.4 Experiment A). This function does none of that I/O
+// 021-Native-Broker-Performance-Redesign.md §2.4 Experiment A). This function does none of that I/O
 // itself: it is a PURE function over a caller-owned buffer, meant to be driven by a caller that fills
 // `buf` via its own bulk recv_some() calls (one recv_some() can hand over many packets' worth of bytes
 // at once) and repeatedly calls this to carve complete packets out of whatever has accumulated so far.
@@ -461,7 +461,7 @@ inline std::expected<Packet, ParseStatus> try_parse_packet(const std::vector<std
 }
 
 // Serializes [fixed-header-byte | remaining-length | body] into a fresh buffer — the exact framing
-// write_packet()/write_packet_bounded() below send as-is. Extracted (017 Phase 7) so a caller building a
+// write_packet()/write_packet_bounded() below send as-is. Extracted (021 Phase 7) so a caller building a
 // packet for later/async transmission (e.g. NativeBroker's reactor outbound queue, which must frame a
 // packet once and then track a partial-send byte offset across multiple non-blocking send attempts) can
 // reuse the exact same framing logic instead of re-deriving it.
@@ -499,7 +499,7 @@ inline bool write_packet(quark::pal::fd_t fd, std::byte type_flags, const std::v
     return write_packet(ch, type_flags, body);
 }
 
-// 017 Phase 7 (Critical fix #2): same as write_packet() but gives up (returns false) once `deadline`
+// 021 Phase 7 (Critical fix #2): same as write_packet() but gives up (returns false) once `deadline`
 // passes, instead of retrying forever like write_packet()'s own unbounded loop. write_packet() itself is
 // BYTE-FOR-BYTE UNCHANGED for every existing caller — this is a new, additive overload, not a
 // modification. Used by NativeBroker's reactor->legacy-recipient hand-off pool so one persistently slow
