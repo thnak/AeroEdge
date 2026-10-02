@@ -18,6 +18,8 @@ Contributor rules stay at the repo root: [AGENTS.md](../AGENTS.md) and [CONVENTI
 - **[Setup Guide](guides/setup-guide.md)** — build from source, run the daemon, run the Studio.
 - **[User Guide](guides/user-guide.md)** — deploy & manage flows, the built-in node/driver catalog, the
   rule expression language, the REST API, monitoring.
+- **[Native MQTT Broker — Message Flow](native-broker-message-flow.md)** — where the embedded broker
+  runs, what happens to a PUBLISH, clustering, and the not-yet-wired path into flows (Mermaid diagrams).
 
 ## Specs — reading order
 
